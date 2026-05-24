@@ -35,6 +35,7 @@ pub mod interpolator {
     /// Responsibilities:
     /// - sample reconstruction
     pub trait Interpolator: Send + 'static {
+        /// Must be very fast. Can't do any allocation
         fn interpolate(&self, samples: &[StereoFrame], position: f64) -> StereoFrame;
     }
 

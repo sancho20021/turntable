@@ -4,11 +4,14 @@ mod decoder;
 mod just_decode;
 mod just_play;
 mod pitch_control;
+mod player_tester;
 mod read_touchpad;
+mod scratch;
 mod stereo_frame;
 mod touchpad_state;
-mod scratch;
 
 fn main() {
-    read_touchpad::main();
+    // read_touchpad::main();
+    // pitch_control::play_with_pitch().unwrap();
+    scratch::run();
 }

@@ -15,7 +15,7 @@
 //
 //
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use atomic_float::AtomicF64;
 use std::sync::Arc;
 
@@ -23,7 +23,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::{
     audio_engine::AudioEngine,
-    deck::interpolator::{self, Interpolator}, decoder::load_file,
+    deck::interpolator::{self, Interpolator},
+    player_tester::run_player,
 };
 
 pub fn play_audio<Int: Interpolator>(
@@ -70,81 +71,65 @@ pub fn play_audio<Int: Interpolator>(
     }
 }
 
-fn play_with_pitch() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+pub fn play_with_pitch() -> Result<()> {
+    run_player(|samples| {
+        let engine = AudioEngine::new(samples, interpolator::Linear);
 
-    if args.len() < 2 {
-        bail!("Usage: cargo run --release -- <audio-file>");
-    }
+        let speed = Arc::new(AtomicF64::new(1.0));
 
-    let path = &args[1];
+        // input thread
+        {
+            let speed = speed.clone();
 
-    println!("Loading: {path}");
+            std::thread::spawn(move || {
+                use std::io::{Read, stdin};
 
-    let samples = load_file(path)?;
+                println!();
+                println!("Controls:");
+                println!("  u = speed up");
+                println!("  d = slow down");
+                println!("  r = reset");
+                println!("  q = quit");
+                println!();
 
-    if samples.is_empty() {
-        bail!("No audio decoded");
-    }
+                loop {
+                    let mut buf = [0u8; 1];
 
-    println!("Decoded {} frames", samples.len());
+                    stdin().read_exact(&mut buf).unwrap();
 
-    let engine = AudioEngine::new(samples, interpolator::Linear);
+                    match buf[0] as char {
+                        'u' => {
+                            let s = speed.load(std::sync::atomic::Ordering::Relaxed) + 0.05;
 
-    let speed = Arc::new(AtomicF64::new(1.0));
+                            speed.store(s, std::sync::atomic::Ordering::Relaxed);
 
-    // input thread
-    {
-        let speed = speed.clone();
+                            println!("speed = {:.2}", s);
+                        }
 
-        std::thread::spawn(move || {
-            use std::io::{Read, stdin};
+                        'd' => {
+                            let s = speed.load(std::sync::atomic::Ordering::Relaxed) - 0.05;
 
-            println!();
-            println!("Controls:");
-            println!("  u = speed up");
-            println!("  d = slow down");
-            println!("  r = reset");
-            println!("  q = quit");
-            println!();
+                            speed.store(s, std::sync::atomic::Ordering::Relaxed);
 
-            loop {
-                let mut buf = [0u8; 1];
+                            println!("speed = {:.2}", s);
+                        }
 
-                stdin().read_exact(&mut buf).unwrap();
+                        'r' => {
+                            speed.store(1.0, std::sync::atomic::Ordering::Relaxed);
 
-                match buf[0] as char {
-                    'u' => {
-                        let s = speed.load(std::sync::atomic::Ordering::Relaxed) + 0.05;
+                            println!("speed = 1.00");
+                        }
 
-                        speed.store(s, std::sync::atomic::Ordering::Relaxed);
+                        'q' => {
+                            std::process::exit(0);
+                        }
 
-                        println!("speed = {:.2}", s);
+                        _ => {}
                     }
-
-                    'd' => {
-                        let s = speed.load(std::sync::atomic::Ordering::Relaxed) - 0.05;
-
-                        speed.store(s, std::sync::atomic::Ordering::Relaxed);
-
-                        println!("speed = {:.2}", s);
-                    }
-
-                    'r' => {
-                        speed.store(1.0, std::sync::atomic::Ordering::Relaxed);
-
-                        println!("speed = 1.00");
-                    }
-
-                    'q' => {
-                        std::process::exit(0);
-                    }
-
-                    _ => {}
                 }
-            }
-        });
-    }
+            });
+        }
 
-    play_audio(engine, speed)
+        play_audio(engine, speed)
+    })
 }
