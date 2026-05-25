@@ -26,11 +26,13 @@ mod record;
 mod scratcher;
 mod shared_state;
 
-pub const SENSITIVITY: f64 = 100.;
+pub const SENSITIVITY: f64 = 300.;
+pub const INERTIA_OMEGA: f64 = 40.;
 
 pub fn play_audio(
     scratch_state: Arc<ScratchState>,
     sensitivity: f64,
+    inertia_omega: f64,
     samples: Vec<StereoFrame>,
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
@@ -45,8 +47,8 @@ pub fn play_audio(
     assert_eq!(channels, 2);
 
     let record = InterpolatedRecord::new(samples, interpolation::Linear);
-    let scratcher: Scratcher<InterpolatedRecord<interpolation::Linear>> =
-        Scratcher::new(record, scratch_state, sensitivity);
+    let mut scratcher: Scratcher<InterpolatedRecord<interpolation::Linear>> =
+        Scratcher::new(record, scratch_state, sensitivity, inertia_omega);
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -92,5 +94,5 @@ pub fn run(samples: Vec<StereoFrame>, telemetry: Option<PathBuf>, deck: Option<P
     let mouse_processor = MouseProcessor::new(Arc::clone(&state), recorder, deck_tele_shutdown);
     let _ = shared_state::spawn_scratch_input(mouse_processor);
     debugger::monitor_scratch_state(Arc::clone(&state));
-    play_audio(state, SENSITIVITY, samples).unwrap();
+    play_audio(state, SENSITIVITY, INERTIA_OMEGA, samples).unwrap();
 }
