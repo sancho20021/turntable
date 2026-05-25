@@ -1,14 +1,11 @@
 use atomic_float::AtomicF64;
 use sdl2::event::Event;
-use sdl2::mouse::MouseButton;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32};
 
-use crate::scratch::mouse_analyzer::MovementRecorder;
 use crate::scratch::mouse_processor::MouseProcessor;
 
-/// Maps touchpad X position into a scratch region of audio.
-pub struct ScratchController {
+/// Communication channel between touchpad and scratching engine
+pub struct ScratchState {
     /// virtual playhead. Current sample
     pub playhead: AtomicF64,
     pub scratching: AtomicBool,
@@ -18,19 +15,19 @@ pub struct ScratchController {
     pub anchor_x: AtomicI32,
     /// current touchpad / platter position
     pub current_x: AtomicI32,
-    /// how many samples should touchpad delta x increment
-    pub sensitivity: f64,
+    /// playback speed
+    pub speed: AtomicF64,
 }
 
-impl ScratchController {
-    pub fn new(playhead: f64, sensitivity: f64) -> Self {
+impl ScratchState {
+    pub fn new(playhead: f64) -> Self {
         Self {
             playhead: AtomicF64::new(playhead),
             scratching: AtomicBool::new(false),
             anchor_sample: AtomicF64::new(playhead),
             anchor_x: AtomicI32::new(0),
             current_x: AtomicI32::new(0),
-            sensitivity,
+            speed: AtomicF64::new(1.),
         }
     }
 }

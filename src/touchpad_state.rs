@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI32, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 pub struct TouchpadState {
     pub x: AtomicI32,

@@ -4,9 +4,9 @@ use std::{
     time::Duration,
 };
 
-use crate::scratch::controller::ScratchController;
+use crate::scratch::shared_state::ScratchState;
 
-pub fn monitor_controller(controller: Arc<ScratchController>) {
+pub fn monitor_scratch_state(controller: Arc<ScratchState>) {
     thread::spawn(move || {
         loop {
             // Loading with Relaxed ordering is sufficient for simple logging/telemetry

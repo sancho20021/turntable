@@ -1,78 +1,63 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 pub struct MouseSample {
     pub timestamp: Duration,
-    pub x: f64,
+    pub raw_x: f64,
 }
 
 pub struct MovementRecorder {
-    start_time: Instant,
-    samples: Vec<Vec<MouseSample>>,
+    samples: Vec<MouseSample>,
+    start: Instant,
+    output: PathBuf,
 }
 
 impl MovementRecorder {
-    pub fn new() -> Self {
+    pub fn new(out: &Path) -> Self {
         Self {
-            start_time: Instant::now(),
-            // Pre-allocate 10 seconds of data at 125Hz to avoid re-allocations
-            samples: vec![vec![]],
+            samples: Vec::with_capacity(1000),
+            start: Instant::now(),
+            output: out.to_path_buf(),
         }
     }
 
     /// Record a point. Call this inside your MouseMotion match arm.
     pub fn record(&mut self, x: f64) {
-        self.samples.last_mut().unwrap().push(MouseSample {
-            timestamp: self.start_time.elapsed(),
-            x,
+        self.samples.push(MouseSample {
+            timestamp: self.start.elapsed(),
+            raw_x: x,
         });
     }
 
-    pub fn finish_motion(&mut self) {
-        self.samples.push(vec![]);
-    }
+    /// Flattens the burst data and saves it as a CSV file for Python analysis
+    pub fn finish(&self) {
+        println!("\n{:=^60}", " EXPORTING TELEMETRY DATA ");
 
-    /// A simple "Smoothness Report"
-    pub fn analyze(&self) {
-    println!("\n{:=^60}", " VELOCITY STABILITY ANALYSIS ");
-    println!("{:<8} | {:<10} | {:<12} | {:<12}", "Burst", "Avg Vel", "V-Jitter", "Consistency");
-    println!("{}", "-".repeat(60));
+        // 1. Build the single giant string in memory
+        let mut csv_output = String::from("timestamp_ms,raw_x,smoothed_x\n");
 
-    for (idx, burst) in self.samples.iter().enumerate() {
-        if burst.len() < 3 { continue; }
+        // Map your flat samples directly to formatted strings
+        let rows: Vec<String> = self
+            .samples
+            .iter()
+            .map(|s| format!("{},{}\n", s.timestamp.as_millis(), s.raw_x))
+            .collect();
 
-        let mut velocities = Vec::new();
+        csv_output.push_str(&rows.concat());
 
-        for i in 1..burst.len() {
-            let dx = (burst[i].x - burst[i-1].x).abs() as f64;
-            let dt = (burst[i].timestamp - burst[i-1].timestamp).as_secs_f64();
-
-            if dt > 0.0 {
-                // Velocity in Pixels per Second
-                velocities.push(dx / dt);
+        // 2. Write everything out to the file path in one shot
+        match std::fs::write(&self.output, csv_output) {
+            Ok(_) => {
+                println!(
+                    "Successfully wrote {} points to: {:?}",
+                    self.samples.len(),
+                    self.output
+                );
+                println!("{:=^60}\n", "");
             }
+            Err(e) => println!("Failed to save telemetry file: {}", e),
         }
-
-        let avg_vel = velocities.iter().sum::<f64>() / velocities.len() as f64;
-
-        // V-Jitter: Standard deviation of velocity
-        // High V-Jitter means the "speed" is jumping around even if your hand is steady
-        let variance = velocities.iter()
-            .map(|&v| (v - avg_vel).powi(2))
-            .sum::<f64>() / velocities.len() as f64;
-        let v_jitter = variance.sqrt();
-
-        // Consistency: How much of the speed is "noise"
-        // (1.0 - Relative Standard Deviation)
-        let consistency = if avg_vel > 0.0 {
-            (1.0 - (v_jitter / avg_vel)).max(0.0) * 100.0
-        } else {
-            0.0
-        };
-
-        println!(
-            "#{:<7} | {:>8.1} px/s | {:>9.1} | {:>10.1}%",
-            idx + 1, avg_vel, v_jitter, consistency
-        );
     }
-}
 }

@@ -1,39 +1,40 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use sdl2::{event::Event, mouse::MouseButton};
+use sdl2::{event::Event, keyboard::Keycode, mouse::MouseButton};
 
-use crate::scratch::{controller::ScratchController, mouse_analyzer::MovementRecorder};
+use crate::scratch::{mouse_analyzer::MovementRecorder, shared_state::ScratchState};
 
+/// Translates mouse events to Scratch state
+/// But also currently responsible for quitting the window and finishing all monitors
 pub struct MouseProcessor {
-    controller: Arc<ScratchController>,
+    scratch_data: Arc<ScratchState>,
     recorder: MovementRecorder,
-    smoothed_x: f64,
-    /// Coefficient of smoothing of mouse movement events.
-    /// 0 = no smoothing. 1 = maximum smoothing
-    smoothing: f64,
+    deck_monitor_shutdown: Arc<AtomicBool>,
 }
 
 impl MouseProcessor {
-    pub fn new(controller: Arc<ScratchController>, smoothing: f64) -> Self {
+    pub fn new(
+        scratch_data: Arc<ScratchState>,
+        recorder: MovementRecorder,
+        deck_monitor_shutdown: Arc<AtomicBool>,
+    ) -> Self {
         Self {
-            controller,
-            recorder: MovementRecorder::new(),
-            smoothed_x: 0.,
-            smoothing,
+            scratch_data,
+            recorder,
+            deck_monitor_shutdown,
         }
     }
 
     pub fn handle_event(&mut self, event: sdl2::event::Event) {
-        let ctrl = &self.controller;
+        let ctrl = &self.scratch_data;
         match event {
             Event::MouseMotion { x, .. } => {
-                let mix = 1.0 - self.smoothing;
-                self.smoothed_x += (x as f64 - self.smoothed_x) * mix;
+                ctrl.current_x.store(x, Ordering::Relaxed);
 
-                ctrl.current_x
-                    .store(self.smoothed_x as i32, Ordering::Relaxed);
-
-                self.recorder.record(self.smoothed_x);
+                self.recorder.record(x as f64);
             }
 
             Event::MouseButtonDown {
@@ -41,15 +42,13 @@ impl MouseProcessor {
                 x,
                 ..
             } => {
-                self.smoothed_x = x as f64;
-
                 ctrl.anchor_sample
                     .store(ctrl.playhead.load(Ordering::Relaxed), Ordering::Relaxed);
                 ctrl.anchor_x.store(x, Ordering::Relaxed);
                 ctrl.current_x.store(x, Ordering::Relaxed);
                 ctrl.scratching.store(true, Ordering::Relaxed);
 
-                self.recorder.record(self.smoothed_x);
+                self.recorder.record(x as f64);
             }
 
             Event::MouseButtonUp {
@@ -57,12 +56,34 @@ impl MouseProcessor {
                 ..
             } => {
                 ctrl.scratching.store(false, Ordering::Relaxed);
-                self.recorder.finish_motion();
+            }
+
+            Event::KeyDown { keycode, .. } => {
+                if let Some(key) = keycode {
+                    match key {
+                        Keycode::R => {
+                            println!("Speed reset");
+                            ctrl.speed.store(1., Ordering::Relaxed);
+                        }
+                        Keycode::Up => {
+                            let speed = ctrl.speed.load(Ordering::Relaxed) + 0.01;
+                            print!("Speed := {:.0}%", speed * 100.0);
+                            ctrl.speed.store(speed, Ordering::Relaxed);
+                        }
+                        Keycode::Down => {
+                            let speed = ctrl.speed.load(Ordering::Relaxed) - 0.01;
+                            print!("Speed := {:.0}%", speed * 100.0);
+                            ctrl.speed.store(speed, Ordering::Relaxed);
+                        }
+                        _ => (),
+                    }
+                }
             }
 
             Event::Quit { .. } => {
                 println!("Mouse statistics:");
-                self.recorder.analyze();
+                self.recorder.finish();
+                self.deck_monitor_shutdown.store(true, Ordering::Relaxed);
                 return;
             }
 
