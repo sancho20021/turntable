@@ -10,7 +10,7 @@ pub struct MouseSample {
 
 pub struct MovementRecorder {
     samples: Vec<MouseSample>,
-    start: Instant,
+    pub start: Instant,
     output: PathBuf,
 }
 
@@ -36,7 +36,7 @@ impl MovementRecorder {
         println!("\n{:=^60}", " EXPORTING TELEMETRY DATA ");
 
         // 1. Build the single giant string in memory
-        let mut csv_output = String::from("timestamp_ms,raw_x,smoothed_x\n");
+        let mut csv_output = String::from("timestamp_ms,x\n");
 
         // Map your flat samples directly to formatted strings
         let rows: Vec<String> = self

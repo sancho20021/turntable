@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,64 +15,75 @@ pub struct DeckSample {
 }
 
 pub struct DeckMonitor {
-    samples: Vec<DeckSample>,
-    start: Instant,
+    state: Arc<ScratchState>,
     output: PathBuf,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
-pub fn monitor_deck_playhead(
-    state: Arc<ScratchState>,
-    shutdown_flag: Arc<AtomicBool>,
-    output_path: PathBuf,
-) {
-    let mut monitor = DeckMonitor {
-        samples: Vec::with_capacity(10_000),
-        start: Instant::now(),
-        output: output_path,
-    };
-    std::thread::spawn(move || {
-        println!("[Monitor] Background target tracking active...");
+impl DeckMonitor {
+    pub fn new(state: Arc<ScratchState>, output: &Path) -> Self {
+        Self {
+            output: output.to_path_buf(),
+            state,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-        while !shutdown_flag.load(Ordering::Relaxed) {
-            let is_scratching = state.scratching.load(Ordering::Relaxed);
+    pub fn start(&self, start_time: Instant) {
+        let mut samples = Vec::with_capacity(10_000);
+        let output = self.output.clone();
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let state = Arc::clone(&self.state);
 
-            if is_scratching {
-                let timestamp = monitor.start.elapsed();
-                let playhead = state.playhead.load(Ordering::Relaxed);
-                monitor.samples.push(DeckSample {
-                    timestamp,
-                    playhead,
-                });
+        std::thread::spawn(move || {
+            println!("[Monitor] Background target tracking active...");
+
+            while !shutdown_flag.load(Ordering::Relaxed) {
+                match state.platter.load() {
+                    crate::scratch::shared_state::PlatterState::Playing => (),
+                    crate::scratch::shared_state::PlatterState::Scratching { .. } => {
+                        let timestamp = start_time.elapsed();
+                        let playhead = state.playhead.load(Ordering::Relaxed);
+                        samples.push(DeckSample {
+                            timestamp,
+                            playhead,
+                        });
+                    }
+                }
+
+                // High frequency polling rate (approx 1000Hz)
+                std::thread::sleep(Duration::from_millis(4));
             }
 
-            // High frequency polling rate (approx 1000Hz)
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            // --- EXPORT PHASE (Triggers on exit) ---
+            println!("\n{:=^60}", " EXPORTING MONITOR TELEMETRY DATA ");
 
-        // --- EXPORT PHASE (Triggers on exit) ---
-        println!("\n{:=^60}", " EXPORTING MONITOR TELEMETRY DATA ");
+            let mut csv_output = String::from("timestamp_ms,playhead\n");
 
-        let mut csv_output = String::from("timestamp_ms,playhead\n");
+            let rows: Vec<String> = samples
+                .iter()
+                .map(|s| format!("{},{:.4}\n", s.timestamp.as_millis(), s.playhead,))
+                .collect();
 
-        let rows: Vec<String> = monitor
-            .samples
-            .iter()
-            .map(|s| format!("{},{}\n", s.timestamp.as_millis(), s.playhead))
-            .collect();
+            csv_output.push_str(&rows.concat());
 
-        csv_output.push_str(&rows.concat());
-
-        // Write everything out to the file path in one shot
-        match std::fs::write(&monitor.output, csv_output) {
-            Ok(_) => {
-                println!(
-                    "Successfully wrote {} points to: {:?}",
-                    monitor.samples.len(),
-                    monitor.output
-                );
-                println!("{:=^60}\n", "");
+            // Write everything out to the file path in one shot
+            match std::fs::write(&output, csv_output) {
+                Ok(_) => {
+                    println!(
+                        "Successfully wrote {} points to: {:?}",
+                        samples.len(),
+                        output
+                    );
+                    println!("{:=^60}\n", "");
+                }
+                Err(e) => println!("Failed to save telemetry file: {}", e),
             }
-            Err(e) => println!("Failed to save telemetry file: {}", e),
-        }
-    });
+        });
+    }
+
+    pub fn finish(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

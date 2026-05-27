@@ -34,5 +34,7 @@ fn main() {
         panic!("No audio decoded");
     }
     println!("Decoded {} frames", samples.len());
-    scratch::run(samples, args.mouse_data, args.deck_data);
+
+    let mut app = scratch::app::Application::new(args.mouse_data, args.deck_data);
+    app.start(samples);
 }
