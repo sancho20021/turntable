@@ -4,6 +4,7 @@ mod read_touchpad;
 mod scratch;
 mod stereo_frame;
 mod touchpad_state;
+mod scratchv2;
 
 use std::path::PathBuf;
 

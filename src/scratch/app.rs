@@ -168,7 +168,6 @@ pub fn start_deck(
         sample_rate: 44100,
         // buffer_size: BufferSize::Fixed(4096),  // for testing purposes to make glitches easily hearable
         buffer_size: BufferSize::Fixed(512),
-
     };
 
     // let mut config = device.default_output_config()?;
@@ -185,7 +184,7 @@ pub fn start_deck(
 
     let stream = device.build_output_stream(
         &config.into(),
-        move |data: &mut [f32], _| {
+        move |data: &mut [f32], i| {
             scratcher.write_frames(data);
         },
         move |err| {
