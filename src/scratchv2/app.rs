@@ -1,85 +1,91 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use cpal::{
     BufferSize, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use rtrb::Producer;
+use sdl2::event::Event;
 
 use crate::{
     interpolation,
     scratch::record::InterpolatedRecord,
-    scratchv2::{platter_audio_processor::PlatterAudioProcessor, virtual_platter::PlatterSample},
+    scratchv2::{
+        platter_audio_processor::PlatterAudioProcessor, platter_driver,
+        scratch_controller::ScratchController, virtual_platter::VirtualPlatter,
+    },
+    sdl_deck_event::to_deck_event,
     stereo_frame::StereoFrame,
 };
 
 /// Main app loop
-///
-/// The updates are sent no more often then the specified frequency
 pub fn start(
     speed: f64,
+    touchpad_sensitivity: f64,
     samples: Vec<StereoFrame>,
-    extra_lattency: Duration,
     platter_update_freq_hz: f64,
-    jitter_fac: f64,
+    buffer_size: u32,
 ) {
-    let (stream, mut platter) =
-        start_deck(samples, extra_lattency, platter_update_freq_hz, jitter_fac).unwrap();
+    let sdl = sdl2::init().unwrap();
+    let video = sdl.video().unwrap();
 
-    let pause = Duration::from_secs_f64(1.0 / platter_update_freq_hz);
-    let pos_step_nanos = (pause.as_nanos() as f64 * speed).floor() as u64;
-    let mut platter_pos_nanos = 0;
-    loop {
-        let sample = PlatterSample {
-            time: Instant::now(),
-            record_pos: platter_pos_nanos,
-        };
-        println!("pushing {sample:?}");
-        match platter.push(sample) {
-            Ok(_) => (),
-            Err(_) => {
-                println!("Platter buffer IS FULL, terminating");
-                return;
+    let _window = video
+        .window("scratch input", 600, 300)
+        .position_centered()
+        .build()
+        .unwrap();
+
+    let mut pump = sdl.event_pump().unwrap();
+    let (stream, platter) = start_deck(samples, buffer_size).unwrap();
+    let controller = ScratchController::new(platter, speed, touchpad_sensitivity);
+    let platter_shutdown = Arc::new(AtomicBool::new(false));
+    let driver = platter_driver::spawn_platter_driver(
+        controller.clone(),
+        platter_update_freq_hz,
+        Arc::clone(&platter_shutdown),
+    );
+
+    for event in pump.wait_iter() {
+        if let Event::Quit { .. } = event {
+            println!("Stopping the app");
+            drop(stream);
+            platter_shutdown.store(true, Ordering::Relaxed);
+            if let Err(_) = driver.join() {
+                eprintln!("Platter driver panicked");
             }
+            return;
         }
-        platter_pos_nanos += pos_step_nanos;
-        std::thread::sleep(pause);
+        if let Some(event) = to_deck_event(event) {
+            controller.handle_deck_event(event);
+        }
     }
 }
 
 fn start_deck(
     samples: Vec<StereoFrame>,
-    extra_lattency: Duration,
-    platter_update_freq_hz: f64,
-    jitter_fac: f64,
-) -> anyhow::Result<(Stream, Producer<PlatterSample>)> {
+    buffer_size: u32,
+) -> anyhow::Result<(Stream, VirtualPlatter)> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().expect("No output device");
     let sample_rate = 44100;
 
-    let buffer_size = 1024;
-
     let config = StreamConfig {
         channels: 2,
         sample_rate,
-        // buffer_size: BufferSize::Fixed(4096),  // for testing purposes to make glitches easily hearable
         buffer_size: BufferSize::Fixed(buffer_size),
     };
-
-    // let mut config = device.default_output_config()?;
 
     println!("Output config: {:?}", config);
 
     let record = InterpolatedRecord::new(samples, interpolation::Linear);
-    let (mut processor, platter) = PlatterAudioProcessor::new(
-        record,
-        sample_rate as usize,
-        buffer_size as usize,
-        extra_lattency,
-        platter_update_freq_hz,
-        jitter_fac,
-    );
+    let (mut processor, platter) =
+        PlatterAudioProcessor::new(record, sample_rate as usize, buffer_size as usize);
 
     let stream = device.build_output_stream(
         &config.into(),

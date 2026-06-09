@@ -1,12 +1,14 @@
+mod deck_event;
 mod decoder;
 mod interpolation;
 mod read_touchpad;
 mod scratch;
 mod scratchv2;
+mod sdl_deck_event;
 mod stereo_frame;
 mod touchpad_state;
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -49,13 +51,13 @@ enum Commands {
         #[arg(short, long, default_value_t = 1.0)]
         speed: f64,
 
-        /// Extra lattency of audio playing in ms
-        #[arg(long, default_value_t = 10)]
-        extra_lat: u64,
+        /// Audio callback buffer size
+        #[arg(short, long, default_value_t = 512)]
+        buffer: u32,
 
-        /// Jitter factor for virtual platter buffer size calculation
-        #[arg(short, long, default_value_t = 2.)]
-        jitter: f64,
+        /// Touchpad sensitivity factor
+        #[arg(short('t'), long, default_value_t = 1.)]
+        sensitivity: f64,
     },
 }
 
@@ -84,10 +86,13 @@ fn main() {
             input,
             freq,
             speed,
-            extra_lat,
-            jitter,
+            buffer,
+            sensitivity,
         } => {
-            println!("Starting V2 App (Freq: {}Hz, Speed: {}x)...", freq, speed);
+            println!(
+                "Starting V2 App (platter update Freq: {:.2}Hz, Speed: {}x, buffer: {})...",
+                freq, speed, buffer
+            );
             println!("Loading: {}", input.to_string_lossy());
 
             let samples = load_file(&input.to_string_lossy()).unwrap();
@@ -96,7 +101,7 @@ fn main() {
             }
             println!("Decoded {} frames", samples.len());
 
-            scratchv2::app::start(speed, samples, Duration::from_millis(extra_lat), freq, jitter);
+            scratchv2::app::start(speed, sensitivity, samples, freq, buffer);
         }
     }
 }

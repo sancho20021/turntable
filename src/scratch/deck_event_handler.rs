@@ -3,25 +3,15 @@ use std::{
     time::Instant,
 };
 
-use crate::scratch::{
+use crate::{deck_event::DeckEvent, scratch::{
     mouse_analyzer::MovementRecorder,
     shared_state::{MouseUpdate, PlatterState, ScratchState},
-};
+}};
 
 /// Handles DeckEvents and updates the deck state
 pub struct DeckEventHandler {
     scratch_data: Arc<ScratchState>,
     recorder: MovementRecorder,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum DeckEvent {
-    MouseMotion(i32),
-    MouseDown(i32),
-    MouseUp(i32),
-    KeyReset,
-    KeyUp,
-    KeyDown,
 }
 
 impl DeckEventHandler {
