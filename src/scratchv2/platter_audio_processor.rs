@@ -1,117 +1,103 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use crossbeam::atomic::AtomicCell;
-use rtrb::Consumer;
+use rtrb::Producer;
 
 use crate::{
     scratch::record::Record,
-    scratchv2::virtual_platter::{self, PlatterSample},
+    scratchv2::virtual_platter::{self, PlatterError, PlatterSample, VirtualPlatter},
 };
 
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor<R> {
-    consumer: Consumer<PlatterSample>,
-    time_bridge: TimeAnchorBridge,
+    extra_lattency: Duration,
+    platter: VirtualPlatter,
     sample_rate: usize,
     record: R,
+    buffer_size: usize,
 }
 
 impl<R: Record> PlatterAudioProcessor<R> {
+    fn block_dur(buffer_size: usize, sample_rate: usize) -> Duration {
+        Duration::from_secs_f64((buffer_size as f64 / 2.) / (sample_rate as f64))
+    }
+
+    /// Returns duration of the audio block requested by cpal (according to provided the buffer size and sample rate)
+    pub fn block_duration(&self) -> Duration {
+        Self::block_dur(self.buffer_size, self.sample_rate)
+    }
+
+    pub fn new(
+        record: R,
+        sample_rate: usize,
+        buffer_size: usize,
+        extra_lattency: Duration,
+        platter_update_freq_hz: f64,
+        jitter_factor: f64,
+    ) -> (Self, Producer<PlatterSample>) {
+        let block_duration = Self::block_dur(buffer_size, sample_rate);
+        let (prod, platter) =
+            VirtualPlatter::new(block_duration, platter_update_freq_hz, jitter_factor);
+        let processor = PlatterAudioProcessor {
+            extra_lattency,
+            platter,
+            sample_rate,
+            record,
+            buffer_size,
+        };
+        (processor, prod)
+    }
+
+    /// Converts position in seconds to sample number
+    pub fn secs_to_sample(&self, secs: f64) -> f64 {
+        self.sample_rate as f64 * secs
+    }
+
     /// Warning: this function must be very fast, no allocation
-    pub fn write_frames(&mut self, data: &mut [f32], callback_time: cpal::StreamInstant) {
-        let block_duration =
-            Duration::from_secs_f64(data.len() as f64 / 2.0 / self.sample_rate as f64);
+    pub fn write_frames(&mut self, data: &mut [f32]) {
+        let samples_n = data.len() as f64 / 2.;
 
-        let start = callback_time.sub(block_duration).unwrap_or(callback_time);
-        let finish = callback_time;
+        let block_duration = Duration::from_secs_f64(samples_n / self.sample_rate as f64);
 
-        let start_pos = virtual_platter::get_sample(start, &mut self.consumer).unwrap();
-        let finish_pos = virtual_platter::get_sample(finish, &mut self.consumer).unwrap();
+        let finish = Instant::now() - self.extra_lattency;
+        let start = finish - block_duration - self.extra_lattency;
 
-        // let start = start_pos.0.record_pos
-        // todo
+        let handle_platter_error = |e: PlatterError, target_time: std::time::Instant| {
+            println!("virtual platter error: {e:?}");
+            match e {
+                PlatterError::OldSampleRequested { oldest } => (oldest.clone(), oldest),
+                PlatterError::NewerSampleRequested { newest } => (newest.clone(), newest),
+                PlatterError::NoSamples => {
+                    let default_sample = PlatterSample {
+                        time: target_time,
+                        record_pos: 0,
+                    };
+                    (default_sample.clone(), default_sample)
+                }
+            }
+        };
+        let start_pos = match self.platter.get_sample(start) {
+            Ok(s) => s,
+            Err(e) => handle_platter_error(e, start),
+        };
+        let finish_pos = match self.platter.get_sample(finish) {
+            Ok(s) => s,
+            Err(e) => handle_platter_error(e, finish),
+        };
 
-        // 3. LOOP: Process the samples
+        let start_pos_secs = virtual_platter::interpolate(start_pos.0, start_pos.1, start);
+        let finish_pos_secs = virtual_platter::interpolate(finish_pos.0, finish_pos.1, finish);
+
+        let start_sample = self.secs_to_sample(start_pos_secs);
+        let finish_sample = self.secs_to_sample(finish_pos_secs);
+        println!("playing [{start_sample:.1}..{finish_sample:.1})");
+        let step = (finish_sample - start_sample) / samples_n;
+        let mut sample_i = start_sample;
+
         for frame in data.chunks_mut(2) {
-            // Calculate current sample based on playhead
-            todo!()
+            let sample = self.record.get_sample(sample_i);
+            frame[0] = sample.l;
+            frame[1] = sample.r;
+            sample_i += step;
         }
-    }
-}
-
-/// Structure to map `std::time::Instant` to `cpal::StreamInstant`
-/// fully correcting for clock drift over time.
-#[derive(Clone)]
-pub struct TimeAnchorBridge {
-    /// Initialized once when the bridge is created.
-    system_base_time: Instant,
-    /// most recent CPAL stream time anchor minus most recent CPU time anchor (in nanoseconds wince `system_base_time`)
-    diff_stream_cpu_nanos: Arc<AtomicI64>,
-}
-
-impl TimeAnchorBridge {
-    /// Creates a new `TimeAnchorBridge` and captures the local system base time.
-    pub fn new() -> Self {
-        Self {
-            system_base_time: Instant::now(),
-            diff_stream_cpu_nanos: Arc::new(AtomicI64::new(0)),
-        }
-    }
-
-    /// **MUST be called at the very start of every single audio callback block.**
-    ///
-    /// This recalibrates the relationship between the CPU clock and the cpal clock,
-    /// continuously resetting any clock drift before it accumulates.
-    ///
-    /// Pass `info.timestamp().callback` here to align the current CPU execution
-    /// directly with CPAL's present timeline grid.
-    pub fn update_from_audio_thread(&self, stream_now: cpal::StreamInstant) {
-        let cpu_now = Instant::now();
-
-        // cpal::StreamInstant::new(secs, nanos)
-
-        // Calculate nanoseconds elapsed since our immutable base time
-        let cpu = cpu_now.duration_since(self.system_base_time);
-        let cpu_timestamp = cpal::StreamInstant::new(cpu.as_secs() as i64, cpu.subsec_nanos());
-
-        let diff = if stream_now > cpu_timestamp {
-            stream_now
-                .duration_since(&cpu_timestamp)
-                .unwrap()
-                .as_nanos() as i64
-        } else {
-            -(cpu_timestamp
-                .duration_since(&stream_now)
-                .unwrap()
-                .as_nanos() as i64)
-        };
-        self.diff_stream_cpu_nanos.store(diff, Ordering::Relaxed);
-    }
-
-    /// **Called by the Producer/Sensor thread to translate an event's CPU time.**
-    ///
-    /// Takes a standard `Instant` and projects it onto the CPAL `StreamInstant` timeline
-    /// using the drift-corrected anchor established by the last audio block.
-    pub fn map_to_stream_instant(&self, cpu_time: Instant) -> cpal::StreamInstant {
-        let diff_stream_cpu = self.diff_stream_cpu_nanos.load(Ordering::Relaxed);
-
-        // Calculate where this specific event falls relative to our struct's base time.
-        let target_cpu_nanos = if cpu_time >= self.system_base_time {
-            cpu_time.duration_since(self.system_base_time).as_nanos() as i64
-        } else {
-            -(self.system_base_time.duration_since(cpu_time).as_nanos() as i64)
-        };
-
-        // Calculate target nanoseconds, safely clamping to 0 before casting to u64
-        let target_nanos = (target_cpu_nanos + diff_stream_cpu).max(0) as u64;
-        let target_stream = Duration::from_nanos(target_nanos);
-
-        cpal::StreamInstant::new(target_stream.as_secs() as i64, target_stream.subsec_nanos())
     }
 }
