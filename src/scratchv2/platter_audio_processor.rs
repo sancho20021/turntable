@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::{
-    scratch::record::Record,
+    record::Record,
     scratchv2::virtual_platter::{PlatterSample, VirtualPlatter},
 };
 
@@ -30,6 +30,7 @@ impl<R: Record> PlatterAudioProcessor<R> {
         let t_now = cur_measurement.timestamp_nanos;
 
         // This is a corner case that shouldn't normally happen. New timestamp is behind old timestamp, so we just return current velocity
+        // TODO: well looks like it happens when updates from virtual platter are slow
         if t_now <= t_prev {
             return self.last_ema_vel;
         }

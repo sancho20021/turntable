@@ -1,9 +1,6 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use cpal::{
@@ -14,7 +11,7 @@ use sdl2::event::Event;
 
 use crate::{
     interpolation,
-    scratch::record::InterpolatedRecord,
+    record::InterpolatedRecord,
     scratchv2::{
         platter_audio_processor::PlatterAudioProcessor, platter_driver,
         scratch_controller::ScratchController, virtual_platter::VirtualPlatter,
@@ -30,6 +27,7 @@ pub fn start(
     samples: Vec<StereoFrame>,
     platter_update_freq_hz: f64,
     buffer_size: u32,
+    sample_rate: u32,
 ) {
     let sdl = sdl2::init().unwrap();
     let video = sdl.video().unwrap();
@@ -41,7 +39,7 @@ pub fn start(
         .unwrap();
 
     let mut pump = sdl.event_pump().unwrap();
-    let (stream, platter) = start_deck(samples, buffer_size).unwrap();
+    let (stream, platter) = start_deck(samples, buffer_size, sample_rate).unwrap();
     let controller = ScratchController::new(platter, speed, touchpad_sensitivity);
     let platter_shutdown = Arc::new(AtomicBool::new(false));
     let driver = platter_driver::spawn_platter_driver(
@@ -69,11 +67,11 @@ pub fn start(
 fn start_deck(
     samples: Vec<StereoFrame>,
     buffer_size: u32,
+    sample_rate: u32,
 ) -> anyhow::Result<(Stream, VirtualPlatter)> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().expect("No output device");
-    let sample_rate = 44100;
 
     let config = StreamConfig {
         channels: 2,
