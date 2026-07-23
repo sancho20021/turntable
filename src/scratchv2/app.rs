@@ -22,7 +22,6 @@ use crate::{
 
 /// Main app loop
 pub fn start(
-    speed: f64,
     touchpad_sensitivity: f64,
     samples: Vec<StereoFrame>,
     platter_update_freq_hz: f64,
@@ -40,7 +39,7 @@ pub fn start(
 
     let mut pump = sdl.event_pump().unwrap();
     let (stream, platter) = start_deck(samples, buffer_size, sample_rate).unwrap();
-    let controller = ScratchController::new(platter, speed, touchpad_sensitivity);
+    let controller = ScratchController::new(platter, 1., touchpad_sensitivity);
     let platter_shutdown = Arc::new(AtomicBool::new(false));
     let driver = platter_driver::spawn_platter_driver(
         controller.clone(),

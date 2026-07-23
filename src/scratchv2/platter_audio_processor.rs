@@ -6,6 +6,11 @@ use crate::{
     scratchv2::virtual_platter::{INanos, PlatterSample, UNanos, VirtualPlatter},
 };
 
+/// time that (approximately) takes to remove the lag between virtual platter and audio playback.
+///
+/// longer time reduces speed wobbles
+static SYNC_TIME: Duration = Duration::from_millis(2000);
+
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor<R> {
     platter: VirtualPlatter,
@@ -13,8 +18,18 @@ pub struct PlatterAudioProcessor<R> {
     record: R,
     /// timestamp and nanosecond of last sample played
     last_played: PlatterSample,
-    /// Last observed virtual playhead position
-    last_measurement: PlatterSample,
+    //// Second newest measurement of virtual playhead
+    first_measurement: PlatterSample,
+    /// Newest observed virtual playhead position
+    second_measurement: PlatterSample,
+    /// filtered nanoseconds of playback played per block
+    filtered_nanos_played: INanos,
+    /// filtered lag of played nanos behind last observed nanos
+    filtered_lag: INanos,
+}
+
+fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
+    new_value_proportion * new_value + (1. - new_value_proportion) * old_value
 }
 
 impl<R: Record> PlatterAudioProcessor<R> {
@@ -24,15 +39,29 @@ impl<R: Record> PlatterAudioProcessor<R> {
 
     pub fn new(record: R, sample_rate: usize) -> (Self, VirtualPlatter) {
         let platter = VirtualPlatter::new();
-        let last_measurement = platter.get_playhead();
+        let first_measurement = platter.get_playhead();
+        let second_measurement = PlatterSample {
+            timestamp_nanos: UNanos(first_measurement.timestamp_nanos.0 + 1),
+            record_pos: first_measurement.record_pos,
+        };
         let processor = PlatterAudioProcessor {
             platter: platter.clone(),
             sample_rate,
             record,
-            last_played: last_measurement,
-            last_measurement,
+            last_played: first_measurement,
+            second_measurement,
+            first_measurement,
+            filtered_nanos_played: INanos(0), // one of sources of slow startup
+            filtered_lag: INanos(0),
         };
         (processor, platter)
+    }
+
+    fn update_measurements(&mut self, cur: PlatterSample) {
+        if self.second_measurement.timestamp_nanos != cur.timestamp_nanos {
+            self.first_measurement = self.second_measurement;
+            self.second_measurement = cur;
+        }
     }
 
     /// Converts position in nanoseconds to sample number
@@ -49,34 +78,71 @@ impl<R: Record> PlatterAudioProcessor<R> {
     pub fn write_frames(&mut self, data: &mut [f32]) {
         let samples_n = data.len() as f64 / 2.;
 
-        let cur_measurement = self.platter.get_playhead();
+        self.update_measurements(self.platter.get_playhead());
+
         let block_duration = self.block_dur(data.len());
 
-        let target_timestamp =
-            UNanos(self.last_played.timestamp_nanos.0 + block_duration.as_nanos() as u64);
-        // todo: with time, play_until may lag behind or rush in front of current virtual platter measurement.
-        // in this case, we should potentially increase or decrease block_duration dynamically so that
-        // the audio processor clock synchronizes with virtual platter clock.
+        let target_timestamp = {
+            let target_timestamp =
+                UNanos(self.last_played.timestamp_nanos.0 + block_duration.as_nanos() as u64);
 
-        let target_playhead_nanos = INanos(Linear::interpolate_two(
-            self.last_measurement.timestamp_nanos.0,
-            self.last_measurement.record_pos.0 as f64,
-            cur_measurement.timestamp_nanos.0,
-            cur_measurement.record_pos.0 as f64,
-            1., // if interpolation can't be done, assume normal playback speed = 1
-            target_timestamp.0,
-        ) as i64);
+            {
+                // target_timestamp may lag behind or rush in front of current virtual platter measurement
+                let lags_behind = INanos(
+                    self.second_measurement.timestamp_nanos.0 as i64 - target_timestamp.0 as i64,
+                );
+
+                // we must filter the lag because if observations arrive less frequently then write_frames,
+                // then lag will jump back and forth
+                self.filtered_lag =
+                    INanos(ma_filter(self.filtered_lag.0 as f64, lags_behind.0 as f64, 0.1) as i64);
+
+                self.filtered_lag = self.filtered_lag.clamp(INanos(-5_000_000), INanos(5_000_000)); // think of good numbers
+            }
+
+            // if we add lags_behind to target_timestamp, we will remove the lag.
+            // we do it slowly (approximately in SYNC_TIME seconds)
+            let lags_behind_step = INanos(
+                self.filtered_lag.0 / ((SYNC_TIME.as_nanos() / block_duration.as_nanos()) as i64),
+            );
+            UNanos((target_timestamp.0 as i64 + lags_behind_step.0) as u64)
+        };
+
+        let target_playhead_nanos = {
+            let target_playhead_raw = INanos(Linear::interpolate_two(
+                self.first_measurement.timestamp_nanos.0,
+                self.first_measurement.record_pos.0 as f64,
+                self.second_measurement.timestamp_nanos.0,
+                self.second_measurement.record_pos.0 as f64,
+                1., // if interpolation can't be done, assume normal playback speed = 1
+                target_timestamp.0,
+            ) as i64);
+            let played_nanos_raw = INanos(target_playhead_raw.0 - self.last_played.record_pos.0);
+
+            let alpha = 0.8; // higher - snappier
+            self.filtered_nanos_played = INanos(ma_filter(
+                self.filtered_nanos_played.0 as f64,
+                played_nanos_raw.0 as f64,
+                alpha,
+            ) as i64);
+            INanos(self.last_played.record_pos.0 + self.filtered_nanos_played.0)
+        };
 
         let mut playhead = self.nanosecs_to_sample(self.last_played.record_pos);
         let target_playhead = self.nanosecs_to_sample(target_playhead_nanos);
         let step = (target_playhead - playhead) / samples_n;
 
         log::debug!(
-            "observations at {}, {}",
-            self.last_measurement.timestamp_nanos.0,
-            cur_measurement.timestamp_nanos.0
+            "observations at {}, ..+{}ms",
+            self.first_measurement.timestamp_nanos.0,
+            (self.second_measurement.timestamp_nanos.0 - self.first_measurement.timestamp_nanos.0)
+                / 1000000
         );
-        log::debug!("playing at = {:.0}, {:.0}", self.last_played.timestamp_nanos.0, target_timestamp.0);
+        log::debug!(
+            "playing at = {:.0}, ..+{:.0}ms",
+            self.last_played.timestamp_nanos.0,
+            (target_timestamp.0 - self.last_played.timestamp_nanos.0) / 1000000
+        );
 
         log::debug!(
             "playing [{playhead:.0}..{:.0}) at speed {:.2}",
@@ -95,6 +161,5 @@ impl<R: Record> PlatterAudioProcessor<R> {
             timestamp_nanos: target_timestamp,
             record_pos: target_playhead_nanos,
         };
-        self.last_measurement = cur_measurement;
     }
 }
