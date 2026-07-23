@@ -2,11 +2,11 @@ mod deck_event;
 mod decoder;
 mod interpolation;
 mod read_touchpad;
+mod record;
 mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
 mod touchpad_state;
-mod record;
 
 use std::path::PathBuf;
 
@@ -34,10 +34,6 @@ enum Commands {
         #[arg(short, long, default_value_t = 100.0)]
         freq: f64,
 
-        /// Playback speed multiplier
-        #[arg(short, long, default_value_t = 1.0)]
-        speed: f64,
-
         /// Audio callback buffer size
         #[arg(short, long, default_value_t = 512)]
         buffer: u32,
@@ -60,14 +56,13 @@ fn main() {
         Commands::V2 {
             input,
             freq,
-            speed,
             buffer,
             sensitivity,
         } => {
             let sample_rate = 44100;
             println!(
-                "Starting V2 App (platter update Freq: {:.2}Hz, Speed: {}x, buffer: {})...",
-                freq, speed, buffer
+                "Starting V2 App (platter update Freq: {:.2}Hz,  buffer: {})...",
+                freq, buffer
             );
             println!("Loading: {}", input.to_string_lossy());
 
@@ -77,7 +72,7 @@ fn main() {
             }
             println!("Decoded {} frames", samples.len());
 
-            scratchv2::app::start(speed, sensitivity, samples, freq, buffer, sample_rate);
+            scratchv2::app::start(sensitivity, samples, freq, buffer, sample_rate);
         }
     }
 }

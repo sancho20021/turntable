@@ -4,7 +4,7 @@ use crossbeam::atomic::AtomicCell;
 
 use crate::{
     deck_event::DeckEvent,
-    scratchv2::virtual_platter::{PlatterSample, VirtualPlatter},
+    scratchv2::virtual_platter::{INanos, PlatterSample, UNanos, VirtualPlatter},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -132,13 +132,13 @@ impl ScratchController {
                 if now <= start_sample.timestamp_nanos {
                     return start_sample;
                 }
-                let elapsed_nanos = now - start_sample.timestamp_nanos;
+                let elapsed_nanos = UNanos(now.0 - start_sample.timestamp_nanos.0);
 
                 // Position advances relative to elapsed time and playback speed
-                let position_delta = (elapsed_nanos as f64 * speed) as i64;
+                let position_delta = (elapsed_nanos.0 as f64 * speed) as i64;
                 PlatterSample {
                     timestamp_nanos: now,
-                    record_pos: start_sample.record_pos + position_delta,
+                    record_pos: INanos(start_sample.record_pos.0 + position_delta),
                 }
             }
             ControllerState::Scratching {
@@ -155,7 +155,7 @@ impl ScratchController {
                     (mouse_delta * self.sensitivity * BASE_SENSITIVITY_FACTOR) as i64;
                 PlatterSample {
                     timestamp_nanos: now,
-                    record_pos: anchor_platter.record_pos + position_delta,
+                    record_pos: INanos(anchor_platter.record_pos.0 + position_delta),
                 }
             }
         }
