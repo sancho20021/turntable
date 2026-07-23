@@ -2,12 +2,18 @@ use std::{sync::Arc, time::Instant};
 
 use crossbeam::atomic::AtomicCell;
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+pub struct UNanos(pub u64);
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+pub struct INanos(pub i64);
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PlatterSample {
     /// When the sample was recorded
-    pub timestamp_nanos: u64,
+    pub timestamp_nanos: UNanos,
     /// Record position in nanoseconds from the start
-    pub record_pos: i64,
+    pub record_pos: INanos,
 }
 
 #[derive(Debug, Clone)]
@@ -21,16 +27,16 @@ impl VirtualPlatter {
         let base_time = Instant::now();
         Self {
             playhead: Arc::new(AtomicCell::new(PlatterSample {
-                timestamp_nanos: 0,
-                record_pos: 0,
+                timestamp_nanos: UNanos(0),
+                record_pos: INanos(0),
             })),
             base_time,
         }
     }
 
     /// timestamp of Instant::now relative to base_time in nanos
-    pub fn now(&self) -> u64 {
-        (Instant::now() - self.base_time).as_nanos() as u64
+    pub fn now(&self) -> UNanos {
+        UNanos((Instant::now() - self.base_time).as_nanos() as u64)
     }
 
     /// Retrieves current playhead position
@@ -39,7 +45,7 @@ impl VirtualPlatter {
     }
 
     /// Updates current playhead position
-    pub fn update_playhead(&self, pos_nanos: i64, timestamp_nanos: u64) {
+    pub fn update_playhead(&self, pos_nanos: INanos, timestamp_nanos: UNanos) {
         self.playhead.store(PlatterSample {
             timestamp_nanos,
             record_pos: pos_nanos,

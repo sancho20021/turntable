@@ -82,8 +82,7 @@ fn start_deck(
     println!("Output config: {:?}", config);
 
     let record = InterpolatedRecord::new(samples, interpolation::Linear);
-    let (mut processor, platter) =
-        PlatterAudioProcessor::new(record, sample_rate as usize, buffer_size as usize);
+    let (mut processor, platter) = PlatterAudioProcessor::new(record, sample_rate as usize);
 
     let stream = device.build_output_stream(
         &config.into(),

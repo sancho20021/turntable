@@ -41,3 +41,15 @@ impl Interpolator for Linear {
         }
     }
 }
+
+impl Linear {
+    pub fn interpolate_two(x0: u64, y0: f64, x1: u64, y1: f64, default_k: f64, x: u64) -> f64 {
+        let k = if x0 == x1 {
+            default_k
+        } else {
+            (y1 - y0) / (x1 - x0) as f64
+        };
+
+        y0 + (x as f64 - x0 as f64) * k
+    }
+}

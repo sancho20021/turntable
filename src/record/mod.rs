@@ -2,6 +2,8 @@ use crate::{interpolation::Interpolator, stereo_frame::StereoFrame};
 
 /// Interface of a virtual record
 pub trait Record {
+    /// gets sample at an index.
+    ///
     /// Warning: this function must be very fast. Can't do any allocation
     fn get_sample(&self, position: f64) -> StereoFrame;
 }
