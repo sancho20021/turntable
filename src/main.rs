@@ -1,12 +1,10 @@
 mod deck_event;
 mod decoder;
 mod interpolation;
-mod read_touchpad;
 mod record;
 mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
-mod touchpad_state;
 
 use std::path::PathBuf;
 

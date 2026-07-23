@@ -24,6 +24,7 @@ pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
                     Keycode::R => Some(DeckEvent::KeyReset),
                     Keycode::Up => Some(DeckEvent::KeyUp),
                     Keycode::Down => Some(DeckEvent::KeyDown),
+                    Keycode::Space => Some(DeckEvent::StartStop),
                     _ => None,
                 }
             } else {

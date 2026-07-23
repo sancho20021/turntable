@@ -39,7 +39,7 @@ pub fn start(
 
     let mut pump = sdl.event_pump().unwrap();
     let (stream, platter) = start_deck(samples, buffer_size, sample_rate).unwrap();
-    let controller = ScratchController::new(platter, 1., touchpad_sensitivity);
+    let mut controller = ScratchController::new(platter, 1., touchpad_sensitivity);
     let platter_shutdown = Arc::new(AtomicBool::new(false));
     let driver = platter_driver::spawn_platter_driver(
         controller.clone(),

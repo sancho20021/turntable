@@ -7,6 +7,8 @@ use crate::{
     scratchv2::virtual_platter::{INanos, PlatterSample, UNanos, VirtualPlatter},
 };
 
+const SPEED_EPS: f64 = 0.001;
+
 #[derive(Clone, Copy, Debug)]
 pub enum ControllerState {
     Playing {
@@ -34,11 +36,13 @@ pub struct ScratchController {
     state: Arc<AtomicCell<ControllerState>>,
     platter: VirtualPlatter,
     sensitivity: f64,
+    previous_speed: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SpeedUpdate {
     Reset,
+    Set(f64),
     Adjust(f64),
 }
 
@@ -55,6 +59,7 @@ impl ScratchController {
             state: Arc::new(AtomicCell::new(initial_state)),
             sensitivity,
             platter,
+            previous_speed: initial_speed,
         }
     }
 
@@ -91,10 +96,12 @@ impl ScratchController {
         }
     }
 
-    fn update_speed(&self, update: SpeedUpdate, current: ControllerState) {
+    /// update speed in controller state but dont touch speed_copy
+    fn update_speed(&mut self, update: SpeedUpdate, current: ControllerState) {
         if let ControllerState::Playing { speed, .. } = current {
             let new_speed = match update {
                 SpeedUpdate::Reset => 1.,
+                SpeedUpdate::Set(x) => x,
                 SpeedUpdate::Adjust(delta) => speed + delta,
             };
 
@@ -108,7 +115,20 @@ impl ScratchController {
         }
     }
 
-    pub fn handle_deck_event(&self, event: DeckEvent) {
+    fn start_or_stop(&mut self, current: ControllerState) {
+        if let ControllerState::Playing { speed, .. } = current {
+            if speed.abs() < SPEED_EPS {
+                // we consider the deck was still
+                self.update_speed(SpeedUpdate::Set(self.previous_speed), current);
+            } else {
+                // the deck was playing
+                self.previous_speed = speed;
+                self.update_speed(SpeedUpdate::Set(0.), current);
+            }
+        }
+    }
+
+    pub fn handle_deck_event(&mut self, event: DeckEvent) {
         let current = self.state.load();
         match event {
             DeckEvent::MouseMotion(x) => self.handle_mouse_motion(x, current),
@@ -117,6 +137,7 @@ impl ScratchController {
             DeckEvent::KeyReset => self.update_speed(SpeedUpdate::Reset, current),
             DeckEvent::KeyUp => self.update_speed(SpeedUpdate::Adjust(0.01), current),
             DeckEvent::KeyDown => self.update_speed(SpeedUpdate::Adjust(-0.01), current),
+            DeckEvent::StartStop => self.start_or_stop(current),
         }
     }
 
