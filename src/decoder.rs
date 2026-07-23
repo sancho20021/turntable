@@ -1,79 +1,39 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use symphonium::DecodeConfig;
 
-use std::fs::File;
-
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::default::{get_codecs, get_probe};
+use std::{num::NonZeroU32, path::Path};
 
 use crate::stereo_frame::StereoFrame;
 
 /// Loads and decodes the whole music file into RAM
-pub fn load_file(path: &str) -> Result<Vec<StereoFrame>> {
-    let file = File::open(path)?;
-
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let hint = symphonia::core::probe::Hint::new();
-
-    let probed = get_probe().format(
-        &hint,
-        mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+pub fn load_file(sample_rate: u32, path: &Path) -> Result<Vec<StereoFrame>> {
+    // Probe the audio file.
+    let probed = symphonium::probe_from_file(
+        path,
+        // A custom codec prober. Set to `None` to use the default one from symphonia.
+        None,
+    )?;
+    let audio_data_f32 = symphonium::decode_f32(
+        probed,
+        &DecodeConfig::default(),
+        Some(NonZeroU32::new(sample_rate).ok_or(anyhow!("sample rate must be non-zero"))?),
+        None,
+        None,
     )?;
 
-    let mut format = probed.format;
-
-    let track = format.default_track().expect("No default audio track");
-
-    let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
-
-    let mut samples = Vec::<StereoFrame>::new();
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(_) => break,
-        };
-
-        let decoded = decoder.decode(&packet)?;
-
-        match decoded {
-            AudioBufferRef::F32(buf) => {
-                let channels = buf.spec().channels.count();
-
-                for i in 0..buf.frames() {
-                    let l = buf.chan(0)[i];
-
-                    let r = if channels > 1 { buf.chan(1)[i] } else { l };
-
-                    samples.push(StereoFrame { l, r });
-                }
-            }
-
-            AudioBufferRef::S16(buf) => {
-                let channels = buf.spec().channels.count();
-
-                for i in 0..buf.frames() {
-                    let l = buf.chan(0)[i] as f32 / i16::MAX as f32;
-
-                    let r = if channels > 1 {
-                        buf.chan(1)[i] as f32 / i16::MAX as f32
-                    } else {
-                        l
-                    };
-
-                    samples.push(StereoFrame { l, r });
-                }
-            }
-
-            _ => {}
-        }
+    if audio_data_f32.channels() != 2 {
+        bail!(
+            "Audio file must have 2 channels but it has {}",
+            audio_data_f32.channels()
+        );
     }
+    let mut data = audio_data_f32.data.into_iter();
+    let left = data.next().unwrap();
+    let right = data.next().unwrap();
 
-    Ok(samples)
+    Ok(left
+        .into_iter()
+        .zip(right)
+        .map(|(l, r)| StereoFrame { l, r })
+        .collect())
 }
