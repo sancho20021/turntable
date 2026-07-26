@@ -7,32 +7,49 @@ use std::{
 };
 
 use crate::scratchv2::{
-    deck_controller::{ControllerState, PlatterState},
+    deck_controller::{DeckState, PlatterState},
+    physical_speed::Speed,
     virtual_platter::{INanos, PlatterSample, UNanos, WritablePlatter},
 };
 
 #[derive(Debug)]
 pub struct PlatterSource {
-    state: Arc<ControllerState>,
+    state: Arc<DeckState>,
+    speed: Speed,
     sensitivity: f64,
     platter: WritablePlatter,
 }
 
 impl PlatterSource {
-    pub fn new(state: Arc<ControllerState>, sensitivity: f64, platter: WritablePlatter) -> Self {
+    pub fn new(
+        state: Arc<DeckState>,
+        sensitivity: f64,
+        inertia_tau_secs: f64,
+        platter: WritablePlatter,
+    ) -> Self {
+        let initial_speed = state.target_speed();
+        let speed = Speed::new(inertia_tau_secs, initial_speed);
         Self {
             state,
+            speed,
             sensitivity,
             platter,
         }
     }
 
     /// Calculates platter position in nanos
-    fn calculate_position(&self) -> PlatterSample {
-        let speed = self.state.speed.load(Ordering::Relaxed);
+    fn calculate_position(&mut self) -> PlatterSample {
         let state = self.state.platter.load();
         let now = self.platter.now();
         let cur_playhead = self.platter.get_playhead();
+
+        let speed = {
+            let dt_secs =
+                (now.0 - cur_playhead.timestamp_nanos.0.min(now.0)) as f64 / 1_000_000_000.;
+            self.speed.advance_speed(dt_secs, self.state.target_speed());
+            self.speed.get_speed()
+        };
+
         match state {
             PlatterState::Playing => {
                 if now <= cur_playhead.timestamp_nanos {

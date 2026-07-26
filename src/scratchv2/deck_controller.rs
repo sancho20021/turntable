@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use atomic_float::AtomicF64;
 use crossbeam::atomic::AtomicCell;
@@ -11,7 +14,7 @@ use crate::{
     },
 };
 
-const SPEED_EPS: f64 = 0.001;
+// const SPEED_EPS: f64 = 0.001;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PlatterState {
@@ -27,25 +30,38 @@ pub enum PlatterState {
 }
 
 #[derive(Debug)]
-pub struct ControllerState {
-    /// Current platter speed
-    pub speed: AtomicF64,
+pub struct DeckState {
+    /// Target platter speed (1.0 = normal)
+    pub pitch: AtomicF64,
+    /// Is deck playing
+    pub playing: AtomicBool,
     /// Platter state (scratching or playing)
     pub platter: AtomicCell<PlatterState>,
+}
+
+impl DeckState {
+    /// target platter speed.
+    ///
+    /// 0 if not playing, pitch if playing
+    pub fn target_speed(&self) -> f64 {
+        if self.playing.load(Ordering::Relaxed) {
+            self.pitch.load(Ordering::Relaxed)
+        } else {
+            0.
+        }
+    }
 }
 
 /// Stateful Scratch controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
 #[derive(Debug)]
 pub struct ScratchController {
-    /// Playback target speed (1.0 = normal)
-    pub pitch: f64,
-    state: Arc<ControllerState>,
+    state: Arc<DeckState>,
     platter: ReadablePlatter,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SpeedUpdate {
+enum PitchUpdate {
     Reset,
     Set(f64),
     Adjust(f64),
@@ -60,21 +76,23 @@ impl ScratchController {
         writable_platter: WritablePlatter,
         initial_pitch: f64,
         sensitivity: f64,
+        inertia_tau_secs: f64,
     ) -> (Self, PlatterSource) {
-        let initial_state = Arc::new(ControllerState {
-            speed: AtomicF64::new(0.),
+        let initial_state = Arc::new(DeckState {
+            pitch: AtomicF64::new(initial_pitch),
+            playing: AtomicBool::new(true),
             platter: AtomicCell::new(PlatterState::Playing),
         });
         let platter_src = PlatterSource::new(
             Arc::clone(&initial_state),
             sensitivity * BASE_SENSITIVITY_FACTOR,
+            inertia_tau_secs,
             writable_platter,
         );
         (
             Self {
                 state: initial_state,
                 platter: readable_platter,
-                pitch: initial_pitch,
             },
             platter_src,
         )
@@ -106,36 +124,31 @@ impl ScratchController {
         self.state.platter.store(PlatterState::Playing);
     }
 
-    fn update_speed(&mut self, update: SpeedUpdate, cur_speed: f64) {
+    fn update_pitch(&mut self, update: PitchUpdate, cur_speed: f64) {
         let new_speed = match update {
-            SpeedUpdate::Reset => 1.,
-            SpeedUpdate::Set(x) => x,
-            SpeedUpdate::Adjust(delta) => cur_speed + delta,
+            PitchUpdate::Reset => 1.,
+            PitchUpdate::Set(x) => x,
+            PitchUpdate::Adjust(delta) => cur_speed + delta,
         };
-        self.state.speed.store(new_speed, Ordering::Relaxed);
+        self.state.pitch.store(new_speed, Ordering::Relaxed);
     }
 
-    fn start_or_stop(&mut self, speed: f64) {
-        if speed.abs() < SPEED_EPS {
-            // we consider the deck was still
-            self.update_speed(SpeedUpdate::Set(self.pitch), speed);
-        } else {
-            // the deck was playing
-            self.update_speed(SpeedUpdate::Set(0.), speed);
-        }
+    fn start_or_stop(&mut self) {
+        let playing = self.state.playing.load(Ordering::Relaxed);
+        self.state.playing.store(!playing, Ordering::Relaxed);
     }
 
     pub fn handle_deck_event(&mut self, event: DeckEvent) {
-        let current_speed = self.state.speed.load(Ordering::Relaxed);
+        let current_pitch = self.state.pitch.load(Ordering::Relaxed);
         let current_state = self.state.platter.load();
         match event {
             DeckEvent::MouseMotion(x) => self.handle_mouse_motion(x, current_state),
             DeckEvent::MouseDown(x) => self.handle_mouse_down(x, current_state),
             DeckEvent::MouseUp(_) => self.handle_mouse_up(),
-            DeckEvent::KeyReset => self.update_speed(SpeedUpdate::Reset, current_speed),
-            DeckEvent::KeyUp => self.update_speed(SpeedUpdate::Adjust(0.01), current_speed),
-            DeckEvent::KeyDown => self.update_speed(SpeedUpdate::Adjust(-0.01), current_speed),
-            DeckEvent::StartStop => self.start_or_stop(current_speed),
+            DeckEvent::KeyReset => self.update_pitch(PitchUpdate::Reset, current_pitch),
+            DeckEvent::KeyUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
+            DeckEvent::KeyDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
+            DeckEvent::StartStop => self.start_or_stop(),
         }
     }
 }

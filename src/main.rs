@@ -39,6 +39,10 @@ enum Commands {
         /// Touchpad sensitivity factor
         #[arg(short('t'), long, default_value_t = 1.)]
         sensitivity: f64,
+
+        /// Motor inertia parameter in seconds
+        #[arg(short('i'), long, default_value_t = 0.5)]
+        motor_inertia: f64,
     },
 }
 
@@ -56,6 +60,7 @@ fn main() {
             freq,
             buffer,
             sensitivity,
+            motor_inertia,
         } => {
             let sample_rate = 44100;
             println!(
@@ -70,7 +75,14 @@ fn main() {
             }
             println!("Decoded {} frames", samples.len());
 
-            scratchv2::app::start(sensitivity, samples, freq, buffer, sample_rate);
+            scratchv2::app::start(
+                motor_inertia,
+                sensitivity,
+                samples,
+                freq,
+                buffer,
+                sample_rate,
+            );
         }
     }
 }
