@@ -1,46 +1,47 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
+use atomic_float::AtomicF64;
 use crossbeam::atomic::AtomicCell;
 
 use crate::{
     deck_event::DeckEvent,
     scratchv2::{
         platter_driver::PlatterSource,
-        virtual_platter::{PlatterSample, ReadablePlatter, WritablePlatter},
+        virtual_platter::{INanos, ReadablePlatter, WritablePlatter},
     },
 };
 
 const SPEED_EPS: f64 = 0.001;
 
-
-
-#[derive(Clone, Copy, Debug)]
-pub enum ControllerState {
-    Playing {
-        /// The playhead anchor when playback started/resumed
-        start_sample: PlatterSample,
-        /// Playback speed multiplier (1.0 = normal)
-        speed: f64,
-    },
+#[derive(Debug, Clone, Copy)]
+pub enum PlatterState {
+    Playing,
     Scratching {
         /// The exact state of the virtual platter when the mouse went down
-        anchor_platter: PlatterSample,
+        anchor_pos: INanos,
         /// The mouse X position when the mouse went down
         anchor_mouse_x: i32,
         /// The latest mouse position sent by the OS
         latest_mouse_x: i32,
-        /// Previous speed before scratching started
-        previous_speed: f64,
     },
+}
+
+#[derive(Debug)]
+pub struct ControllerState {
+    /// Current platter speed
+    pub speed: AtomicF64,
+    /// Platter state (scratching or playing)
+    pub platter: AtomicCell<PlatterState>,
 }
 
 /// Stateful Scratch controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
 #[derive(Debug)]
 pub struct ScratchController {
-    state: Arc<AtomicCell<ControllerState>>,
+    /// Playback target speed (1.0 = normal)
+    pub pitch: f64,
+    state: Arc<ControllerState>,
     platter: ReadablePlatter,
-    previous_speed: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,13 +58,13 @@ impl ScratchController {
     pub fn new(
         readable_platter: ReadablePlatter,
         writable_platter: WritablePlatter,
-        initial_speed: f64,
+        initial_pitch: f64,
         sensitivity: f64,
     ) -> (Self, PlatterSource) {
-        let initial_state = Arc::new(AtomicCell::new(ControllerState::Playing {
-            start_sample: readable_platter.get_playhead(),
-            speed: initial_speed,
-        }));
+        let initial_state = Arc::new(ControllerState {
+            speed: AtomicF64::new(0.),
+            platter: AtomicCell::new(PlatterState::Playing),
+        });
         let platter_src = PlatterSource::new(
             Arc::clone(&initial_state),
             sensitivity * BASE_SENSITIVITY_FACTOR,
@@ -73,87 +74,68 @@ impl ScratchController {
             Self {
                 state: initial_state,
                 platter: readable_platter,
-                previous_speed: initial_speed,
+                pitch: initial_pitch,
             },
             platter_src,
         )
     }
 
-    fn handle_mouse_motion(&self, x: i32, mut current: ControllerState) {
-        if let ControllerState::Scratching {
+    fn handle_mouse_motion(&self, x: i32, mut current: PlatterState) {
+        if let PlatterState::Scratching {
             ref mut latest_mouse_x,
             ..
         } = current
         {
             *latest_mouse_x = x;
-            self.state.store(current);
+            self.state.platter.store(current);
         }
     }
 
-    fn handle_mouse_down(&self, x: i32, current: ControllerState) {
-        if let ControllerState::Playing { speed, .. } = current {
-            let scratch_state = ControllerState::Scratching {
-                anchor_platter: self.platter.get_playhead(),
+    fn handle_mouse_down(&self, x: i32, current: PlatterState) {
+        if let PlatterState::Playing = current {
+            let scratch_state = PlatterState::Scratching {
+                anchor_pos: self.platter.get_playhead().record_pos,
                 anchor_mouse_x: x,
                 latest_mouse_x: x,
-                previous_speed: speed,
             };
-            self.state.store(scratch_state);
+            self.state.platter.store(scratch_state);
         }
     }
 
-    fn handle_mouse_up(&self, current: ControllerState) {
-        if let ControllerState::Scratching { previous_speed, .. } = current {
-            let play_state = ControllerState::Playing {
-                start_sample: self.platter.get_playhead(),
-                speed: previous_speed,
-            };
-            self.state.store(play_state);
-        }
+    fn handle_mouse_up(&self) {
+        self.state.platter.store(PlatterState::Playing);
     }
 
-    /// update speed in controller state but dont touch speed_copy
-    fn update_speed(&mut self, update: SpeedUpdate, current: ControllerState) {
-        if let ControllerState::Playing { speed, .. } = current {
-            let new_speed = match update {
-                SpeedUpdate::Reset => 1.,
-                SpeedUpdate::Set(x) => x,
-                SpeedUpdate::Adjust(delta) => speed + delta,
-            };
-
-            // Because the playhead is calculated relatively to some anchor position, we have to update the anchor with the latest playhead.
-            // Otherwise playhead will jump
-            let cur_playhead = self.platter.get_playhead();
-            self.state.store(ControllerState::Playing {
-                start_sample: cur_playhead,
-                speed: new_speed,
-            });
-        }
+    fn update_speed(&mut self, update: SpeedUpdate, cur_speed: f64) {
+        let new_speed = match update {
+            SpeedUpdate::Reset => 1.,
+            SpeedUpdate::Set(x) => x,
+            SpeedUpdate::Adjust(delta) => cur_speed + delta,
+        };
+        self.state.speed.store(new_speed, Ordering::Relaxed);
     }
 
-    fn start_or_stop(&mut self, current: ControllerState) {
-        if let ControllerState::Playing { speed, .. } = current {
-            if speed.abs() < SPEED_EPS {
-                // we consider the deck was still
-                self.update_speed(SpeedUpdate::Set(self.previous_speed), current);
-            } else {
-                // the deck was playing
-                self.previous_speed = speed;
-                self.update_speed(SpeedUpdate::Set(0.), current);
-            }
+    fn start_or_stop(&mut self, speed: f64) {
+        if speed.abs() < SPEED_EPS {
+            // we consider the deck was still
+            self.update_speed(SpeedUpdate::Set(self.pitch), speed);
+        } else {
+            // the deck was playing
+            self.update_speed(SpeedUpdate::Set(0.), speed);
         }
     }
 
     pub fn handle_deck_event(&mut self, event: DeckEvent) {
-        let current = self.state.load();
+        let current_speed = self.state.speed.load(Ordering::Relaxed);
+        let current_state = self.state.platter.load();
         match event {
-            DeckEvent::MouseMotion(x) => self.handle_mouse_motion(x, current),
-            DeckEvent::MouseDown(x) => self.handle_mouse_down(x, current),
-            DeckEvent::MouseUp(_) => self.handle_mouse_up(current),
-            DeckEvent::KeyReset => self.update_speed(SpeedUpdate::Reset, current),
-            DeckEvent::KeyUp => self.update_speed(SpeedUpdate::Adjust(0.01), current),
-            DeckEvent::KeyDown => self.update_speed(SpeedUpdate::Adjust(-0.01), current),
-            DeckEvent::StartStop => self.start_or_stop(current),
+            DeckEvent::MouseMotion(x) => self.handle_mouse_motion(x, current_state),
+            DeckEvent::MouseDown(x) => self.handle_mouse_down(x, current_state),
+            DeckEvent::MouseUp(_) => self.handle_mouse_up(),
+            DeckEvent::KeyReset => self.update_speed(SpeedUpdate::Reset, current_speed),
+            DeckEvent::KeyUp => self.update_speed(SpeedUpdate::Adjust(0.01), current_speed),
+            DeckEvent::KeyDown => self.update_speed(SpeedUpdate::Adjust(-0.01), current_speed),
+            DeckEvent::StartStop => self.start_or_stop(current_speed),
         }
     }
 }

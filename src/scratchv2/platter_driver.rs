@@ -6,26 +6,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::atomic::AtomicCell;
-
 use crate::scratchv2::{
-    deck_controller::ControllerState,
+    deck_controller::{ControllerState, PlatterState},
     virtual_platter::{INanos, PlatterSample, UNanos, WritablePlatter},
 };
 
 #[derive(Debug)]
 pub struct PlatterSource {
-    state: Arc<AtomicCell<ControllerState>>,
+    state: Arc<ControllerState>,
     sensitivity: f64,
     platter: WritablePlatter,
 }
 
 impl PlatterSource {
-    pub fn new(
-        state: Arc<AtomicCell<ControllerState>>,
-        sensitivity: f64,
-        platter: WritablePlatter,
-    ) -> Self {
+    pub fn new(state: Arc<ControllerState>, sensitivity: f64, platter: WritablePlatter) -> Self {
         Self {
             state,
             sensitivity,
@@ -35,27 +29,26 @@ impl PlatterSource {
 
     /// Calculates platter position in nanos
     fn calculate_position(&self) -> PlatterSample {
-        let state = self.state.load();
+        let speed = self.state.speed.load(Ordering::Relaxed);
+        let state = self.state.platter.load();
         let now = self.platter.now();
+        let cur_playhead = self.platter.get_playhead();
         match state {
-            ControllerState::Playing {
-                start_sample,
-                speed,
-            } => {
-                if now <= start_sample.timestamp_nanos {
-                    return start_sample;
+            PlatterState::Playing => {
+                if now <= cur_playhead.timestamp_nanos {
+                    return cur_playhead;
                 }
-                let elapsed_nanos = UNanos(now.0 - start_sample.timestamp_nanos.0);
+                let elapsed_nanos = UNanos(now.0 - cur_playhead.timestamp_nanos.0);
 
                 // Position advances relative to elapsed time and playback speed
                 let position_delta = (elapsed_nanos.0 as f64 * speed) as i64;
                 PlatterSample {
                     timestamp_nanos: now,
-                    record_pos: INanos(start_sample.record_pos.0 + position_delta),
+                    record_pos: INanos(cur_playhead.record_pos.0 + position_delta),
                 }
             }
-            ControllerState::Scratching {
-                anchor_platter,
+            PlatterState::Scratching {
+                anchor_pos: anchor_platter,
                 anchor_mouse_x,
                 latest_mouse_x,
                 ..
@@ -67,7 +60,7 @@ impl PlatterSource {
                 let position_delta = (mouse_delta * self.sensitivity) as i64;
                 PlatterSample {
                     timestamp_nanos: now,
-                    record_pos: INanos(anchor_platter.record_pos.0 + position_delta),
+                    record_pos: INanos(anchor_platter.0 + position_delta),
                 }
             }
         }
