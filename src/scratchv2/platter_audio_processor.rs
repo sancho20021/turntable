@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::{
     interpolation::Linear,
     record::Record,
-    scratchv2::virtual_platter::{INanos, PlatterSample, UNanos, VirtualPlatter},
+    scratchv2::virtual_platter::{INanos, PlatterSample, ReadablePlatter, UNanos},
 };
 
 /// time that (approximately) takes to remove the lag between virtual platter and audio playback.
@@ -13,7 +13,7 @@ static SYNC_TIME: Duration = Duration::from_millis(2000);
 
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor<R> {
-    platter: VirtualPlatter,
+    platter: ReadablePlatter,
     sample_rate: usize,
     record: R,
     /// timestamp and nanosecond of last sample played
@@ -37,15 +37,14 @@ impl<R: Record> PlatterAudioProcessor<R> {
         Duration::from_secs_f64((buffer_size as f64 / 2.) / (self.sample_rate as f64))
     }
 
-    pub fn new(record: R, sample_rate: usize) -> (Self, VirtualPlatter) {
-        let platter = VirtualPlatter::new();
+    pub fn new(record: R, sample_rate: usize, platter: ReadablePlatter) -> Self {
         let first_measurement = platter.get_playhead();
         let second_measurement = PlatterSample {
             timestamp_nanos: UNanos(first_measurement.timestamp_nanos.0 + 1),
             record_pos: first_measurement.record_pos,
         };
         let processor = PlatterAudioProcessor {
-            platter: platter.clone(),
+            platter,
             sample_rate,
             record,
             last_played: first_measurement,
@@ -54,7 +53,7 @@ impl<R: Record> PlatterAudioProcessor<R> {
             filtered_nanos_played: INanos(0), // one of sources of slow startup
             filtered_lag: INanos(0),
         };
-        (processor, platter)
+        processor
     }
 
     fn update_measurements(&mut self, cur: PlatterSample) {
@@ -97,7 +96,9 @@ impl<R: Record> PlatterAudioProcessor<R> {
                 self.filtered_lag =
                     INanos(ma_filter(self.filtered_lag.0 as f64, lags_behind.0 as f64, 0.1) as i64);
 
-                self.filtered_lag = self.filtered_lag.clamp(INanos(-5_000_000), INanos(5_000_000)); // think of good numbers
+                self.filtered_lag = self
+                    .filtered_lag
+                    .clamp(INanos(-5_000_000), INanos(5_000_000)); // think of good numbers
             }
 
             // if we add lags_behind to target_timestamp, we will remove the lag.

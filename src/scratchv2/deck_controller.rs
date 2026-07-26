@@ -4,10 +4,15 @@ use crossbeam::atomic::AtomicCell;
 
 use crate::{
     deck_event::DeckEvent,
-    scratchv2::virtual_platter::{INanos, PlatterSample, UNanos, VirtualPlatter},
+    scratchv2::{
+        platter_driver::PlatterSource,
+        virtual_platter::{PlatterSample, ReadablePlatter, WritablePlatter},
+    },
 };
 
 const SPEED_EPS: f64 = 0.001;
+
+
 
 #[derive(Clone, Copy, Debug)]
 pub enum ControllerState {
@@ -31,11 +36,10 @@ pub enum ControllerState {
 
 /// Stateful Scratch controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ScratchController {
     state: Arc<AtomicCell<ControllerState>>,
-    platter: VirtualPlatter,
-    sensitivity: f64,
+    platter: ReadablePlatter,
     previous_speed: f64,
 }
 
@@ -50,17 +54,29 @@ enum SpeedUpdate {
 static BASE_SENSITIVITY_FACTOR: f64 = 2_500_000.0;
 
 impl ScratchController {
-    pub fn new(platter: VirtualPlatter, initial_speed: f64, sensitivity: f64) -> Self {
-        let initial_state = ControllerState::Playing {
-            start_sample: platter.get_playhead(),
+    pub fn new(
+        readable_platter: ReadablePlatter,
+        writable_platter: WritablePlatter,
+        initial_speed: f64,
+        sensitivity: f64,
+    ) -> (Self, PlatterSource) {
+        let initial_state = Arc::new(AtomicCell::new(ControllerState::Playing {
+            start_sample: readable_platter.get_playhead(),
             speed: initial_speed,
-        };
-        Self {
-            state: Arc::new(AtomicCell::new(initial_state)),
-            sensitivity,
-            platter,
-            previous_speed: initial_speed,
-        }
+        }));
+        let platter_src = PlatterSource::new(
+            Arc::clone(&initial_state),
+            sensitivity * BASE_SENSITIVITY_FACTOR,
+            writable_platter,
+        );
+        (
+            Self {
+                state: initial_state,
+                platter: readable_platter,
+                previous_speed: initial_speed,
+            },
+            platter_src,
+        )
     }
 
     fn handle_mouse_motion(&self, x: i32, mut current: ControllerState) {
@@ -139,53 +155,5 @@ impl ScratchController {
             DeckEvent::KeyDown => self.update_speed(SpeedUpdate::Adjust(-0.01), current),
             DeckEvent::StartStop => self.start_or_stop(current),
         }
-    }
-
-    /// Calculates platter position in nanos
-    fn calculate_position(&self) -> PlatterSample {
-        let state = self.state.load();
-        let now = self.platter.now();
-        match state {
-            ControllerState::Playing {
-                start_sample,
-                speed,
-            } => {
-                if now <= start_sample.timestamp_nanos {
-                    return start_sample;
-                }
-                let elapsed_nanos = UNanos(now.0 - start_sample.timestamp_nanos.0);
-
-                // Position advances relative to elapsed time and playback speed
-                let position_delta = (elapsed_nanos.0 as f64 * speed) as i64;
-                PlatterSample {
-                    timestamp_nanos: now,
-                    record_pos: INanos(start_sample.record_pos.0 + position_delta),
-                }
-            }
-            ControllerState::Scratching {
-                anchor_platter,
-                anchor_mouse_x,
-                latest_mouse_x,
-                ..
-            } => {
-                // TODO: in mouse updates save timestamps as well because mouse updates can be older than now
-                let mouse_delta = (latest_mouse_x - anchor_mouse_x) as f64;
-
-                // Map mouse movement straight to playhead offset
-                let position_delta =
-                    (mouse_delta * self.sensitivity * BASE_SENSITIVITY_FACTOR) as i64;
-                PlatterSample {
-                    timestamp_nanos: now,
-                    record_pos: INanos(anchor_platter.record_pos.0 + position_delta),
-                }
-            }
-        }
-    }
-
-    /// Updates virtual platter according to current state
-    pub fn update_platter(&self) {
-        let pos = self.calculate_position();
-        self.platter
-            .update_playhead(pos.record_pos, pos.timestamp_nanos);
     }
 }

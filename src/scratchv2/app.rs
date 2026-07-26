@@ -13,8 +13,10 @@ use crate::{
     interpolation,
     record::InterpolatedRecord,
     scratchv2::{
-        platter_audio_processor::PlatterAudioProcessor, platter_driver,
-        scratch_controller::ScratchController, virtual_platter::VirtualPlatter,
+        deck_controller::ScratchController,
+        platter_audio_processor::PlatterAudioProcessor,
+        platter_driver,
+        virtual_platter::{ReadablePlatter, WritablePlatter, new_platter},
     },
     sdl_deck_event::to_deck_event,
     stereo_frame::StereoFrame,
@@ -38,11 +40,13 @@ pub fn start(
         .unwrap();
 
     let mut pump = sdl.event_pump().unwrap();
-    let (stream, platter) = start_deck(samples, buffer_size, sample_rate).unwrap();
-    let mut controller = ScratchController::new(platter, 1., touchpad_sensitivity);
+    let (stream, write_platter, read_platter) =
+        start_deck(samples, buffer_size, sample_rate).unwrap();
+    let (mut controller, platter_src) =
+        ScratchController::new(read_platter, write_platter, 1., touchpad_sensitivity);
     let platter_shutdown = Arc::new(AtomicBool::new(false));
     let driver = platter_driver::spawn_platter_driver(
-        controller.clone(),
+        platter_src,
         platter_update_freq_hz,
         Arc::clone(&platter_shutdown),
     );
@@ -67,7 +71,7 @@ fn start_deck(
     samples: Vec<StereoFrame>,
     buffer_size: u32,
     sample_rate: u32,
-) -> anyhow::Result<(Stream, VirtualPlatter)> {
+) -> anyhow::Result<(Stream, WritablePlatter, ReadablePlatter)> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().expect("No output device");
@@ -81,7 +85,9 @@ fn start_deck(
     println!("Output config: {:?}", config);
 
     let record = InterpolatedRecord::new(samples, interpolation::Linear);
-    let (mut processor, platter) = PlatterAudioProcessor::new(record, sample_rate as usize);
+    let (write_platter, read_platter) = new_platter();
+    let mut processor =
+        PlatterAudioProcessor::new(record, sample_rate as usize, read_platter.clone());
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -95,5 +101,5 @@ fn start_deck(
     )?;
 
     stream.play()?;
-    Ok((stream, platter))
+    Ok((stream, write_platter, read_platter))
 }

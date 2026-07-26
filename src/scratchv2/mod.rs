@@ -1,5 +1,5 @@
 pub mod app;
 mod platter_audio_processor;
 mod platter_driver;
-mod scratch_controller;
+mod deck_controller;
 mod virtual_platter;
