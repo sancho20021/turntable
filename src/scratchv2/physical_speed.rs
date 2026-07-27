@@ -20,7 +20,7 @@ impl Speed {
         }
     }
 
-    pub fn get_speed(&self) -> f64 {
+    pub fn get(&self) -> f64 {
         self.speed
     }
 
@@ -34,5 +34,10 @@ impl Speed {
         } else {
             self.speed = target_speed;
         }
+    }
+
+    /// sets motor speed
+    pub fn hard_set_speed(&mut self, speed: f64) {
+        self.speed = speed;
     }
 }

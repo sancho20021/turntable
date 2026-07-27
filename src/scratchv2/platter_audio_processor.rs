@@ -93,6 +93,7 @@ impl<R: Record> PlatterAudioProcessor<R> {
 
                 // we must filter the lag because if observations arrive less frequently then write_frames,
                 // then lag will jump back and forth
+                // todo: make this invariant of buffer size using dt and exponent
                 self.filtered_lag =
                     INanos(ma_filter(self.filtered_lag.0 as f64, lags_behind.0 as f64, 0.1) as i64);
 
@@ -121,6 +122,7 @@ impl<R: Record> PlatterAudioProcessor<R> {
             let played_nanos_raw = INanos(target_playhead_raw.0 - self.last_played.record_pos.0);
 
             let alpha = 0.8; // higher - snappier
+            // todo: make this invariant of buffer size using dt and exponent
             self.filtered_nanos_played = INanos(ma_filter(
                 self.filtered_nanos_played.0 as f64,
                 played_nanos_raw.0 as f64,
