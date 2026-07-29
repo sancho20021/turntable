@@ -10,12 +10,20 @@ pub struct Speed {
     inertia_tau: f64,
     /// Dynamically adjustable speed
     speed: f64,
+
+    /// if difference between current and desired speed is below this value,
+    /// the current speed is set to desired speed.
+    /// Used in combination with dt in SECONDS
+    ///
+    /// Useful to prevent record from endlessly slipping on the slipmat.
+    diff_threshold: f64,
 }
 
 impl Speed {
-    pub fn new(inertia_tau: f64, initial_speed: f64) -> Self {
+    pub fn new(inertia_tau: f64, diff_threshold: f64, initial_speed: f64) -> Self {
         Self {
             inertia_tau,
+            diff_threshold,
             speed: initial_speed,
         }
     }
@@ -26,8 +34,8 @@ impl Speed {
 
     /// Update current motor speed according to delta time and target speed
     pub fn advance_speed(&mut self, dt_secs: f64, target_speed: f64) {
-        // Avoid endless micro-calculations if the speeds are virtually identical
-        if (self.speed - target_speed).abs() > 1e-6 {
+        // Avoid endless adjustments if the speeds are virtually identical
+        if (self.speed - target_speed).abs() > self.diff_threshold * dt_secs {
             let factor = (-dt_secs / self.inertia_tau).exp();
             let next_speed = target_speed + (self.speed - target_speed) * factor;
             self.speed = next_speed;
