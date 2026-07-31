@@ -4,13 +4,15 @@ use std::sync::{
 };
 
 use atomic_float::AtomicF64;
-use crossbeam::atomic::AtomicCell;
+use crossbeam::{atomic::AtomicCell, channel::Sender};
 
 use crate::{
     deck_event::DeckEvent,
+    decoder::load_file,
+    record::{INanos, Record, interpolation::Interpolator},
     scratchv2::{
         platter_driver::PlatterSource,
-        virtual_platter::{INanos, ReadablePlatter, WritablePlatter},
+        virtual_platter::{ReadablePlatter, WritablePlatter},
     },
 };
 
@@ -55,8 +57,9 @@ impl DeckState {
 /// Stateful Scratch controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
 #[derive(Debug)]
-pub struct ScratchController {
+pub struct DeckController {
     state: Arc<DeckState>,
+    change_record: Sender<Record>,
     platter: ReadablePlatter,
 }
 
@@ -70,10 +73,11 @@ enum PitchUpdate {
 // 1.0 sensitivity means 400 pixels = 1 second of audio
 static BASE_SENSITIVITY_FACTOR: f64 = 2_500_000.0;
 
-impl ScratchController {
+impl DeckController {
     pub fn new(
         readable_platter: ReadablePlatter,
         writable_platter: WritablePlatter,
+        record_sender: Sender<Record>,
         initial_pitch: f64,
         sensitivity: f64,
         inertia_tau_secs: f64,
@@ -93,6 +97,8 @@ impl ScratchController {
             Self {
                 state: initial_state,
                 platter: readable_platter,
+                change_record: record_sender,
+                // send_events:
             },
             platter_src,
         )
@@ -138,7 +144,7 @@ impl ScratchController {
         self.state.playing.store(!playing, Ordering::Relaxed);
     }
 
-    pub fn handle_deck_event(&mut self, event: DeckEvent) {
+    pub fn handle_deck_event(&mut self, event: DeckEvent) -> anyhow::Result<()> {
         let current_pitch = self.state.pitch.load(Ordering::Relaxed);
         let current_state = self.state.platter.load();
         match event {
@@ -149,6 +155,29 @@ impl ScratchController {
             DeckEvent::KeyUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
             DeckEvent::KeyDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
             DeckEvent::StartStop => self.start_or_stop(),
-        }
+            DeckEvent::LoadTrack(track) => {
+                let send_rec = self.change_record.clone();
+                println!("Loading: {}", track);
+                std::thread::spawn(move || {
+                    let rec = load_file(44100, track.as_ref());
+                    match rec {
+                        Ok(rec) => {
+                            let rec = Record::new(rec, Interpolator::linear(), 44100);
+
+                            match send_rec.try_send(rec) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    log::error!("failed to change record, try again: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("failed to load track: {e}");
+                        }
+                    }
+                });
+            }
+        };
+        Ok(())
     }
 }

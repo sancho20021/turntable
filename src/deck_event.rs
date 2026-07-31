@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum DeckEvent {
     MouseMotion(i32),
     MouseDown(i32),
@@ -7,4 +7,5 @@ pub enum DeckEvent {
     KeyReset,
     KeyUp,
     KeyDown,
+    LoadTrack(String),
 }

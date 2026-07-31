@@ -7,26 +7,24 @@ use cpal::{
     BufferSize, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use crossbeam::channel::Sender;
 use sdl2::event::Event;
 
 use crate::{
-    interpolation,
-    record::InterpolatedRecord,
+    record::Record,
     scratchv2::{
-        deck_controller::ScratchController,
+        deck_controller::DeckController,
         platter_audio_processor::PlatterAudioProcessor,
         platter_driver,
         virtual_platter::{ReadablePlatter, WritablePlatter, new_platter},
     },
     sdl_deck_event::to_deck_event,
-    stereo_frame::StereoFrame,
 };
 
 /// Main app loop
 pub fn start(
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
-    samples: Vec<StereoFrame>,
     platter_update_freq_hz: f64,
     buffer_size: u32,
     sample_rate: u32,
@@ -41,11 +39,12 @@ pub fn start(
         .unwrap();
 
     let mut pump = sdl.event_pump().unwrap();
-    let (stream, write_platter, read_platter) =
-        start_deck(samples, buffer_size, sample_rate).unwrap();
-    let (mut controller, platter_src) = ScratchController::new(
+    let (stream, write_platter, read_platter, record_sender) =
+        start_deck(buffer_size, sample_rate).unwrap();
+    let (mut controller, platter_src) = DeckController::new(
         read_platter,
         write_platter,
+        record_sender,
         1.,
         touchpad_sensitivity,
         motor_inertia_secs,
@@ -68,16 +67,18 @@ pub fn start(
             return;
         }
         if let Some(event) = to_deck_event(event) {
-            controller.handle_deck_event(event);
+            let r = controller.handle_deck_event(event);
+            if let Err(r) = r {
+                log::error!("{r}");
+            }
         }
     }
 }
 
 fn start_deck(
-    samples: Vec<StereoFrame>,
     buffer_size: u32,
     sample_rate: u32,
-) -> anyhow::Result<(Stream, WritablePlatter, ReadablePlatter)> {
+) -> anyhow::Result<(Stream, WritablePlatter, ReadablePlatter, Sender<Record>)> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().expect("No output device");
@@ -90,10 +91,12 @@ fn start_deck(
 
     println!("Output config: {:?}", config);
 
-    let record = InterpolatedRecord::new(samples, interpolation::Linear);
     let (write_platter, read_platter) = new_platter();
+
+    let (send, recv) = crossbeam::channel::bounded(1);
+
     let mut processor =
-        PlatterAudioProcessor::new(record, sample_rate as usize, read_platter.clone());
+        PlatterAudioProcessor::new(sample_rate as usize, read_platter.clone(), recv);
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -107,5 +110,5 @@ fn start_deck(
     )?;
 
     stream.play()?;
-    Ok((stream, write_platter, read_platter))
+    Ok((stream, write_platter, read_platter, send))
 }

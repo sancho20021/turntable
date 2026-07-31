@@ -31,6 +31,7 @@ pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
                 None
             }
         }
+        Event::DropFile { filename, .. } => Some(DeckEvent::LoadTrack(filename)),
         _ => None,
     }
 }

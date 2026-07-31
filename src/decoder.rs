@@ -31,9 +31,16 @@ pub fn load_file(sample_rate: u32, path: &Path) -> Result<Vec<StereoFrame>> {
     let left = data.next().unwrap();
     let right = data.next().unwrap();
 
-    Ok(left
+    let samples: Vec<_> = left
         .into_iter()
         .zip(right)
         .map(|(l, r)| StereoFrame { l, r })
-        .collect())
+        .collect();
+
+    if samples.is_empty() {
+        bail!("empty audio decoded");
+    }
+
+    log::info!("Decoded {} frames", samples.len());
+    Ok(samples)
 }

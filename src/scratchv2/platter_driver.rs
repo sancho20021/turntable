@@ -6,11 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::scratchv2::{
+use crate::{record::{INanos, UNanos}, scratchv2::{
     deck_controller::{DeckState, PlatterState},
     physical_speed::Speed,
-    virtual_platter::{INanos, PlatterSample, UNanos, WritablePlatter},
-};
+    virtual_platter::{PlatterSample, WritablePlatter},
+}};
 
 #[derive(Debug)]
 pub struct PlatterSource {
@@ -31,7 +31,7 @@ impl PlatterSource {
         let initial_speed = state.target_speed();
         let motor_speed = Speed::new(inertia_tau_secs, 0.1, initial_speed);
         // I want the record to sync with the platter in about 50ms after scratching
-        let record_speed = Speed::new(0.05, 25., initial_speed);
+        let record_speed = Speed::new(0.01, 25., initial_speed);
         Self {
             state,
             motor_speed,

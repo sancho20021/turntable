@@ -1,9 +1,10 @@
 use std::time::Duration;
 
+use crossbeam::channel::Receiver;
+
 use crate::{
-    interpolation::Linear,
-    record::Record,
-    scratchv2::virtual_platter::{INanos, PlatterSample, ReadablePlatter, UNanos},
+    record::{INanos, Record, UNanos, interpolation::Linear},
+    scratchv2::virtual_platter::{PlatterSample, ReadablePlatter},
 };
 
 /// time that (approximately) takes to remove the lag between virtual platter and audio playback.
@@ -12,10 +13,12 @@ use crate::{
 static SYNC_TIME: Duration = Duration::from_millis(2000);
 
 /// The self-contained logic unit that transforms platter ticks into audio samples.
-pub struct PlatterAudioProcessor<R> {
+pub struct PlatterAudioProcessor {
     platter: ReadablePlatter,
     sample_rate: usize,
-    record: R,
+    /// record sent to play instead of current record
+    next_record: Receiver<Record>,
+    cur_record: Option<Record>,
     /// timestamp and nanosecond of last sample played
     last_played: PlatterSample,
     //// Second newest measurement of virtual playhead
@@ -32,12 +35,20 @@ fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
     new_value_proportion * new_value + (1. - new_value_proportion) * old_value
 }
 
-impl<R: Record> PlatterAudioProcessor<R> {
+impl PlatterAudioProcessor {
     fn block_dur(&self, buffer_size: usize) -> Duration {
         Duration::from_secs_f64((buffer_size as f64 / 2.) / (self.sample_rate as f64))
     }
 
-    pub fn new(record: R, sample_rate: usize, platter: ReadablePlatter) -> Self {
+    fn set_record(&mut self, record: Record) {
+        self.cur_record = Some(record);
+    }
+
+    pub fn new(
+        sample_rate: usize,
+        platter: ReadablePlatter,
+        next_record: Receiver<Record>,
+    ) -> Self {
         let first_measurement = platter.get_playhead();
         let second_measurement = PlatterSample {
             timestamp_nanos: UNanos(first_measurement.timestamp_nanos.0 + 1),
@@ -46,12 +57,13 @@ impl<R: Record> PlatterAudioProcessor<R> {
         let processor = PlatterAudioProcessor {
             platter,
             sample_rate,
-            record,
+            cur_record: None,
             last_played: first_measurement,
             second_measurement,
             first_measurement,
             filtered_nanos_played: INanos(0), // one of sources of slow startup
             filtered_lag: INanos(0),
+            next_record,
         };
         processor
     }
@@ -75,7 +87,12 @@ impl<R: Record> PlatterAudioProcessor<R> {
 
     /// Warning: this function must be very fast, no allocation
     pub fn write_frames(&mut self, data: &mut [f32]) {
-        let samples_n = data.len() as f64 / 2.;
+        if let Ok(record) = self.next_record.try_recv() {
+            println!("Track loaded");
+            self.set_record(record);
+        }
+
+        let samples_n = data.len() as i64 / 2;
 
         self.update_measurements(self.platter.get_playhead());
 
@@ -131,9 +148,10 @@ impl<R: Record> PlatterAudioProcessor<R> {
             INanos(self.last_played.record_pos.0 + self.filtered_nanos_played.0)
         };
 
-        let mut playhead = self.nanosecs_to_sample(self.last_played.record_pos);
-        let target_playhead = self.nanosecs_to_sample(target_playhead_nanos);
-        let step = (target_playhead - playhead) / samples_n;
+        let mut playhead_nanos = INanos(self.last_played.record_pos.0);
+        // here we lose about maximum samples_n nanoseconds of accumulated error, which is fine as
+        // sums up to around 44ns of drift per second
+        let step_nanos = INanos((target_playhead_nanos.0 - playhead_nanos.0) / samples_n);
 
         log::debug!(
             "observations at {}, ..+{}ms",
@@ -142,27 +160,26 @@ impl<R: Record> PlatterAudioProcessor<R> {
                 / 1000000
         );
         log::debug!(
-            "playing at = {:.0}, ..+{:.0}ms",
+            "playing at = {:.0}, ..+{:.0}ms at speed {:.2}",
             self.last_played.timestamp_nanos.0,
-            (target_timestamp.0 - self.last_played.timestamp_nanos.0) / 1000000
+            (target_timestamp.0 - self.last_played.timestamp_nanos.0) / 1000000,
+            step_nanos.0 as f64 / (self.sample_to_nanos(1.))
         );
-
-        log::debug!(
-            "playing [{playhead:.0}..{:.0}) at speed {:.2}",
-            target_playhead,
-            step
-        );
-
-        for frame in data.chunks_mut(2) {
-            let sample = self.record.get_sample(playhead);
-            frame[0] = sample.l;
-            frame[1] = sample.r;
-            playhead += step;
-        }
 
         self.last_played = PlatterSample {
             timestamp_nanos: target_timestamp,
             record_pos: target_playhead_nanos,
         };
+
+        if let Some(rec) = &self.cur_record {
+            for frame in data.chunks_mut(2) {
+                let sample = rec.get_sample(playhead_nanos);
+                frame[0] = sample.l;
+                frame[1] = sample.r;
+                playhead_nanos.0 += step_nanos.0;
+            }
+        } else {
+            data.fill(0.);
+        }
     }
 }

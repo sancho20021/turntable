@@ -1,17 +1,12 @@
 mod deck_event;
 mod decoder;
-mod interpolation;
 mod record;
 mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
 
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use log::info;
-
-use crate::decoder::load_file;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
@@ -24,10 +19,6 @@ struct Cli {
 enum Commands {
     /// Run the new V2 testing turntable (no mouse tracking, synthetic events)
     V2 {
-        /// Path to the audio track file to load (e.g., track.wav)
-        #[arg(value_name = "AUDIO_TRACK")]
-        input: PathBuf,
-
         /// Target frequency for platter updates in Hz
         #[arg(short, long, default_value_t = 100.0)]
         freq: f64,
@@ -56,7 +47,6 @@ fn main() {
 
     match args.command {
         Commands::V2 {
-            input,
             freq,
             buffer,
             sensitivity,
@@ -64,25 +54,12 @@ fn main() {
         } => {
             let sample_rate = 44100;
             println!(
-                "Starting V2 App (platter update Freq: {:.2}Hz,  buffer: {})...",
+                "Starting V2 App (platter update Freq: {:.2}Hz,  buffer: {}, touchpad sensitivity: {sensitivity:.2}, motor inertia: {motor_inertia:.2}).",
                 freq, buffer
             );
-            println!("Loading: {}", input.to_string_lossy());
+            println!("Drag and drop a music file to start");
 
-            let samples = load_file(sample_rate, &input).unwrap();
-            if samples.is_empty() {
-                panic!("No audio decoded");
-            }
-            println!("Decoded {} frames", samples.len());
-
-            scratchv2::app::start(
-                motor_inertia,
-                sensitivity,
-                samples,
-                freq,
-                buffer,
-                sample_rate,
-            );
+            scratchv2::app::start(motor_inertia, sensitivity, freq, buffer, sample_rate);
         }
     }
 }
