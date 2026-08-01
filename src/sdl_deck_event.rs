@@ -18,13 +18,26 @@ pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
             ..
         } => Some(DeckEvent::MouseUp(x)),
 
-        Event::KeyDown { keycode, .. } => {
+        Event::KeyDown {
+            keycode, keymod, ..
+        } => {
             if let Some(key) = keycode {
+                let is_shift = keymod
+                    .intersects(sdl2::keyboard::Mod::LSHIFTMOD | sdl2::keyboard::Mod::RSHIFTMOD);
+
                 match key {
-                    Keycode::R => Some(DeckEvent::KeyReset),
-                    Keycode::Up => Some(DeckEvent::KeyUp),
-                    Keycode::Down => Some(DeckEvent::KeyDown),
+                    Keycode::R => Some(DeckEvent::ResetPitch),
+                    Keycode::Up => Some(DeckEvent::PitchUp),
+                    Keycode::Down => Some(DeckEvent::PitchDown),
                     Keycode::Space => Some(DeckEvent::StartStop),
+                    Keycode::Right => Some(DeckEvent::PlayheadFF),
+                    Keycode::Left => {
+                        if is_shift {
+                            Some(DeckEvent::PlayheadReset)
+                        } else {
+                            Some(DeckEvent::PlayheadRewind)
+                        }
+                    }
                     _ => None,
                 }
             } else {

@@ -4,14 +4,17 @@ use std::sync::{
 };
 
 use atomic_float::AtomicF64;
-use crossbeam::{atomic::AtomicCell, channel::Sender};
+use crossbeam::{
+    atomic::AtomicCell,
+    channel::{Sender, bounded},
+};
 
 use crate::{
     deck_event::DeckEvent,
     decoder::load_file,
     record::{INanos, Record, interpolation::Interpolator},
     scratchv2::{
-        platter_driver::PlatterSource,
+        platter_driver::{PlatterDriver, PlayheadUpdate},
         virtual_platter::{ReadablePlatter, WritablePlatter},
     },
 };
@@ -60,6 +63,7 @@ impl DeckState {
 pub struct DeckController {
     state: Arc<DeckState>,
     change_record: Sender<Record>,
+    adjust_playhead: Sender<PlayheadUpdate>,
     platter: ReadablePlatter,
 }
 
@@ -81,24 +85,27 @@ impl DeckController {
         initial_pitch: f64,
         sensitivity: f64,
         inertia_tau_secs: f64,
-    ) -> (Self, PlatterSource) {
+    ) -> (Self, PlatterDriver) {
         let initial_state = Arc::new(DeckState {
             pitch: AtomicF64::new(initial_pitch),
             playing: AtomicBool::new(true),
             platter: AtomicCell::new(PlatterState::Playing),
         });
-        let platter_src = PlatterSource::new(
+        let (pl_snd, pl_rcv) = bounded(1000);
+
+        let platter_src = PlatterDriver::new(
             Arc::clone(&initial_state),
             sensitivity * BASE_SENSITIVITY_FACTOR,
             inertia_tau_secs,
             writable_platter,
+            pl_rcv,
         );
         (
             Self {
                 state: initial_state,
                 platter: readable_platter,
                 change_record: record_sender,
-                // send_events:
+                adjust_playhead: pl_snd,
             },
             platter_src,
         )
@@ -151,9 +158,9 @@ impl DeckController {
             DeckEvent::MouseMotion(x) => self.handle_mouse_motion(x, current_state),
             DeckEvent::MouseDown(x) => self.handle_mouse_down(x, current_state),
             DeckEvent::MouseUp(_) => self.handle_mouse_up(),
-            DeckEvent::KeyReset => self.update_pitch(PitchUpdate::Reset, current_pitch),
-            DeckEvent::KeyUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
-            DeckEvent::KeyDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
+            DeckEvent::ResetPitch => self.update_pitch(PitchUpdate::Reset, current_pitch),
+            DeckEvent::PitchUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
+            DeckEvent::PitchDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
             DeckEvent::StartStop => self.start_or_stop(),
             DeckEvent::LoadTrack(track) => {
                 let send_rec = self.change_record.clone();
@@ -163,13 +170,7 @@ impl DeckController {
                     match rec {
                         Ok(rec) => {
                             let rec = Record::new(rec, Interpolator::linear(), 44100);
-
-                            match send_rec.try_send(rec) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    log::error!("failed to change record, try again: {e}");
-                                }
-                            }
+                            log_try_send(&send_rec, rec, "change record");
                         }
                         Err(e) => {
                             log::error!("failed to load track: {e}");
@@ -177,7 +178,32 @@ impl DeckController {
                     }
                 });
             }
+            DeckEvent::PlayheadReset => log_try_send(
+                &self.adjust_playhead,
+                PlayheadUpdate::ToZero,
+                "reset playhead",
+            ),
+            DeckEvent::PlayheadFF => log_try_send(
+                &self.adjust_playhead,
+                PlayheadUpdate::FastForward,
+                "fast forward",
+            ),
+            DeckEvent::PlayheadRewind => {
+                log_try_send(&self.adjust_playhead, PlayheadUpdate::Rewind, "rewind")
+            }
         };
         Ok(())
+    }
+}
+
+/// Helper function to safely send events to a bounded queue without crashing or blocking.
+///
+/// # Arguments
+/// * `queue` - The bounded channel sender
+/// * `event` - The event item being pushed
+/// * `context` - A descriptive label used in the log error message if the send fails
+pub fn log_try_send<T>(queue: &Sender<T>, event: T, action: &str) {
+    if let Err(e) = queue.try_send(event) {
+        log::error!("failed to {}, try again: {}", action, e);
     }
 }

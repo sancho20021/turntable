@@ -70,7 +70,7 @@ impl<AnyMode> VirtualPlatter<AnyMode> {
 
 impl VirtualPlatter<Write> {
     /// Updates current playhead position
-    pub fn update_playhead(&self, pos_nanos: INanos, timestamp_nanos: UNanos) {
+    pub fn update_playhead(&mut self, pos_nanos: INanos, timestamp_nanos: UNanos) {
         self.playhead.store(PlatterSample {
             timestamp_nanos,
             record_pos: pos_nanos,

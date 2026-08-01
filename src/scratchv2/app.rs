@@ -41,7 +41,7 @@ pub fn start(
     let mut pump = sdl.event_pump().unwrap();
     let (stream, write_platter, read_platter, record_sender) =
         start_deck(buffer_size, sample_rate).unwrap();
-    let (mut controller, platter_src) = DeckController::new(
+    let (mut controller, platter_driver) = DeckController::new(
         read_platter,
         write_platter,
         record_sender,
@@ -50,11 +50,7 @@ pub fn start(
         motor_inertia_secs,
     );
     let platter_shutdown = Arc::new(AtomicBool::new(false));
-    let driver = platter_driver::spawn_platter_driver(
-        platter_src,
-        platter_update_freq_hz,
-        Arc::clone(&platter_shutdown),
-    );
+    let driver = platter_driver.start(platter_update_freq_hz, Arc::clone(&platter_shutdown));
 
     for event in pump.wait_iter() {
         if let Event::Quit { .. } = event {

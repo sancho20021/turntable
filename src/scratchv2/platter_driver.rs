@@ -6,27 +6,47 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{record::{INanos, UNanos}, scratchv2::{
-    deck_controller::{DeckState, PlatterState},
-    physical_speed::Speed,
-    virtual_platter::{PlatterSample, WritablePlatter},
-}};
+use crossbeam::channel::Receiver;
+
+use crate::{
+    record::{INanos, UNanos},
+    scratchv2::{
+        deck_controller::{DeckState, PlatterState},
+        physical_speed::Speed,
+        virtual_platter::{PlatterSample, WritablePlatter},
+    },
+};
+
+/// time that fast-forward skips
+static FF_TIME: UNanos = UNanos(15 * 1_000_000_000);
 
 #[derive(Debug)]
-pub struct PlatterSource {
+pub enum PlayheadUpdate {
+    /// set playhead to the start
+    ToZero,
+    /// skip FF_TIME forward
+    FastForward,
+    /// go FF_TIME backward
+    Rewind,
+}
+
+#[derive(Debug)]
+pub struct PlatterDriver {
     state: Arc<DeckState>,
     motor_speed: Speed,
     record_speed: Speed,
     sensitivity: f64,
     platter: WritablePlatter,
+    playhead_events: Receiver<PlayheadUpdate>,
 }
 
-impl PlatterSource {
+impl PlatterDriver {
     pub fn new(
         state: Arc<DeckState>,
         sensitivity: f64,
         inertia_tau_secs: f64,
         platter: WritablePlatter,
+        playhead_events: Receiver<PlayheadUpdate>,
     ) -> Self {
         let initial_speed = state.target_speed();
         let motor_speed = Speed::new(inertia_tau_secs, 0.1, initial_speed);
@@ -38,6 +58,7 @@ impl PlatterSource {
             record_speed: record_speed,
             sensitivity,
             platter,
+            playhead_events,
         }
     }
 
@@ -108,33 +129,49 @@ impl PlatterSource {
         }
     }
 
+    fn adjust_playhead(&mut self, adjust: PlayheadUpdate) {
+        let cur_playhead = self.platter.get_playhead().record_pos;
+        let now = self.platter.now();
+        let new_pos = INanos(match adjust {
+            PlayheadUpdate::ToZero => 0,
+            PlayheadUpdate::FastForward => cur_playhead.0 + FF_TIME.0 as i64,
+            PlayheadUpdate::Rewind => cur_playhead.0 - FF_TIME.0 as i64,
+        });
+        self.platter.update_playhead(new_pos, now);
+    }
+
     /// Updates virtual platter according to current state
     pub fn update_platter(&mut self) {
-        // log::debug!("platter speed: {:.2}", self.speed.get());
+        // to not get stuck handling updates
+        for _ in 0..1000 {
+            if let Ok(upd) = self.playhead_events.try_recv() {
+                self.adjust_playhead(upd);
+            }
+        }
         let pos = self.calculate_position();
         self.platter
             .update_playhead(pos.record_pos, pos.timestamp_nanos);
     }
-}
 
-pub fn spawn_platter_driver(
-    mut platter_src: PlatterSource,
-    update_frequency_hz: f64,
-    shutdown_flag: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let interval = Duration::from_secs_f64(1.0 / update_frequency_hz);
+    pub fn start(
+        mut self,
+        update_frequency_hz: f64,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let interval = Duration::from_secs_f64(1.0 / update_frequency_hz);
 
-        while !shutdown_flag.load(Ordering::Relaxed) {
-            let loop_start = Instant::now();
-            platter_src.update_platter();
-            // 5. High-precision sleep to maintain targeted update frequency
-            let elapsed = loop_start.elapsed();
-            if elapsed < interval {
-                std::thread::sleep(interval - elapsed);
+            while !shutdown_flag.load(Ordering::Relaxed) {
+                let loop_start = Instant::now();
+                self.update_platter();
+                // 5. High-precision sleep to maintain targeted update frequency
+                let elapsed = loop_start.elapsed();
+                if elapsed < interval {
+                    std::thread::sleep(interval - elapsed);
+                }
             }
-        }
 
-        println!("Platter stopped");
-    })
+            println!("Platter stopped");
+        })
+    }
 }
