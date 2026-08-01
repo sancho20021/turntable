@@ -3,8 +3,20 @@ use crate::{record::interpolation::Interpolator, stereo_frame::StereoFrame};
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub struct UNanos(pub u64);
 
+impl UNanos {
+    pub fn as_millis(&self) -> u64 {
+        self.0 / 1_000_000
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub struct INanos(pub i64);
+
+impl INanos {
+    pub fn as_millis(&self) -> i64 {
+        self.0 / 1_000_000
+    }
+}
 
 /// Virtual record
 #[derive(Debug)]

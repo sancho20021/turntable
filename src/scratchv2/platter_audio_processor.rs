@@ -100,6 +100,7 @@ impl PlatterAudioProcessor {
 
         // to detect reset, rewind, fast-forward, etc
         const JUMP_THRESHOLD: INanos = INanos(500_000_000);
+        // todo: observation not always change inbetween callbacks, results in many jumps
         let observed_played_nanos =
             INanos(self.second_measurement.record_pos.0 - self.first_measurement.record_pos.0);
 
@@ -143,6 +144,9 @@ impl PlatterAudioProcessor {
                     self.filtered_lag = self
                         .filtered_lag
                         .clamp(INanos(-5_000_000), INanos(5_000_000)); // TODO: think of good numbers
+
+                    log::debug!("raw lag = {}ms", lags_behind.as_millis());
+                    log::debug!("filtered lag = {}ms", self.filtered_lag.as_millis());
                 }
 
                 // if we add lags_behind to target_timestamp, we will remove the lag.
@@ -151,6 +155,7 @@ impl PlatterAudioProcessor {
                     self.filtered_lag.0
                         / ((SYNC_TIME.as_nanos() / block_duration.as_nanos()) as i64),
                 );
+                log::debug!("stepped filtered lag = {}", lags_behind_step.as_millis());
                 UNanos((target_timestamp.0 as i64 + lags_behind_step.0) as u64)
             };
 
@@ -191,14 +196,14 @@ impl PlatterAudioProcessor {
         };
 
         log::debug!(
-            "observations at {}, ..+{}ms",
-            self.first_measurement.timestamp_nanos.0,
+            "observations at {}ms, ..+{}ms",
+            self.first_measurement.timestamp_nanos.as_millis(),
             (self.second_measurement.timestamp_nanos.0 - self.first_measurement.timestamp_nanos.0)
                 / 1000000
         );
         log::debug!(
-            "playing at = {:.0}, ..+{:.0}ms at speed {:.2}",
-            self.last_played.timestamp_nanos.0,
+            "playing at = {}ms, ..+{:.0}ms at speed {:.2}",
+            self.last_played.timestamp_nanos.as_millis(),
             (target_playhead.timestamp_nanos.0 - self.last_played.timestamp_nanos.0) / 1000000,
             step.0 as f64 / (self.sample_to_nanos(1.))
         );

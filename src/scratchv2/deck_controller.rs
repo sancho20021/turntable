@@ -164,12 +164,20 @@ impl DeckController {
             DeckEvent::StartStop => self.start_or_stop(),
             DeckEvent::LoadTrack(track) => {
                 let send_rec = self.change_record.clone();
+                let adjust_playhead = self.adjust_playhead.clone();
                 println!("Loading: {}", track);
                 std::thread::spawn(move || {
                     let rec = load_file(44100, track.as_ref());
                     match rec {
                         Ok(rec) => {
                             let rec = Record::new(rec, Interpolator::linear(), 44100);
+
+                            // so that next record starts from the beginning
+                            log_try_send(
+                                &adjust_playhead,
+                                PlayheadUpdate::ToZero,
+                                "reset playhead",
+                            );
                             log_try_send(&send_rec, rec, "change record");
                         }
                         Err(e) => {
