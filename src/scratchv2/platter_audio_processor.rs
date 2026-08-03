@@ -43,8 +43,8 @@ impl PlatterAudioProcessor {
     }
 
     /// Calculates optimal update frequency for virtual platter
-    pub fn platter_update_freq(sample_rate: usize, buffer_size: usize) -> usize {
-        (1. / Self::block_duration(sample_rate, buffer_size).as_secs_f64() * 3.) as usize
+    pub fn platter_update_freq(sample_rate: usize, samples_n: usize) -> usize {
+        (1. / Self::block_duration(sample_rate, samples_n * 2).as_secs_f64() * 3.) as usize
     }
 
     fn block_dur(&self, buffer_size: usize) -> Duration {

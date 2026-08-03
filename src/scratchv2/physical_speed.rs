@@ -15,7 +15,7 @@ pub struct Speed {
     /// the current speed is set to desired speed.
     /// Used in combination with dt in SECONDS
     ///
-    /// Useful to prevent record from endlessly slipping on the slipmat.
+    /// Useful to prevent record from approaching target speed for too long
     diff_threshold: f64,
 }
 

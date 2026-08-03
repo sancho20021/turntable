@@ -21,7 +21,7 @@ enum Commands {
     /// Run the new V2 testing turntable (no mouse tracking, synthetic events)
     V2 {
         /// Audio callback buffer size
-        #[arg(short, long, default_value_t = 512)]
+        #[arg(short, long, default_value_t = 128)]
         buffer: u32,
 
         /// Touchpad sensitivity factor

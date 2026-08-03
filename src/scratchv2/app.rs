@@ -26,6 +26,7 @@ use crate::{
 pub fn start(
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
+    // buffer in frames
     buffer_size: u32,
     sample_rate: u32,
 ) {
@@ -127,7 +128,7 @@ fn start_deck(
         buffer_size: BufferSize::Fixed(buffer_size),
     };
 
-    println!("Output config: {:?}", config);
+    println!("Stream config: {:?}", config);
 
     let mut processor =
         PlatterAudioProcessor::new(sample_rate as usize, platter, new_record, used_records);

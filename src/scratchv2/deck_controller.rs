@@ -87,8 +87,7 @@ pub enum ExternalEvent {
     RecordChanged,
 }
 
-// 1.0 sensitivity means 400 pixels = 1 second of audio
-static BASE_SENSITIVITY_FACTOR: f64 = 2_500_000.0;
+static BASE_SENSITIVITY_FACTOR: f64 = 1_500_000.0;
 
 impl DeckController {
     pub fn new(

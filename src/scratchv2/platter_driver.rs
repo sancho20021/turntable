@@ -33,7 +33,6 @@ pub enum PlayheadUpdate {
 #[derive(Debug)]
 pub struct PlatterDriver {
     state: Arc<DeckState>,
-    motor_speed: Speed,
     record_speed: Speed,
     sensitivity: f64,
     platter: WritablePlatter,
@@ -49,13 +48,10 @@ impl PlatterDriver {
         playhead_events: Receiver<PlayheadUpdate>,
     ) -> Self {
         let initial_speed = state.target_speed();
-        let motor_speed = Speed::new(inertia_tau_secs, 0.1, initial_speed);
-        // I want the record to sync with the platter in about 50ms after scratching
-        let record_speed = Speed::new(0.01, 25., initial_speed);
+        let record_speed = Speed::new(inertia_tau_secs, 1., initial_speed);
         Self {
             state,
-            motor_speed,
-            record_speed: record_speed,
+            record_speed,
             sensitivity,
             platter,
             playhead_events,
@@ -78,11 +74,8 @@ impl PlatterDriver {
                 let speed = {
                     let dt_secs = elapsed_nanos.0 as f64 / 1_000_000_000.;
                     // motor speed tries reaching pitch
-                    self.motor_speed
-                        .advance_speed(dt_secs, self.state.target_speed());
-                    // record speed catches up with motor speed (not instant because of virtual slipmat)
                     self.record_speed
-                        .advance_speed(dt_secs, self.motor_speed.get());
+                        .advance_speed(dt_secs, self.state.target_speed());
                     self.record_speed.get()
                 };
 
@@ -111,18 +104,6 @@ impl PlatterDriver {
                     timestamp_nanos: now,
                     record_pos: INanos(anchor_platter.0 + position_delta),
                 };
-                if new_sample.timestamp_nanos > cur_playhead.timestamp_nanos {
-                    const TAU_NANOS: f64 = 10_000_000.0;
-                    let dt_nanos =
-                        (new_sample.timestamp_nanos.0 - cur_playhead.timestamp_nanos.0) as f64;
-                    let factor = (-dt_nanos / TAU_NANOS).exp();
-                    let raw_speed =
-                        (new_sample.record_pos.0 - cur_playhead.record_pos.0) as f64 / dt_nanos;
-                    // Applying frequency-invariant exponential smoothing
-                    let current_speed = self.record_speed.get();
-                    let next_speed = raw_speed + (current_speed - raw_speed) * factor;
-                    self.record_speed.hard_set_speed(next_speed);
-                }
                 new_sample
             }
         }
