@@ -112,7 +112,6 @@ impl PlatterDriver {
                     record_pos: INanos(anchor_platter.0 + position_delta),
                 };
                 if new_sample.timestamp_nanos > cur_playhead.timestamp_nanos {
-                    // todo: separate inertia of "scratch release and motor inertia"
                     const TAU_NANOS: f64 = 10_000_000.0;
                     let dt_nanos =
                         (new_sample.timestamp_nanos.0 - cur_playhead.timestamp_nanos.0) as f64;
@@ -155,11 +154,11 @@ impl PlatterDriver {
 
     pub fn start(
         mut self,
-        update_frequency_hz: f64,
+        update_frequency_hz: usize,
         shutdown_flag: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let interval = Duration::from_secs_f64(1.0 / update_frequency_hz);
+            let interval = Duration::from_secs_f64(1.0 / update_frequency_hz as f64);
 
             while !shutdown_flag.load(Ordering::Relaxed) {
                 let loop_start = Instant::now();

@@ -7,7 +7,8 @@ use cpal::{
     BufferSize, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use crossbeam::channel::Sender;
+use crossbeam::channel::bounded;
+use rtrb::{Consumer, Producer};
 use sdl2::event::Event;
 
 use crate::{
@@ -15,7 +16,7 @@ use crate::{
     scratchv2::{
         deck_controller::DeckController,
         platter_audio_processor::PlatterAudioProcessor,
-        platter_driver,
+        record_changer::RecordChanger,
         virtual_platter::{ReadablePlatter, WritablePlatter, new_platter},
     },
     sdl_deck_event::to_deck_event,
@@ -25,7 +26,6 @@ use crate::{
 pub fn start(
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
-    platter_update_freq_hz: f64,
     buffer_size: u32,
     sample_rate: u32,
 ) {
@@ -39,26 +39,64 @@ pub fn start(
         .unwrap();
 
     let mut pump = sdl.event_pump().unwrap();
-    let (stream, write_platter, read_platter, record_sender) =
-        start_deck(buffer_size, sample_rate).unwrap();
-    let (mut controller, platter_driver) = DeckController::new(
-        read_platter,
+
+    let (used_records_prod, used_records_cons) = rtrb::RingBuffer::new(3);
+    let (new_record_prod, new_record_cons) = rtrb::RingBuffer::new(1);
+
+    let (requested_record_snd, requested_rec_rcv) = bounded(100);
+
+    let (write_platter, read_platter) = new_platter();
+
+    let (controller, platter_driver) = DeckController::new(
+        read_platter.clone(),
         write_platter,
-        record_sender,
+        requested_record_snd,
         1.,
         touchpad_sensitivity,
         motor_inertia_secs,
     );
-    let platter_shutdown = Arc::new(AtomicBool::new(false));
-    let driver = platter_driver.start(platter_update_freq_hz, Arc::clone(&platter_shutdown));
+    let controller = Arc::new(controller);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let controller_listener =
+        Arc::clone(&controller).listen_to_external_events(Arc::clone(&shutdown));
+
+    let platter_update_freq_hz =
+        PlatterAudioProcessor::platter_update_freq(sample_rate as usize, buffer_size as usize);
+    log::info!("calculated platter update frequency is {platter_update_freq_hz}hz");
+
+    let driver = platter_driver.start(platter_update_freq_hz, Arc::clone(&shutdown));
+
+    let record_changer = RecordChanger::new(
+        requested_rec_rcv,
+        new_record_prod,
+        used_records_cons,
+        Arc::clone(&shutdown),
+        controller.get_event_sender(),
+    )
+    .start();
+
+    let stream = start_deck(
+        buffer_size,
+        sample_rate,
+        used_records_prod,
+        new_record_cons,
+        read_platter,
+    )
+    .unwrap();
 
     for event in pump.wait_iter() {
         if let Event::Quit { .. } = event {
             println!("Stopping the app");
             drop(stream);
-            platter_shutdown.store(true, Ordering::Relaxed);
+            shutdown.store(true, Ordering::Relaxed);
             if let Err(_) = driver.join() {
-                eprintln!("Platter driver panicked");
+                log::error!("Platter driver panicked");
+            }
+            if let Err(_) = record_changer.join() {
+                log::error!("Record changer panicked");
+            }
+            if let Err(_) = controller_listener.join() {
+                log::error!("Controller listener panicked");
             }
             return;
         }
@@ -71,10 +109,14 @@ pub fn start(
     }
 }
 
+/// Start audio thread
 fn start_deck(
     buffer_size: u32,
     sample_rate: u32,
-) -> anyhow::Result<(Stream, WritablePlatter, ReadablePlatter, Sender<Record>)> {
+    used_records: Producer<Record>,
+    new_record: Consumer<Record>,
+    platter: ReadablePlatter,
+) -> anyhow::Result<Stream> {
     let host = cpal::default_host();
 
     let device = host.default_output_device().expect("No output device");
@@ -87,12 +129,8 @@ fn start_deck(
 
     println!("Output config: {:?}", config);
 
-    let (write_platter, read_platter) = new_platter();
-
-    let (send, recv) = crossbeam::channel::bounded(1);
-
     let mut processor =
-        PlatterAudioProcessor::new(sample_rate as usize, read_platter.clone(), recv);
+        PlatterAudioProcessor::new(sample_rate as usize, platter, new_record, used_records);
 
     let stream = device.build_output_stream(
         &config.into(),
@@ -106,5 +144,5 @@ fn start_deck(
     )?;
 
     stream.play()?;
-    Ok((stream, write_platter, read_platter, send))
+    Ok(stream)
 }

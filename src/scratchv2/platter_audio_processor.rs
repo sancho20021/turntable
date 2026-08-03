@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossbeam::channel::Receiver;
+use rtrb::{Consumer, Producer};
 
 use crate::{
     record::{INanos, Record, UNanos, interpolation::Linear},
@@ -17,8 +17,10 @@ pub struct PlatterAudioProcessor {
     platter: ReadablePlatter,
     sample_rate: usize,
     /// record sent to play instead of current record
-    next_record: Receiver<Record>,
+    next_record: Consumer<Record>,
     cur_record: Option<Record>,
+    /// sink for used records to avoid dropping in audio thread
+    used_records: Producer<Record>,
     /// timestamp and nanosecond of last sample played
     last_played: PlatterSample,
     //// Second newest measurement of virtual playhead
@@ -36,18 +38,39 @@ fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
 }
 
 impl PlatterAudioProcessor {
+    fn block_duration(sample_rate: usize, buffer_size: usize) -> Duration {
+        Duration::from_secs_f64((buffer_size as f64 / 2.) / (sample_rate as f64))
+    }
+
+    /// Calculates optimal update frequency for virtual platter
+    pub fn platter_update_freq(sample_rate: usize, buffer_size: usize) -> usize {
+        (1. / Self::block_duration(sample_rate, buffer_size).as_secs_f64() * 3.) as usize
+    }
+
     fn block_dur(&self, buffer_size: usize) -> Duration {
-        Duration::from_secs_f64((buffer_size as f64 / 2.) / (self.sample_rate as f64))
+        Self::block_duration(self.sample_rate, buffer_size)
     }
 
     fn set_record(&mut self, record: Record) {
-        self.cur_record = Some(record);
+        if let Some(old_record) = self.cur_record.replace(record) {
+            // in case of failure, we will drop it in audio thread which may lead to buffer overrun / underrun
+            match self.used_records.push(old_record) {
+                Ok(()) => {}
+                Err(rtrb::PushError::Full(old_rec)) => {
+                    log::warn!(
+                        "Failed to send used record to record changer, dropping on audio thread (may cause buffer overrun / underrun)"
+                    );
+                    drop(old_rec);
+                }
+            }
+        }
     }
 
     pub fn new(
         sample_rate: usize,
         platter: ReadablePlatter,
-        next_record: Receiver<Record>,
+        next_record: Consumer<Record>,
+        used_records: Producer<Record>,
     ) -> Self {
         let first_measurement = platter.get_playhead();
         let second_measurement = PlatterSample {
@@ -64,6 +87,7 @@ impl PlatterAudioProcessor {
             filtered_nanos_played: INanos(0), // one of sources of slow startup
             filtered_lag: INanos(0),
             next_record,
+            used_records,
         };
         processor
     }
@@ -87,8 +111,7 @@ impl PlatterAudioProcessor {
 
     /// Warning: this function must be very fast, no allocation
     pub fn write_frames(&mut self, data: &mut [f32]) {
-        if let Ok(record) = self.next_record.try_recv() {
-            println!("Track loaded");
+        if let Ok(record) = self.next_record.pop() {
             self.set_record(record);
         }
 
@@ -116,6 +139,8 @@ impl PlatterAudioProcessor {
             );
             let playhead =
                 INanos(self.second_measurement.record_pos.0 - self.filtered_nanos_played.0);
+
+            self.filtered_lag = INanos(0);
 
             // here we lose about maximum samples_n nanoseconds of accumulated error, which is fine as
             // sums up to around 44ns of drift per second

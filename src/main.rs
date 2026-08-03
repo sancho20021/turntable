@@ -4,6 +4,7 @@ mod record;
 mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
+mod utils;
 
 use clap::{Parser, Subcommand};
 use log::info;
@@ -19,10 +20,6 @@ struct Cli {
 enum Commands {
     /// Run the new V2 testing turntable (no mouse tracking, synthetic events)
     V2 {
-        /// Target frequency for platter updates in Hz
-        #[arg(short, long, default_value_t = 100.0)]
-        freq: f64,
-
         /// Audio callback buffer size
         #[arg(short, long, default_value_t = 512)]
         buffer: u32,
@@ -47,19 +44,18 @@ fn main() {
 
     match args.command {
         Commands::V2 {
-            freq,
             buffer,
             sensitivity,
             motor_inertia,
         } => {
             let sample_rate = 44100;
             println!(
-                "Starting V2 App (platter update Freq: {:.2}Hz,  buffer: {}, touchpad sensitivity: {sensitivity:.2}, motor inertia: {motor_inertia:.2}).",
-                freq, buffer
+                "Starting V2 App (buffer: {}, touchpad sensitivity: {sensitivity:.2}, motor inertia: {motor_inertia:.2}).",
+                buffer
             );
             println!("Drag and drop a music file to start");
 
-            scratchv2::app::start(motor_inertia, sensitivity, freq, buffer, sample_rate);
+            scratchv2::app::start(motor_inertia, sensitivity, buffer, sample_rate);
         }
     }
 }

@@ -1,22 +1,26 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use atomic_float::AtomicF64;
 use crossbeam::{
     atomic::AtomicCell,
-    channel::{Sender, bounded},
+    channel::{Receiver, Sender, bounded},
 };
 
 use crate::{
     deck_event::DeckEvent,
-    decoder::load_file,
-    record::{INanos, Record, interpolation::Interpolator},
+    record::INanos,
     scratchv2::{
         platter_driver::{PlatterDriver, PlayheadUpdate},
         virtual_platter::{ReadablePlatter, WritablePlatter},
     },
+    utils::log_try_send,
 };
 
 // const SPEED_EPS: f64 = 0.001;
@@ -62,9 +66,13 @@ impl DeckState {
 #[derive(Debug)]
 pub struct DeckController {
     state: Arc<DeckState>,
-    change_record: Sender<Record>,
+    change_record: Sender<String>,
     adjust_playhead: Sender<PlayheadUpdate>,
     platter: ReadablePlatter,
+    // Receives events from outside senders
+    event_receiver: Receiver<ExternalEvent>,
+    // so the controller can clone and hand out senders
+    event_sender: Sender<ExternalEvent>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +82,11 @@ enum PitchUpdate {
     Adjust(f64),
 }
 
+#[derive(Debug)]
+pub enum ExternalEvent {
+    RecordChanged,
+}
+
 // 1.0 sensitivity means 400 pixels = 1 second of audio
 static BASE_SENSITIVITY_FACTOR: f64 = 2_500_000.0;
 
@@ -81,7 +94,7 @@ impl DeckController {
     pub fn new(
         readable_platter: ReadablePlatter,
         writable_platter: WritablePlatter,
-        record_sender: Sender<Record>,
+        record_changer: Sender<String>,
         initial_pitch: f64,
         sensitivity: f64,
         inertia_tau_secs: f64,
@@ -100,15 +113,22 @@ impl DeckController {
             writable_platter,
             pl_rcv,
         );
+        let (event_snd, event_rcv) = bounded(100);
         (
             Self {
                 state: initial_state,
                 platter: readable_platter,
-                change_record: record_sender,
+                change_record: record_changer,
                 adjust_playhead: pl_snd,
+                event_sender: event_snd,
+                event_receiver: event_rcv,
             },
             platter_src,
         )
+    }
+
+    pub fn get_event_sender(&self) -> Sender<ExternalEvent> {
+        self.event_sender.clone()
     }
 
     fn handle_mouse_motion(&self, x: i32, mut current: PlatterState) {
@@ -137,7 +157,7 @@ impl DeckController {
         self.state.platter.store(PlatterState::Playing);
     }
 
-    fn update_pitch(&mut self, update: PitchUpdate, cur_speed: f64) {
+    fn update_pitch(&self, update: PitchUpdate, cur_speed: f64) {
         let new_speed = match update {
             PitchUpdate::Reset => 1.,
             PitchUpdate::Set(x) => x,
@@ -146,12 +166,43 @@ impl DeckController {
         self.state.pitch.store(new_speed, Ordering::Relaxed);
     }
 
-    fn start_or_stop(&mut self) {
+    fn start_or_stop(&self) {
         let playing = self.state.playing.load(Ordering::Relaxed);
         self.state.playing.store(!playing, Ordering::Relaxed);
     }
 
-    pub fn handle_deck_event(&mut self, event: DeckEvent) -> anyhow::Result<()> {
+    /// Starts a background thread that connects external components (like the **`RecordChanger`**) to this controller.
+    ///
+    /// **Must be called at startup**
+    pub fn listen_to_external_events(self: Arc<Self>, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let event = match self.event_receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(event) => event,
+                    Err(e) => match e {
+                        crossbeam::channel::RecvTimeoutError::Timeout => continue,
+                        crossbeam::channel::RecvTimeoutError::Disconnected => break,
+                    },
+                };
+                self.process_external_event(event);
+            }
+        })
+    }
+
+    fn process_external_event(&self, event: ExternalEvent) {
+        match event {
+            ExternalEvent::RecordChanged => {
+                println!("Track loaded");
+                log_try_send(
+                    &self.adjust_playhead,
+                    PlayheadUpdate::ToZero,
+                    "reset playhead",
+                )
+            }
+        }
+    }
+
+    pub fn handle_deck_event(&self, event: DeckEvent) -> anyhow::Result<()> {
         let current_pitch = self.state.pitch.load(Ordering::Relaxed);
         let current_state = self.state.platter.load();
         match event {
@@ -163,28 +214,7 @@ impl DeckController {
             DeckEvent::PitchDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
             DeckEvent::StartStop => self.start_or_stop(),
             DeckEvent::LoadTrack(track) => {
-                let send_rec = self.change_record.clone();
-                let adjust_playhead = self.adjust_playhead.clone();
-                println!("Loading: {}", track);
-                std::thread::spawn(move || {
-                    let rec = load_file(44100, track.as_ref());
-                    match rec {
-                        Ok(rec) => {
-                            let rec = Record::new(rec, Interpolator::linear(), 44100);
-
-                            // so that next record starts from the beginning
-                            log_try_send(
-                                &adjust_playhead,
-                                PlayheadUpdate::ToZero,
-                                "reset playhead",
-                            );
-                            log_try_send(&send_rec, rec, "change record");
-                        }
-                        Err(e) => {
-                            log::error!("failed to load track: {e}");
-                        }
-                    }
-                });
+                log_try_send(&self.change_record, track, "change record")
             }
             DeckEvent::PlayheadReset => log_try_send(
                 &self.adjust_playhead,
@@ -201,17 +231,5 @@ impl DeckController {
             }
         };
         Ok(())
-    }
-}
-
-/// Helper function to safely send events to a bounded queue without crashing or blocking.
-///
-/// # Arguments
-/// * `queue` - The bounded channel sender
-/// * `event` - The event item being pushed
-/// * `context` - A descriptive label used in the log error message if the send fails
-pub fn log_try_send<T>(queue: &Sender<T>, event: T, action: &str) {
-    if let Err(e) = queue.try_send(event) {
-        log::error!("failed to {}, try again: {}", action, e);
     }
 }

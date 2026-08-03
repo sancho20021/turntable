@@ -4,3 +4,4 @@ mod platter_driver;
 mod deck_controller;
 mod virtual_platter;
 mod physical_speed;
+mod record_changer;
