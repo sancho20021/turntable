@@ -1,5 +1,13 @@
+use std::time::Instant;
+
 #[derive(Debug)]
-pub enum DeckEvent {
+pub struct DeckEvent {
+    pub event: Event,
+    pub timestamp: Instant,
+}
+
+#[derive(Debug)]
+pub enum Event {
     MouseMotion(i32),
     MouseDown(i32),
     MouseUp(i32),

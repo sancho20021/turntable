@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
 use cpal::{
@@ -17,9 +20,10 @@ use crate::{
         deck_controller::DeckController,
         platter_audio_processor::PlatterAudioProcessor,
         record_changer::RecordChanger,
-        virtual_platter::{ReadablePlatter, WritablePlatter, new_platter},
+        virtual_platter::{ReadablePlatter, new_platter},
     },
     sdl_deck_event::to_deck_event,
+    telemetry,
 };
 
 /// Main app loop
@@ -48,7 +52,7 @@ pub fn start(
 
     let (write_platter, read_platter) = new_platter();
 
-    let (controller, platter_driver) = DeckController::new(
+    let (mut controller, platter_driver, deck_worker) = DeckController::new(
         read_platter.clone(),
         write_platter,
         requested_record_snd,
@@ -56,10 +60,9 @@ pub fn start(
         touchpad_sensitivity,
         motor_inertia_secs,
     );
-    let controller = Arc::new(controller);
     let shutdown = Arc::new(AtomicBool::new(false));
-    let controller_listener =
-        Arc::clone(&controller).listen_to_external_events(Arc::clone(&shutdown));
+    let send_external_events = deck_worker.get_event_sender();
+    let controller_listener = deck_worker.listen_to_external_events(Arc::clone(&shutdown));
 
     let platter_update_freq_hz =
         PlatterAudioProcessor::platter_update_freq(sample_rate as usize, buffer_size as usize);
@@ -72,7 +75,7 @@ pub fn start(
         new_record_prod,
         used_records_cons,
         Arc::clone(&shutdown),
-        controller.get_event_sender(),
+        send_external_events,
     )
     .start();
 
@@ -87,27 +90,36 @@ pub fn start(
 
     for event in pump.wait_iter() {
         if let Event::Quit { .. } = event {
-            println!("Stopping the app");
-            drop(stream);
-            shutdown.store(true, Ordering::Relaxed);
-            if let Err(_) = driver.join() {
-                log::error!("Platter driver panicked");
-            }
-            if let Err(_) = record_changer.join() {
-                log::error!("Record changer panicked");
-            }
-            if let Err(_) = controller_listener.join() {
-                log::error!("Controller listener panicked");
-            }
-            return;
+            break;
         }
-        if let Some(event) = to_deck_event(event) {
+        if let Some(event) = to_deck_event(event, Instant::now()) {
             let r = controller.handle_deck_event(event);
             if let Err(r) = r {
                 log::error!("{r}");
             }
         }
     }
+
+    println!("Stopping the app");
+    drop(stream);
+    shutdown.store(true, Ordering::Relaxed);
+    let platter_driver = driver.join().map_err(|e| {
+        log::error!("Platter driver panicked");
+        e
+    });
+    if let Err(_) = record_changer.join() {
+        log::error!("Record changer panicked");
+    }
+    if let Err(_) = controller_listener.join() {
+        log::error!("Controller listener panicked");
+    }
+
+    let mut tracers = vec![controller.tracer];
+    if let Ok(driver) = platter_driver {
+        tracers.push(driver.tracer);
+    }
+
+    telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
 }
 
 /// Start audio thread

@@ -1,22 +1,24 @@
+use std::time::Instant;
+
 use sdl2::{event::Event, keyboard::Keycode, mouse::MouseButton};
 
-use crate::deck_event::DeckEvent;
+use crate::deck_event::{self, DeckEvent};
 
-pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
-    match event {
-        Event::MouseMotion { x, .. } => Some(DeckEvent::MouseMotion(x)),
+pub fn to_deck_event(event: Event, timestamp: Instant) -> Option<DeckEvent> {
+    let event = match event {
+        Event::MouseMotion { x, .. } => Some(deck_event::Event::MouseMotion(x)),
 
         Event::MouseButtonDown {
             mouse_btn: MouseButton::Left,
             x,
             ..
-        } => Some(DeckEvent::MouseDown(x)),
+        } => Some(deck_event::Event::MouseDown(x)),
 
         Event::MouseButtonUp {
             mouse_btn: MouseButton::Left,
             x,
             ..
-        } => Some(DeckEvent::MouseUp(x)),
+        } => Some(deck_event::Event::MouseUp(x)),
 
         Event::KeyDown {
             keycode, keymod, ..
@@ -26,16 +28,16 @@ pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
                     .intersects(sdl2::keyboard::Mod::LSHIFTMOD | sdl2::keyboard::Mod::RSHIFTMOD);
 
                 match key {
-                    Keycode::R => Some(DeckEvent::ResetPitch),
-                    Keycode::Up => Some(DeckEvent::PitchUp),
-                    Keycode::Down => Some(DeckEvent::PitchDown),
-                    Keycode::Space => Some(DeckEvent::StartStop),
-                    Keycode::Right => Some(DeckEvent::PlayheadFF),
+                    Keycode::R => Some(deck_event::Event::ResetPitch),
+                    Keycode::Up => Some(deck_event::Event::PitchUp),
+                    Keycode::Down => Some(deck_event::Event::PitchDown),
+                    Keycode::Space => Some(deck_event::Event::StartStop),
+                    Keycode::Right => Some(deck_event::Event::PlayheadFF),
                     Keycode::Left => {
                         if is_shift {
-                            Some(DeckEvent::PlayheadReset)
+                            Some(deck_event::Event::PlayheadReset)
                         } else {
-                            Some(DeckEvent::PlayheadRewind)
+                            Some(deck_event::Event::PlayheadRewind)
                         }
                     }
                     _ => None,
@@ -44,7 +46,8 @@ pub fn to_deck_event(event: Event) -> Option<DeckEvent> {
                 None
             }
         }
-        Event::DropFile { filename, .. } => Some(DeckEvent::LoadTrack(filename)),
+        Event::DropFile { filename, .. } => Some(deck_event::Event::LoadTrack(filename)),
         _ => None,
-    }
+    }?;
+    Some(DeckEvent { event, timestamp })
 }

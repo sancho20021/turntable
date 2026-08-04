@@ -31,6 +31,8 @@ pub struct PlatterAudioProcessor {
     filtered_nanos_played: INanos,
     /// filtered lag of played nanos behind last observed nanos
     filtered_lag: INanos,
+    /// last speed of playback
+    last_speed: f64,
 }
 
 fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
@@ -88,6 +90,7 @@ impl PlatterAudioProcessor {
             filtered_lag: INanos(0),
             next_record,
             used_records,
+            last_speed: 0., // one of sources of slow startup
         };
         processor
     }
@@ -137,8 +140,10 @@ impl PlatterAudioProcessor {
                 "Playhead jumped: jump distance: {:.2}s",
                 observed_played_nanos.0 as f64 / 1_000_000_000.0
             );
-            let playhead =
-                INanos(self.second_measurement.record_pos.0 - self.filtered_nanos_played.0);
+            let playhead = INanos(
+                self.second_measurement.record_pos.0
+                    - (self.last_speed * block_duration.as_nanos() as f64) as i64,
+            );
 
             self.filtered_lag = INanos(0);
 
@@ -160,7 +165,6 @@ impl PlatterAudioProcessor {
 
                     // we must filter the lag because if observations arrive less frequently then write_frames,
                     // then lag will jump back and forth
-                    // todo: make this invariant of buffer size using dt and exponent
                     self.filtered_lag =
                         INanos(
                             ma_filter(self.filtered_lag.0 as f64, lags_behind.0 as f64, 0.1) as i64,
@@ -196,8 +200,10 @@ impl PlatterAudioProcessor {
                 INanos(target_playhead_estimated.0 - self.last_played.record_pos.0);
 
             let target_playhead_nanos = {
-                let alpha = 0.8; // higher - snappier
-                // todo: make this invariant of buffer size using dt and exponent
+                let tau = 0.1;
+                let dt_secs = block_duration.as_secs_f64();
+                let alpha = 1.0 - (-dt_secs / tau).exp();
+
                 self.filtered_nanos_played = INanos(ma_filter(
                     self.filtered_nanos_played.0 as f64,
                     to_play_estimated.0 as f64,
@@ -232,6 +238,9 @@ impl PlatterAudioProcessor {
             (target_playhead.timestamp_nanos.0 - self.last_played.timestamp_nanos.0) / 1000000,
             step.0 as f64 / (self.sample_to_nanos(1.))
         );
+
+        self.last_speed =
+            (target_playhead.record_pos.0 - playhead.0) as f64 / block_duration.as_nanos() as f64;
 
         self.last_played = target_playhead;
 

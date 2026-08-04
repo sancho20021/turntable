@@ -66,6 +66,10 @@ impl<AnyMode> VirtualPlatter<AnyMode> {
     pub fn get_playhead(&self) -> PlatterSample {
         self.playhead.load()
     }
+
+    pub fn timestamp(&self, timestamp: Instant) -> UNanos {
+        UNanos((timestamp - self.base_time).as_nanos() as u64)
+    }
 }
 
 impl VirtualPlatter<Write> {

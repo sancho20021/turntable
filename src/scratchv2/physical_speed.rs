@@ -43,9 +43,4 @@ impl Speed {
             self.speed = target_speed;
         }
     }
-
-    /// sets motor speed
-    pub fn hard_set_speed(&mut self, speed: f64) {
-        self.speed = speed;
-    }
 }

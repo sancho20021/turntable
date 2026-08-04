@@ -7,6 +7,10 @@ impl UNanos {
     pub fn as_millis(&self) -> u64 {
         self.0 / 1_000_000
     }
+
+    pub fn as_micros(&self) -> u64 {
+        self.0 / 1_000
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]

@@ -5,6 +5,7 @@ mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
 mod utils;
+mod telemetry;
 
 use clap::{Parser, Subcommand};
 use log::info;

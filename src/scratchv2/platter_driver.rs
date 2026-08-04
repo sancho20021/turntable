@@ -10,11 +10,13 @@ use crossbeam::channel::Receiver;
 
 use crate::{
     record::{INanos, UNanos},
+    record_mouse,
     scratchv2::{
         deck_controller::{DeckState, PlatterState},
         physical_speed::Speed,
         virtual_platter::{PlatterSample, WritablePlatter},
     },
+    telemetry::TelemetryTrace,
 };
 
 /// time that fast-forward skips
@@ -37,6 +39,8 @@ pub struct PlatterDriver {
     sensitivity: f64,
     platter: WritablePlatter,
     playhead_events: Receiver<PlayheadUpdate>,
+    /// for recording metrics
+    pub tracer: TelemetryTrace,
 }
 
 impl PlatterDriver {
@@ -55,6 +59,7 @@ impl PlatterDriver {
             sensitivity,
             platter,
             playhead_events,
+            tracer: TelemetryTrace::new(),
         }
     }
 
@@ -62,9 +67,10 @@ impl PlatterDriver {
     fn calculate_position(&mut self) -> PlatterSample {
         let state = self.state.platter.load();
         let now = self.platter.now();
+
         let cur_playhead = self.platter.get_playhead();
 
-        match state {
+        let sample = match state {
             PlatterState::Playing => {
                 if now <= cur_playhead.timestamp_nanos {
                     return cur_playhead;
@@ -90,15 +96,53 @@ impl PlatterDriver {
                 anchor_pos: anchor_platter,
                 anchor_mouse_x,
                 latest_mouse_x,
-                ..
+                timestamp: latest_mouse_t,
+                mouse_speed,
             } => {
-                // TODO:
-                // inspect mouse updates (estimated speed, and check why it scratch release doesn't behave as expected)
-                //
-                // TODO: in mouse updates save timestamps as well because mouse updates can be older than now
-                let mouse_delta = (latest_mouse_x - anchor_mouse_x) as f64;
+                // TODO: scratch and stop leads to indefinite calculation below which is like lo-fi normal playback at
+                // latest mouse speed.
+                // probably can be fixed with
+                // or some smart filter that if distance is too far away then converges to latest position?
+                // but not sure. maybe delay time so that we take older value as current so that if we go
+                // over the latest mouse event we stop and never extrapolate
 
-                // Map mouse movement straight to playhead offset
+                let cur_mouse: f64 = {
+                    // we go 2ms in past to extrapolate less
+                    let dt_secs: f64 = (now.0 - 2_000_000 - latest_mouse_t.0) as f64 / 1_000_000_000.;
+
+                    // 1. Calculate where the mouse *would* be if it kept moving
+                    let extrapolated_mouse = {
+                        // for extrapolation we clamp dt
+                        let dt_secs = dt_secs.clamp(-20. / 1_000., 10. / 1_000.);
+
+                        let raw_extrapolated: f64 = match mouse_speed {
+                            Some(speed) => latest_mouse_x as f64 + (speed * dt_secs),
+                            None => latest_mouse_x as f64,
+                        };
+
+                        let max_drift_pixels = 50.;
+                        raw_extrapolated.clamp(
+                            latest_mouse_x as f64 - max_drift_pixels,
+                            latest_mouse_x as f64 + max_drift_pixels,
+                        )
+                    };
+
+                    record_mouse!(self.tracer, now, "extrapolated_mouse_x", extrapolated_mouse);
+
+                    // 2. Convergence factor (higher lambda = snaps faster, lower = smoother/more inertia)
+                    let lambda = 50.0;
+                    let convergence_weight = (-lambda * dt_secs).exp(); // Drops from 1.0 to 0.0 over time
+
+                    // 3. Blend between extrapolation (short-term) and the hard target (long-term)
+                    (extrapolated_mouse * convergence_weight)
+                        + (latest_mouse_x as f64 * (1.0 - convergence_weight))
+                };
+
+                record_mouse!(self.tracer, now, "converged_mouse_x", cur_mouse);
+
+                let mouse_delta = cur_mouse - anchor_mouse_x as f64;
+
+                // Map mouse movement to playhead offset
                 let position_delta = (mouse_delta * self.sensitivity) as i64;
                 let new_sample = PlatterSample {
                     timestamp_nanos: now,
@@ -106,7 +150,8 @@ impl PlatterDriver {
                 };
                 new_sample
             }
-        }
+        };
+        sample
     }
 
     fn adjust_playhead(&mut self, adjust: PlayheadUpdate) {
@@ -137,7 +182,7 @@ impl PlatterDriver {
         mut self,
         update_frequency_hz: usize,
         shutdown_flag: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> std::thread::JoinHandle<Self> {
         std::thread::spawn(move || {
             let interval = Duration::from_secs_f64(1.0 / update_frequency_hz as f64);
 
@@ -152,6 +197,7 @@ impl PlatterDriver {
             }
 
             println!("Platter stopped");
+            self
         })
     }
 }
