@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use rtrb::{Consumer, Producer};
 
 use crate::{
+    filters::FirstOrderLPF,
     record::{INanos, Record, UNanos, interpolation::Linear},
     scratchv2::virtual_platter::{PlatterSample, ReadablePlatter},
 };
@@ -29,8 +30,8 @@ pub struct PlatterAudioProcessor {
     first_measurement: PlatterSample,
     /// Newest observed virtual playhead position. strictly newer than first_measurement
     second_measurement: PlatterSample,
-    /// filtered target playhead
-    filtered_target_playhead: INanos,
+    /// filtered target playhead in nanos
+    filtered_target_playhead: FirstOrderLPF,
     /// filtered lag of played nanos behind last observed nanos
     filtered_lag: INanos,
     /// last speed of playback
@@ -88,7 +89,7 @@ impl PlatterAudioProcessor {
             last_played: first_measurement,
             second_measurement,
             first_measurement,
-            filtered_target_playhead: INanos(0),
+            filtered_target_playhead: FirstOrderLPF::new(PLAYHEAD_LPF_TAU),
             filtered_lag: INanos(0),
             next_record,
             used_records,
@@ -142,11 +143,14 @@ impl PlatterAudioProcessor {
                     - (self.last_speed * block_duration.as_nanos() as f64) as i64,
             );
 
-            self.filtered_target_playhead = {
+            {
                 // without this lag subtraction, filter will fallback to warm-up state, and produce playback ramping
                 let speed_nanos_per_sec = self.last_speed * 1_000_000_000.0;
-                let steady_state_lag_nanos = (speed_nanos_per_sec * PLAYHEAD_LPF_TAU) as i64;
-                INanos(self.second_measurement.record_pos.0 - steady_state_lag_nanos)
+                let steady_state_lag_nanos = speed_nanos_per_sec * PLAYHEAD_LPF_TAU;
+
+                self.filtered_target_playhead.force_state(
+                    self.second_measurement.record_pos.0 as f64 - steady_state_lag_nanos,
+                );
             };
             self.filtered_lag = INanos(0);
 
@@ -200,23 +204,10 @@ impl PlatterAudioProcessor {
                 target_timestamp.0,
             ) as i64);
 
-            let target_playhead_nanos = {
-                let dt_secs = block_duration.as_secs_f64();
-                let alpha = 1.0 - (-dt_secs / PLAYHEAD_LPF_TAU).exp();
-
-                // 1. Initialize filter to current position if it's the first run
-                if self.filtered_target_playhead.0 == 0 {
-                    self.filtered_target_playhead = target_playhead_estimated;
-                }
-
-                self.filtered_target_playhead = INanos(ma_filter(
-                    self.filtered_target_playhead.0 as f64,
-                    target_playhead_estimated.0 as f64,
-                    alpha,
-                ) as i64);
-
-                self.filtered_target_playhead
-            };
+            let target_playhead_nanos = INanos(self.filtered_target_playhead.advance(
+                block_duration.as_secs_f64(),
+                target_playhead_estimated.0 as f64,
+            ) as i64);
 
             let playhead_nanos = INanos(self.last_played.record_pos.0);
             // here we lose about maximum samples_n nanoseconds of accumulated error, which is fine as

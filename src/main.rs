@@ -6,6 +6,7 @@ mod sdl_deck_event;
 mod stereo_frame;
 mod utils;
 mod telemetry;
+mod filters;
 
 use clap::{Parser, Subcommand};
 use log::info;
