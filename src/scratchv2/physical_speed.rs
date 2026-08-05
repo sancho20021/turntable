@@ -2,45 +2,35 @@
 //
 // Used to emulate vinyl wind up and wind down effect, and delayed speed reaction to pitch adjust
 
-#[derive(Debug)]
-pub struct Speed {
-    /// The inertia time constant (in seconds).
-    /// A lower value (e.g., 0.2) simulates a high-torque direct-drive motor like a Technics SL-1200.
-    /// A higher value (e.g., 1.0) simulates a low-torque belt-drive motor.
-    inertia_tau: f64,
-    /// Dynamically adjustable speed
-    speed: f64,
+use crate::filters::FirstOrderLPF;
 
+pub struct Speed {
+    speed: FirstOrderLPF,
     /// if difference between current and desired speed is below this value,
     /// the current speed is set to desired speed.
-    /// Used in combination with dt in SECONDS
     ///
     /// Useful to prevent record from approaching target speed for too long
     diff_threshold: f64,
 }
 
 impl Speed {
-    pub fn new(inertia_tau: f64, diff_threshold: f64, initial_speed: f64) -> Self {
+    pub fn new(inertia_secs: f64, diff_threshold: f64) -> Self {
         Self {
-            inertia_tau,
+            speed: FirstOrderLPF::new(inertia_secs),
             diff_threshold,
-            speed: initial_speed,
         }
     }
 
-    pub fn get(&self) -> f64 {
-        self.speed
-    }
-
     /// Update current motor speed according to delta time and target speed
-    pub fn advance_speed(&mut self, dt_secs: f64, target_speed: f64) {
+    pub fn advance(&mut self, dt_secs: f64, target_speed: f64) -> f64 {
+        let speed = self.speed.advance(dt_secs, target_speed);
         // Avoid endless adjustments if the speeds are virtually identical
-        if (self.speed - target_speed).abs() > self.diff_threshold * dt_secs {
-            let factor = (-dt_secs / self.inertia_tau).exp();
-            let next_speed = target_speed + (self.speed - target_speed) * factor;
-            self.speed = next_speed;
+
+        if (speed - target_speed).abs() < self.diff_threshold {
+            self.speed.force_state(target_speed);
+            target_speed
         } else {
-            self.speed = target_speed;
+            speed
         }
     }
 }

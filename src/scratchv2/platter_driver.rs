@@ -32,7 +32,6 @@ pub enum PlayheadUpdate {
     Rewind,
 }
 
-#[derive(Debug)]
 pub struct PlatterDriver {
     state: Arc<DeckState>,
     record_speed: Speed,
@@ -51,8 +50,7 @@ impl PlatterDriver {
         platter: WritablePlatter,
         playhead_events: Receiver<PlayheadUpdate>,
     ) -> Self {
-        let initial_speed = state.target_speed();
-        let record_speed = Speed::new(inertia_tau_secs, 1., initial_speed);
+        let record_speed = Speed::new(inertia_tau_secs, 0.005);
         Self {
             state,
             record_speed,
@@ -69,24 +67,16 @@ impl PlatterDriver {
         let now = self.platter.now();
 
         let cur_playhead = self.platter.get_playhead();
+        let elapsed_nanos: f64 = (now.0 as f64 - cur_playhead.timestamp_nanos.0 as f64).max(0.);
+
+        let speed = self
+            .record_speed
+            .advance(elapsed_nanos / 1_000_000_000., self.state.target_speed());
 
         let sample = match state {
             PlatterState::Playing => {
-                if now <= cur_playhead.timestamp_nanos {
-                    return cur_playhead;
-                }
-                let elapsed_nanos = UNanos(now.0 - cur_playhead.timestamp_nanos.0);
-
-                let speed = {
-                    let dt_secs = elapsed_nanos.0 as f64 / 1_000_000_000.;
-                    // motor speed tries reaching pitch
-                    self.record_speed
-                        .advance_speed(dt_secs, self.state.target_speed());
-                    self.record_speed.get()
-                };
-
                 // Position advances relative to elapsed time and playback speed
-                let position_delta = (elapsed_nanos.0 as f64 * speed) as i64;
+                let position_delta = (elapsed_nanos * speed) as i64;
                 PlatterSample {
                     timestamp_nanos: now,
                     record_pos: INanos(cur_playhead.record_pos.0 + position_delta),
@@ -99,16 +89,10 @@ impl PlatterDriver {
                 timestamp: latest_mouse_t,
                 mouse_speed,
             } => {
-                // TODO: scratch and stop leads to indefinite calculation below which is like lo-fi normal playback at
-                // latest mouse speed.
-                // probably can be fixed with
-                // or some smart filter that if distance is too far away then converges to latest position?
-                // but not sure. maybe delay time so that we take older value as current so that if we go
-                // over the latest mouse event we stop and never extrapolate
-
                 let cur_mouse: f64 = {
                     // we go 2ms in past to extrapolate less
-                    let dt_secs: f64 = (now.0 - 2_000_000 - latest_mouse_t.0) as f64 / 1_000_000_000.;
+                    let dt_secs: f64 =
+                        (now.0 - 2_000_000 - latest_mouse_t.0) as f64 / 1_000_000_000.;
 
                     // 1. Calculate where the mouse *would* be if it kept moving
                     let extrapolated_mouse = {

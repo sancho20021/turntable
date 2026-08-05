@@ -15,10 +15,10 @@ use crossbeam::{
 
 use crate::{
     deck_event::{self, DeckEvent},
+    filters::FirstOrderLPF,
     record::{INanos, UNanos},
     record_mouse,
     scratchv2::{
-        physical_speed::Speed,
         platter_driver::{PlatterDriver, PlayheadUpdate},
         virtual_platter::{ReadablePlatter, WritablePlatter},
     },
@@ -69,14 +69,13 @@ impl DeckState {
 
 /// Deck controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
-#[derive(Debug)]
 pub struct DeckController {
     state: Arc<DeckState>,
     change_record: Sender<String>,
     adjust_playhead: Sender<PlayheadUpdate>,
     platter: ReadablePlatter,
     /// mouse speed smoothing
-    mouse_speed: Option<Speed>,
+    mouse_speed: FirstOrderLPF,
     /// For recording metrics
     pub tracer: TelemetryTrace,
 }
@@ -135,7 +134,7 @@ impl DeckController {
                 change_record: record_changer,
                 adjust_playhead: pl_snd.clone(),
                 tracer: TelemetryTrace::new(),
-                mouse_speed: None,
+                mouse_speed: FirstOrderLPF::new(0.01),
             },
             driver,
             DeckWorker {
@@ -161,15 +160,10 @@ impl DeckController {
                 if dt_secs <= 0. {
                     None
                 } else {
-                    let raw_speed = (x - latest_mouse_x) as f64 / dt_secs;
-                    let filtered = if let Some(filtered_speed) = &mut self.mouse_speed {
-                        filtered_speed.advance_speed(dt_secs, raw_speed);
-                        filtered_speed.get()
-                    } else {
-                        self.mouse_speed = Some(Speed::new(0.01, 1., raw_speed));
-                        raw_speed
-                    };
-                    Some(filtered)
+                    Some(
+                        self.mouse_speed
+                            .advance(dt_secs, (x - latest_mouse_x) as f64 / dt_secs),
+                    )
                 }
             };
             let new_state = PlatterState::Scratching {
@@ -210,7 +204,7 @@ impl DeckController {
 
     fn handle_mouse_up(&mut self) {
         self.state.platter.store(PlatterState::Playing);
-        self.mouse_speed = None;
+        self.mouse_speed.reset();
     }
 
     fn update_pitch(&self, update: PitchUpdate, cur_speed: f64) {
