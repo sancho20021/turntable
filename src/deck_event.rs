@@ -7,10 +7,18 @@ pub struct DeckEvent {
 }
 
 #[derive(Debug)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug)]
 pub enum Event {
     MouseMotion(i32),
     MouseDown(i32),
     MouseUp(i32),
+    // pitch nudge
+    Nudge(Direction),
     StartStop,
     ResetPitch,
     PitchUp,

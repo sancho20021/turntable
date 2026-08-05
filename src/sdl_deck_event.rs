@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use sdl2::{event::Event, keyboard::Keycode, mouse::MouseButton};
 
-use crate::deck_event::{self, DeckEvent};
+use crate::deck_event::{self, DeckEvent, Direction};
 
 pub fn to_deck_event(event: Event, timestamp: Instant) -> Option<DeckEvent> {
     let event = match event {
@@ -19,6 +19,15 @@ pub fn to_deck_event(event: Event, timestamp: Instant) -> Option<DeckEvent> {
             x,
             ..
         } => Some(deck_event::Event::MouseUp(x)),
+
+        Event::MouseWheel { x, .. } => {
+            let direction = if x < 0 {
+                Direction::Forward
+            } else {
+                Direction::Backward
+            };
+            Some(deck_event::Event::Nudge(direction))
+        }
 
         Event::KeyDown {
             keycode, keymod, ..

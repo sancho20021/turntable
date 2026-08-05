@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,6 +10,7 @@ use std::{
 use crossbeam::channel::Receiver;
 
 use crate::{
+    deck_event::Direction,
     record::{INanos, UNanos},
     record_mouse,
     scratchv2::{
@@ -23,13 +25,65 @@ use crate::{
 static FF_TIME: UNanos = UNanos(15 * 1_000_000_000);
 
 #[derive(Debug)]
-pub enum PlayheadUpdate {
+pub enum Jump {
     /// set playhead to the start
     ToZero,
     /// skip FF_TIME forward
-    FastForward,
+    Forward,
     /// go FF_TIME backward
-    Rewind,
+    Backward,
+}
+
+#[derive(Debug)]
+pub enum PlatterEvent {
+    /// move playhead
+    MovePlayhead(Jump),
+    /// pitch bend / nudge
+    Nudge(Direction),
+}
+
+struct NudgeQueue {
+    /// nudge responsiveness
+    responsiveness: f32,
+    /// forward nudges, sorted from oldest to newest
+    forward: VecDeque<Instant>,
+    /// backward nudges, sorted from oldest to newest
+    backward: VecDeque<Instant>,
+}
+
+impl NudgeQueue {
+    pub fn new(responsiveness: f32) -> Self {
+        Self {
+            responsiveness: responsiveness * 2.,
+            forward: Default::default(),
+            backward: Default::default(),
+        }
+    }
+
+    fn current_nudge(&mut self) -> f32 {
+        let now = Instant::now();
+        let lifetime = Duration::from_millis(100);
+
+        // 1. Drain expired forward nudges one-by-one from the front
+        while let Some(oldest_time) = self.forward.front() {
+            if now.duration_since(*oldest_time) >= lifetime {
+                self.forward.pop_front(); // Cleanly pop index 0
+            } else {
+                break;
+            }
+        }
+
+        // 2. Drain expired backward nudges one-by-one from the front
+        while let Some(oldest_time) = self.backward.front() {
+            if now.duration_since(*oldest_time) >= lifetime {
+                self.backward.pop_front(); // Cleanly pop index 0
+            } else {
+                break;
+            }
+        }
+
+        self.responsiveness * (self.forward.len() as f32 - self.backward.len() as f32)
+    }
 }
 
 pub struct PlatterDriver {
@@ -37,7 +91,8 @@ pub struct PlatterDriver {
     record_speed: Speed,
     sensitivity: f64,
     platter: WritablePlatter,
-    playhead_events: Receiver<PlayheadUpdate>,
+    events: Receiver<PlatterEvent>,
+    nudges: NudgeQueue,
     /// for recording metrics
     pub tracer: TelemetryTrace,
 }
@@ -48,7 +103,8 @@ impl PlatterDriver {
         sensitivity: f64,
         inertia_tau_secs: f64,
         platter: WritablePlatter,
-        playhead_events: Receiver<PlayheadUpdate>,
+        events: Receiver<PlatterEvent>,
+        nudge_responsiveness: f32,
     ) -> Self {
         let record_speed = Speed::new(inertia_tau_secs, 0.005);
         Self {
@@ -56,8 +112,9 @@ impl PlatterDriver {
             record_speed,
             sensitivity,
             platter,
-            playhead_events,
+            events,
             tracer: TelemetryTrace::new(),
+            nudges: NudgeQueue::new(nudge_responsiveness),
         }
     }
 
@@ -69,9 +126,15 @@ impl PlatterDriver {
         let cur_playhead = self.platter.get_playhead();
         let elapsed_nanos: f64 = (now.0 as f64 - cur_playhead.timestamp_nanos.0 as f64).max(0.);
 
+        let target_speed = {
+            let nudge_raw = self.nudges.current_nudge() as f64;
+            let nudge_modifier = nudge_raw.clamp(-8., 8.) / 100.;
+            self.state.target_speed() + nudge_modifier
+        };
+
         let speed = self
             .record_speed
-            .advance(elapsed_nanos / 1_000_000_000., self.state.target_speed());
+            .advance(elapsed_nanos / 1_000_000_000., target_speed);
 
         let sample = match state {
             PlatterState::Playing => {
@@ -138,23 +201,33 @@ impl PlatterDriver {
         sample
     }
 
-    fn adjust_playhead(&mut self, adjust: PlayheadUpdate) {
-        let cur_playhead = self.platter.get_playhead().record_pos;
-        let now = self.platter.now();
-        let new_pos = INanos(match adjust {
-            PlayheadUpdate::ToZero => 0,
-            PlayheadUpdate::FastForward => cur_playhead.0 + FF_TIME.0 as i64,
-            PlayheadUpdate::Rewind => cur_playhead.0 - FF_TIME.0 as i64,
-        });
-        self.platter.update_playhead(new_pos, now);
+    fn handle_event(&mut self, event: PlatterEvent) {
+        let now = Instant::now();
+
+        match event {
+            PlatterEvent::MovePlayhead(jump) => {
+                let cur_playhead = self.platter.get_playhead().record_pos;
+                let new_pos = INanos(match jump {
+                    Jump::ToZero => 0,
+                    Jump::Forward => cur_playhead.0 + FF_TIME.0 as i64,
+                    Jump::Backward => cur_playhead.0 - FF_TIME.0 as i64,
+                });
+                self.platter
+                    .update_playhead(new_pos, self.platter.timestamp(now));
+            }
+            PlatterEvent::Nudge(direction) => match direction {
+                Direction::Forward => self.nudges.forward.push_back(now),
+                Direction::Backward => self.nudges.backward.push_back(now),
+            },
+        }
     }
 
     /// Updates virtual platter according to current state
     pub fn update_platter(&mut self) {
         // to not get stuck handling updates
         for _ in 0..1000 {
-            if let Ok(upd) = self.playhead_events.try_recv() {
-                self.adjust_playhead(upd);
+            if let Ok(upd) = self.events.try_recv() {
+                self.handle_event(upd);
             }
         }
         let pos = self.calculate_position();

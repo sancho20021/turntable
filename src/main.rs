@@ -1,12 +1,12 @@
 mod deck_event;
 mod decoder;
+mod filters;
 mod record;
 mod scratchv2;
 mod sdl_deck_event;
 mod stereo_frame;
-mod utils;
 mod telemetry;
-mod filters;
+mod utils;
 
 use clap::{Parser, Subcommand};
 use log::info;
@@ -33,6 +33,10 @@ enum Commands {
         /// Motor inertia parameter in seconds
         #[arg(short('i'), long, default_value_t = 0.5)]
         motor_inertia: f64,
+
+        /// Nudge / Pitch bend responsiveness
+        #[arg(short('n'), long, default_value_t = 1., allow_negative_numbers = true)]
+        nudge: f32,
     },
 }
 
@@ -49,15 +53,13 @@ fn main() {
             buffer,
             sensitivity,
             motor_inertia,
+            nudge,
         } => {
             let sample_rate = 44100;
-            println!(
-                "Starting V2 App (buffer: {}, touchpad sensitivity: {sensitivity:.2}, motor inertia: {motor_inertia:.2}).",
-                buffer
-            );
+            println!("Starting Turntable: {:?}", args.command);
             println!("Drag and drop a music file to start");
 
-            scratchv2::app::start(motor_inertia, sensitivity, buffer, sample_rate);
+            scratchv2::app::start(motor_inertia, sensitivity, buffer, sample_rate, nudge);
         }
     }
 }

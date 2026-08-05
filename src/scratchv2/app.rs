@@ -33,6 +33,7 @@ pub fn start(
     // buffer in frames
     buffer_size: u32,
     sample_rate: u32,
+    nudge_responsiveness: f32,
 ) {
     let sdl = sdl2::init().unwrap();
     let video = sdl.video().unwrap();
@@ -59,6 +60,7 @@ pub fn start(
         1.,
         touchpad_sensitivity,
         motor_inertia_secs,
+        nudge_responsiveness,
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let send_external_events = deck_worker.get_event_sender();

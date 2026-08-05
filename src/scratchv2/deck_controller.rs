@@ -19,7 +19,7 @@ use crate::{
     record::{INanos, UNanos},
     record_mouse,
     scratchv2::{
-        platter_driver::{PlatterDriver, PlayheadUpdate},
+        platter_driver::{Jump, PlatterDriver, PlatterEvent},
         virtual_platter::{ReadablePlatter, WritablePlatter},
     },
     telemetry::TelemetryTrace,
@@ -72,7 +72,7 @@ impl DeckState {
 pub struct DeckController {
     state: Arc<DeckState>,
     change_record: Sender<String>,
-    adjust_playhead: Sender<PlayheadUpdate>,
+    platter_events: Sender<PlatterEvent>,
     platter: ReadablePlatter,
     /// mouse speed smoothing
     mouse_speed: FirstOrderLPF,
@@ -94,7 +94,7 @@ pub enum ExternalEvent {
 
 /// holds deck background thread that handles external events
 pub struct DeckWorker {
-    adjust_playhead: Sender<PlayheadUpdate>,
+    adjust_playhead: Sender<PlatterEvent>,
     // Receives events from outside senders
     event_receiver: Receiver<ExternalEvent>,
     // so the controller can clone and hand out senders
@@ -111,6 +111,7 @@ impl DeckController {
         initial_pitch: f64,
         sensitivity: f64,
         inertia_tau_secs: f64,
+        nudge_responsiveness: f32,
     ) -> (Self, PlatterDriver, DeckWorker) {
         let initial_state = Arc::new(DeckState {
             pitch: AtomicF64::new(initial_pitch),
@@ -125,14 +126,15 @@ impl DeckController {
             inertia_tau_secs,
             writable_platter,
             pl_rcv,
+            nudge_responsiveness,
         );
         let (event_snd, event_rcv) = bounded(100);
         (
             Self {
-                state: initial_state,
+                state: Arc::clone(&initial_state),
                 platter: readable_platter,
                 change_record: record_changer,
-                adjust_playhead: pl_snd.clone(),
+                platter_events: pl_snd.clone(),
                 tracer: TelemetryTrace::new(),
                 mouse_speed: FirstOrderLPF::new(0.01),
             },
@@ -244,17 +246,22 @@ impl DeckController {
                 log_try_send(&self.change_record, track, "change record")
             }
             deck_event::Event::PlayheadReset => log_try_send(
-                &self.adjust_playhead,
-                PlayheadUpdate::ToZero,
+                &self.platter_events,
+                PlatterEvent::MovePlayhead(Jump::ToZero),
                 "reset playhead",
             ),
             deck_event::Event::PlayheadFF => log_try_send(
-                &self.adjust_playhead,
-                PlayheadUpdate::FastForward,
+                &self.platter_events,
+                PlatterEvent::MovePlayhead(Jump::Forward),
                 "fast forward",
             ),
-            deck_event::Event::PlayheadRewind => {
-                log_try_send(&self.adjust_playhead, PlayheadUpdate::Rewind, "rewind")
+            deck_event::Event::PlayheadRewind => log_try_send(
+                &self.platter_events,
+                PlatterEvent::MovePlayhead(Jump::Backward),
+                "rewind",
+            ),
+            deck_event::Event::Nudge(x) => {
+                log_try_send(&self.platter_events, PlatterEvent::Nudge(x), "nudge");
             }
         };
         Ok(())
@@ -269,7 +276,7 @@ impl DeckWorker {
     /// Starts a background thread that connects external components (like the **`RecordChanger`**) to this controller.
     ///
     /// **Must be called at startup**
-    pub fn listen_to_external_events(self, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
+    pub fn listen_to_external_events(mut self, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
         std::thread::spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
                 let event = match self.event_receiver.recv_timeout(Duration::from_millis(100)) {
@@ -284,13 +291,13 @@ impl DeckWorker {
         })
     }
 
-    fn process_external_event(&self, event: ExternalEvent) {
+    fn process_external_event(&mut self, event: ExternalEvent) {
         match event {
             ExternalEvent::RecordChanged => {
                 println!("Track loaded");
                 log_try_send(
                     &self.adjust_playhead,
-                    PlayheadUpdate::ToZero,
+                    PlatterEvent::MovePlayhead(Jump::ToZero),
                     "reset playhead",
                 )
             }

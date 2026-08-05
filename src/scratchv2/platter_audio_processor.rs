@@ -124,7 +124,6 @@ impl PlatterAudioProcessor {
 
         // to detect reset, rewind, fast-forward, etc
         const JUMP_THRESHOLD: INanos = INanos(500_000_000);
-        // todo: observation not always change inbetween callbacks, results in many jumps
         let observed_played_nanos =
             INanos(self.second_measurement.record_pos.0 - self.first_measurement.record_pos.0);
 
