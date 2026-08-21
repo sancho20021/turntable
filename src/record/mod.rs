@@ -1,4 +1,4 @@
-use crate::{record::interpolation::Interpolator, stereo_frame::StereoFrame};
+use crate::{decoder::SAMPLE_RATE, record::interpolation::Interpolator, stereo_frame::StereoFrame};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub struct UNanos(pub u64);
@@ -27,21 +27,19 @@ impl INanos {
 pub struct Record {
     interpolator: Interpolator,
     samples: Vec<StereoFrame>,
-    sample_rate: usize,
 }
 
 impl Record {
-    pub fn new(samples: Vec<StereoFrame>, interpolator: Interpolator, sample_rate: usize) -> Self {
+    pub fn new(samples: Vec<StereoFrame>, interpolator: Interpolator) -> Self {
         Self {
             samples,
             interpolator,
-            sample_rate,
         }
     }
 
     /// Converts position in nanoseconds to sample number
     pub fn nanosecs_to_sample(&self, nanos: INanos) -> f64 {
-        self.sample_rate as f64 * (nanos.0 as f64 / 1_000_000_000.)
+        SAMPLE_RATE as f64 * (nanos.0 as f64 / 1_000_000_000.)
     }
     pub fn get_sample(&self, position: INanos) -> StereoFrame {
         let position = self.nanosecs_to_sample(position);

@@ -80,10 +80,10 @@ impl RecordChanger {
                 },
             };
             println!("Loading: {}", track);
-            let rec = load_file(44100, track.as_ref());
+            let rec = load_file(track.as_ref());
 
             let rec = match rec {
-                Ok(rec) => Record::new(rec, Interpolator::linear(), 44100),
+                Ok(rec) => Record::new(rec, Interpolator::linear()),
                 Err(e) => {
                     log::error!("failed to load track: {e}");
                     continue;

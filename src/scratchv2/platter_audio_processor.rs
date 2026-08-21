@@ -3,9 +3,11 @@ use std::time::{Duration, Instant};
 use rtrb::{Consumer, Producer};
 
 use crate::{
+    decoder::SAMPLE_RATE,
     filters::FirstOrderLPF,
     record::{INanos, Record, UNanos, interpolation::Linear},
     scratchv2::virtual_platter::{PlatterSample, ReadablePlatter},
+    stereo_frame::StereoFrame,
 };
 
 /// time that (approximately) takes to remove the lag between virtual platter and audio playback.
@@ -18,7 +20,6 @@ static PLAYHEAD_LPF_TAU: f64 = 0.025;
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor {
     platter: ReadablePlatter,
-    sample_rate: usize,
     /// record sent to play instead of current record
     next_record: Consumer<Record>,
     cur_record: Option<Record>,
@@ -43,17 +44,17 @@ fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
 }
 
 impl PlatterAudioProcessor {
-    fn block_duration(sample_rate: usize, buffer_size: usize) -> Duration {
-        Duration::from_secs_f64((buffer_size as f64 / 2.) / (sample_rate as f64))
+    fn block_duration(buffer_frames_n: usize) -> Duration {
+        Duration::from_secs_f64((buffer_frames_n as f64) / (SAMPLE_RATE as f64))
     }
 
     /// Calculates optimal update frequency for virtual platter
-    pub fn platter_update_freq(sample_rate: usize, samples_n: usize) -> usize {
-        (1. / Self::block_duration(sample_rate, samples_n * 2).as_secs_f64() * 3.) as usize
+    pub fn platter_update_freq(buffer_frames_n: usize) -> usize {
+        (1. / Self::block_duration(buffer_frames_n).as_secs_f64() * 3.) as usize
     }
 
-    fn block_dur(&self, buffer_size: usize) -> Duration {
-        Self::block_duration(self.sample_rate, buffer_size)
+    fn block_dur(&self, buffer_frames_n: usize) -> Duration {
+        Self::block_duration(buffer_frames_n)
     }
 
     fn set_record(&mut self, record: Record) {
@@ -72,7 +73,6 @@ impl PlatterAudioProcessor {
     }
 
     pub fn new(
-        sample_rate: usize,
         platter: ReadablePlatter,
         next_record: Consumer<Record>,
         used_records: Producer<Record>,
@@ -84,7 +84,6 @@ impl PlatterAudioProcessor {
         };
         let processor = PlatterAudioProcessor {
             platter,
-            sample_rate,
             cur_record: None,
             last_played: first_measurement,
             second_measurement,
@@ -106,21 +105,20 @@ impl PlatterAudioProcessor {
     }
     /// Converts sample number to nanosecs
     pub fn sample_to_nanos(&self, sample: f64) -> f64 {
-        sample / self.sample_rate as f64 * 1_000_000_000.
+        sample / SAMPLE_RATE as f64 * 1_000_000_000.
     }
 
     /// Warning: this function must be very fast, no allocation
-    pub fn write_frames(&mut self, data: &mut [f32]) {
+    pub fn write_frames(&mut self, frames: &mut [StereoFrame]) {
         let start = Instant::now();
+        let samples_n = frames.len() as i64;
         if let Ok(record) = self.next_record.pop() {
             self.set_record(record);
         }
 
-        let samples_n = data.len() as i64 / 2;
-
         self.update_measurements(self.platter.get_playhead());
 
-        let block_duration = self.block_dur(data.len());
+        let block_duration = self.block_dur(frames.len());
 
         // to detect reset, rewind, fast-forward, etc
         const JUMP_THRESHOLD: INanos = INanos(500_000_000);
@@ -241,14 +239,12 @@ impl PlatterAudioProcessor {
         self.last_played = target_playhead;
 
         if let Some(rec) = &self.cur_record {
-            for frame in data.chunks_mut(2) {
-                let sample = rec.get_sample(playhead);
-                frame[0] = sample.l;
-                frame[1] = sample.r;
+            for frame in frames {
+                *frame = rec.get_sample(playhead);
                 playhead.0 += step.0;
             }
         } else {
-            data.fill(0.);
+            frames.fill(StereoFrame::default());
         }
 
         let elapsed = start.elapsed();

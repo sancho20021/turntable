@@ -15,11 +15,13 @@ use rtrb::{Consumer, Producer};
 use sdl2::event::Event;
 
 use crate::{
+    decoder::SAMPLE_RATE,
     record::Record,
     scratchv2::{
         deck_controller::DeckController,
         platter_audio_processor::PlatterAudioProcessor,
         record_changer::RecordChanger,
+        samples_poller::SamplesPoller,
         virtual_platter::{ReadablePlatter, new_platter},
     },
     sdl_deck_event::to_deck_event,
@@ -31,8 +33,7 @@ pub fn start(
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
     // buffer in frames
-    buffer_size: u32,
-    sample_rate: u32,
+    buffer_frames_n: u32,
     nudge_responsiveness: f32,
 ) {
     let sdl = sdl2::init().unwrap();
@@ -67,7 +68,7 @@ pub fn start(
     let controller_listener = deck_worker.listen_to_external_events(Arc::clone(&shutdown));
 
     let platter_update_freq_hz =
-        PlatterAudioProcessor::platter_update_freq(sample_rate as usize, buffer_size as usize);
+        PlatterAudioProcessor::platter_update_freq(buffer_frames_n as usize);
     log::info!("calculated platter update frequency is {platter_update_freq_hz}hz");
 
     let driver = platter_driver.start(platter_update_freq_hz, Arc::clone(&shutdown));
@@ -82,8 +83,7 @@ pub fn start(
     .start();
 
     let stream = start_deck(
-        buffer_size,
-        sample_rate,
+        buffer_frames_n,
         used_records_prod,
         new_record_cons,
         read_platter,
@@ -126,8 +126,8 @@ pub fn start(
 
 /// Start audio thread
 fn start_deck(
-    buffer_size: u32,
-    sample_rate: u32,
+    // buffer size in frames
+    buffer_frames_n: u32,
     used_records: Producer<Record>,
     new_record: Consumer<Record>,
     platter: ReadablePlatter,
@@ -138,19 +138,19 @@ fn start_deck(
 
     let config = StreamConfig {
         channels: 2,
-        sample_rate,
-        buffer_size: BufferSize::Fixed(buffer_size),
+        sample_rate: SAMPLE_RATE,
+        buffer_size: BufferSize::Fixed(buffer_frames_n),
     };
 
     println!("Stream config: {:?}", config);
 
-    let mut processor =
-        PlatterAudioProcessor::new(sample_rate as usize, platter, new_record, used_records);
+    let processor = PlatterAudioProcessor::new(platter, new_record, used_records);
+    let mut samples_poller = SamplesPoller::new(buffer_frames_n as usize, [processor]);
 
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _| {
-            processor.write_frames(data);
+            samples_poller.write_frames(data);
         },
         move |err| {
             eprintln!("audio error: {err}");

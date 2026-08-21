@@ -5,8 +5,10 @@ use std::{num::NonZeroU32, path::Path};
 
 use crate::stereo_frame::StereoFrame;
 
+pub const SAMPLE_RATE: u32 = 44100;
+
 /// Loads and decodes the whole music file into RAM
-pub fn load_file(sample_rate: u32, path: &Path) -> Result<Vec<StereoFrame>> {
+pub fn load_file(path: &Path) -> Result<Vec<StereoFrame>> {
     // Probe the audio file.
     let probed = symphonium::probe_from_file(
         path,
@@ -16,7 +18,7 @@ pub fn load_file(sample_rate: u32, path: &Path) -> Result<Vec<StereoFrame>> {
     let audio_data_f32 = symphonium::decode_f32(
         probed,
         &DecodeConfig::default(),
-        Some(NonZeroU32::new(sample_rate).ok_or(anyhow!("sample rate must be non-zero"))?),
+        Some(NonZeroU32::new(SAMPLE_RATE).ok_or(anyhow!("sample rate must be non-zero"))?),
         None,
         None,
     )?;

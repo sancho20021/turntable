@@ -55,11 +55,10 @@ fn main() {
             motor_inertia,
             nudge,
         } => {
-            let sample_rate = 44100;
             println!("Starting Turntable: {:?}", args.command);
             println!("Drag and drop a music file to start");
 
-            scratchv2::app::start(motor_inertia, sensitivity, buffer, sample_rate, nudge);
+            scratchv2::app::start(motor_inertia, sensitivity, buffer, nudge);
         }
     }
 }
