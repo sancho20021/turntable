@@ -154,8 +154,9 @@ impl PlatterDriver {
             } => {
                 let cur_mouse: f64 = {
                     // we go 2ms in past to extrapolate less
-                    let dt_secs: f64 =
-                        (now.0 - 2_000_000 - latest_mouse_t.0) as f64 / 1_000_000_000.;
+                    let dt_secs: f64 = ((now.0 - latest_mouse_t.0).max(2_000_000) - 2_000_000)
+                        as f64
+                        / 1_000_000_000.;
 
                     // 1. Calculate where the mouse *would* be if it kept moving
                     let extrapolated_mouse = {

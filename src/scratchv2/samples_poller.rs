@@ -22,6 +22,7 @@ impl SamplesPoller<1> {
     pub fn write_frames(&mut self, data: &mut [f32]) {
         let total_samples = data.len() / 2;
         if total_samples > self.buffers[0].len() {
+            // todo: do not panic here, go to default silent mode and send signal to controller to stop everything
             panic!(
                 "actual buffer length in samples ({}) is bigger than configured ({})",
                 total_samples,

@@ -5,7 +5,8 @@ use std::{num::NonZeroU32, path::Path};
 
 use crate::stereo_frame::StereoFrame;
 
-pub const SAMPLE_RATE: u32 = 44100;
+// because pipewire runs on 48000
+pub const SAMPLE_RATE: u32 = 48000;
 
 /// Loads and decodes the whole music file into RAM
 pub fn load_file(path: &Path) -> Result<Vec<StereoFrame>> {
