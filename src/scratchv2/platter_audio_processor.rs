@@ -17,14 +17,20 @@ static SYNC_TIME: Duration = Duration::from_millis(2000);
 
 static PLAYHEAD_LPF_TAU: f64 = 0.025;
 
+/// Communication channels for audio processor
+pub struct AudioProcessorHandles {
+    /// record sent to play instead of current record
+    pub next_record: Consumer<Record>,
+    /// sink for used records to avoid dropping in audio thread
+    pub used_records: Producer<Record>,
+    /// source of platter position
+    pub platter: ReadablePlatter,
+}
+
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor {
-    platter: ReadablePlatter,
-    /// record sent to play instead of current record
-    next_record: Consumer<Record>,
+    handles: AudioProcessorHandles,
     cur_record: Option<Record>,
-    /// sink for used records to avoid dropping in audio thread
-    used_records: Producer<Record>,
     /// timestamp and nanosecond of last sample played
     last_played: PlatterSample,
     //// Second newest measurement of virtual playhead
@@ -60,7 +66,7 @@ impl PlatterAudioProcessor {
     fn set_record(&mut self, record: Record) {
         if let Some(old_record) = self.cur_record.replace(record) {
             // in case of failure, we will drop it in audio thread which may lead to buffer overrun / underrun
-            match self.used_records.push(old_record) {
+            match self.handles.used_records.push(old_record) {
                 Ok(()) => {}
                 Err(rtrb::PushError::Full(old_rec)) => {
                     log::warn!(
@@ -72,26 +78,20 @@ impl PlatterAudioProcessor {
         }
     }
 
-    pub fn new(
-        platter: ReadablePlatter,
-        next_record: Consumer<Record>,
-        used_records: Producer<Record>,
-    ) -> Self {
-        let first_measurement = platter.get_playhead();
+    pub fn new(handles: AudioProcessorHandles) -> Self {
+        let first_measurement = handles.platter.get_playhead();
         let second_measurement = PlatterSample {
             timestamp_nanos: UNanos(first_measurement.timestamp_nanos.0 + 1),
             record_pos: first_measurement.record_pos,
         };
         let processor = PlatterAudioProcessor {
-            platter,
+            handles,
             cur_record: None,
             last_played: first_measurement,
             second_measurement,
             first_measurement,
             filtered_target_playhead: FirstOrderLPF::new(PLAYHEAD_LPF_TAU),
             filtered_lag: INanos(0),
-            next_record,
-            used_records,
             last_speed: 0., // one of sources of slow startup
         };
         processor
@@ -112,11 +112,11 @@ impl PlatterAudioProcessor {
     pub fn write_frames(&mut self, frames: &mut [StereoFrame]) {
         let start = Instant::now();
         let samples_n = frames.len() as i64;
-        if let Ok(record) = self.next_record.pop() {
+        if let Ok(record) = self.handles.next_record.pop() {
             self.set_record(record);
         }
 
-        self.update_measurements(self.platter.get_playhead());
+        self.update_measurements(self.handles.platter.get_playhead());
 
         let block_duration = self.block_dur(frames.len());
 

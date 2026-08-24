@@ -8,7 +8,6 @@ use std::{
 };
 
 use crossbeam::channel::{Receiver, Sender};
-use rtrb::{Consumer, Producer, PushError};
 
 use crate::{
     decoder::load_file,
@@ -17,62 +16,43 @@ use crate::{
     utils::log_try_send,
 };
 
-// #[derive(Debug)]
-pub struct RecordChanger {
-    /// records to load and play next
-    requested: Receiver<String>,
-    /// channel to change playing record
-    playing: Producer<Record>,
-    /// used records that need to be dropped.
-    /// (to make audio thread free of expensive dropping)
-    used: Consumer<Record>,
-    shutdown: Arc<AtomicBool>,
-    /// to be able to stop record
-    controller: Sender<ExternalEvent>,
+pub enum RecordChangerCommand {
+    /// Load a track off disk
+    Load(String),
+    /// Hand an old record back to be deallocated off the audio thread
+    Dispose(Record),
 }
 
-impl RecordChanger {
-    pub fn new(
-        requested: Receiver<String>,
-        playing: Producer<Record>,
-        used: Consumer<Record>,
-        shutdown: Arc<AtomicBool>,
-        controller: Sender<ExternalEvent>,
-    ) -> Self {
-        Self {
-            requested,
-            playing,
-            used,
-            shutdown,
-            controller,
-        }
-    }
+struct RecordDisposer {
+    records: Receiver<Record>,
+    shutdown: Arc<AtomicBool>,
+}
 
-    fn drop_records(mut used: Consumer<Record>, shutdown: Arc<AtomicBool>) {
-        while !shutdown.load(Ordering::Relaxed) {
-            match used.pop() {
-                Ok(_record) => {
-                    log::debug!("Record safely deallocated");
-                    // Immediately check again without sleeping in case multiple records backed up
-                    continue;
-                }
-                Err(rtrb::PopError::Empty) => {
-                    // Sleep for 50ms to yield execution time back to the OS scheduler.
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
-        log::debug!("Record dropper terminated");
-    }
+struct RecordLoader {
+    records: Receiver<String>,
+    controller: Sender<ExternalEvent>,
+    shutdown: Arc<AtomicBool>,
+}
 
-    fn load_and_start_records(
-        requested: Receiver<String>,
-        mut playing: Producer<Record>,
-        controller: Sender<ExternalEvent>,
-        shutdown: Arc<AtomicBool>,
-    ) {
-        while !shutdown.load(Ordering::Relaxed) {
-            let track = match requested.recv_timeout(Duration::from_millis(100)) {
+impl RecordDisposer {
+    fn run(self) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            let record = match self.records.recv_timeout(Duration::from_millis(100)) {
+                Ok(r) => r,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            };
+            drop(record);
+            log::debug!("Record safely deallocated");
+        }
+        log::debug!("Record disposer terminated");
+    }
+}
+
+impl RecordLoader {
+    fn run(self) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            let track = match self.records.recv_timeout(Duration::from_millis(100)) {
                 Ok(rec) => rec,
                 Err(e) => match e {
                     crossbeam::channel::RecvTimeoutError::Timeout => continue,
@@ -82,42 +62,74 @@ impl RecordChanger {
             println!("Loading: {}", track);
             let rec = load_file(track.as_ref());
 
-            let rec = match rec {
-                Ok(rec) => Record::new(rec, Interpolator::linear()),
-                Err(e) => {
-                    log::error!("failed to load track: {e}");
-                    continue;
-                }
-            };
-
-            log_try_send(&controller, ExternalEvent::RecordChanged, "reset playhead");
-            match playing.push(rec) {
-                Ok(()) => {}
-                Err(PushError::Full(_)) => {
-                    log::error!(
-                        "failed to change the record as previous record change is still being done by the audio thread. Try again"
+            match rec {
+                Ok(rec) => {
+                    let rec = Record::new(rec, Interpolator::linear());
+                    log_try_send(
+                        &self.controller,
+                        ExternalEvent::ChangeRecord(rec),
+                        "change record",
                     );
+                }
+                Err(e) => {
+                    log::error!("failed to load track {track}: {e}");
+                    continue;
                 }
             }
         }
 
         log::debug!("Record loader terminated");
     }
+}
 
-    pub fn start(self) -> JoinHandle<()> {
-        let shutdown_copy = Arc::clone(&self.shutdown);
-        let drop_join = std::thread::spawn(move || Self::drop_records(self.used, shutdown_copy));
-        let load_join = std::thread::spawn(move || {
-            Self::load_and_start_records(
-                self.requested,
-                self.playing,
-                self.controller,
-                self.shutdown,
-            )
-        });
-        std::thread::spawn(move || {
-            let _ = drop_join.join().expect("record dropper panicked");
-            let _ = load_join.join().expect("record loader panicked");
-        })
-    }
+pub fn start(
+    commands: Receiver<RecordChangerCommand>,
+    controller: Sender<ExternalEvent>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let (loader_tx, loader_rx) = crossbeam::channel::bounded::<String>(4);
+    let (disposer_tx, disposer_rx) = crossbeam::channel::bounded::<Record>(4);
+
+    let loader = RecordLoader {
+        records: loader_rx,
+        controller,
+        shutdown: Arc::clone(&shutdown),
+    };
+
+    let disposer = RecordDisposer {
+        records: disposer_rx,
+        shutdown: Arc::clone(&shutdown),
+    };
+
+    let load_join = std::thread::spawn(move || loader.run());
+    let drop_join = std::thread::spawn(move || disposer.run());
+
+    let router_shutdown = Arc::clone(&shutdown);
+
+    let router_join = std::thread::spawn(move || {
+        while !router_shutdown.load(Ordering::Relaxed) {
+            let cmd = match commands.recv_timeout(Duration::from_millis(100)) {
+                Ok(c) => c,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            };
+
+            match cmd {
+                RecordChangerCommand::Load(path) => {
+                    let _ = loader_tx.send(path);
+                }
+                RecordChangerCommand::Dispose(record) => {
+                    let _ = disposer_tx.send(record);
+                }
+            }
+        }
+    });
+
+    // Spawn supervisor thread to join all three workers cleanly
+    std::thread::spawn(move || {
+        router_join.join().expect("record changer panicked");
+        load_join.join().expect("record loader panicked");
+        drop_join.join().expect("record disposer panicked");
+        log::debug!("RecordChanger terminated cleanly");
+    })
 }
