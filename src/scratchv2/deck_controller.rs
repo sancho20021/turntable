@@ -20,9 +20,10 @@ use crate::{
     record::{INanos, Record, UNanos},
     record_mouse,
     scratchv2::{
+        platter_audio_processor::AudioProcessorHandles,
         platter_driver::{Jump, PlatterDriver, PlatterEvent},
         record_changer::RecordChangerCommand,
-        virtual_platter::{ReadablePlatter, WritablePlatter},
+        virtual_platter::{ReadablePlatter, new_platter},
     },
     telemetry::TelemetryTrace,
     utils::log_try_send,
@@ -71,7 +72,7 @@ impl DeckState {
 
 /// Deck controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
-pub struct DeckController {
+pub struct DeckController<const DECK_ID: usize> {
     state: Arc<DeckState>,
     deck_worker: Sender<ExternalEvent>,
     platter_events: Sender<PlatterEvent>,
@@ -98,7 +99,8 @@ pub enum ExternalEvent {
 }
 
 /// holds deck background thread that handles external events
-pub struct DeckWorker {
+pub struct DeckWorker<const DECK_ID: usize> {
+    shutdown: Arc<AtomicBool>,
     adjust_playhead: Sender<PlatterEvent>,
     // Receives events from outside senders
     event_receiver: Receiver<ExternalEvent>,
@@ -113,68 +115,77 @@ pub struct DeckWorker {
     change_record: Producer<Record>,
 }
 
+pub type DeckId = usize;
+
 static BASE_SENSITIVITY_FACTOR: f64 = 1_500_000.0;
 
-impl DeckController {
-    pub fn new(
-        readable_platter: ReadablePlatter,
-        writable_platter: WritablePlatter,
-        initial_pitch: f64,
-        sensitivity: f64,
-        inertia_tau_secs: f64,
-        nudge_responsiveness: f32,
-        record_changer: Sender<RecordChangerCommand>,
-    ) -> (
-        Self,
-        PlatterDriver,
-        DeckWorker,
-        Producer<Record>,
-        Consumer<Record>,
-    ) {
-        let initial_state = Arc::new(DeckState {
-            pitch: AtomicF64::new(initial_pitch),
-            playing: AtomicBool::new(true),
-            platter: AtomicCell::new(PlatterState::Playing),
-        });
-        let (pl_snd, pl_rcv) = bounded(1000);
+pub fn new_deck<const DECK_ID: usize>(
+    initial_pitch: f64,
+    sensitivity: f64,
+    inertia_tau_secs: f64,
+    nudge_responsiveness: f32,
+    record_changer: Sender<RecordChangerCommand>,
+    shutdown: Arc<AtomicBool>,
+    buffer_frames_n: usize,
+) -> (
+    DeckController<DECK_ID>,
+    PlatterDriver,
+    DeckWorker<DECK_ID>,
+    AudioProcessorHandles,
+) {
+    let initial_state = Arc::new(DeckState {
+        pitch: AtomicF64::new(initial_pitch),
+        playing: AtomicBool::new(true),
+        platter: AtomicCell::new(PlatterState::Playing),
+    });
+    let (pl_snd, pl_rcv) = bounded(1000);
+    let (writable_platter, readable_platter) = new_platter();
 
-        let driver = PlatterDriver::new(
-            Arc::clone(&initial_state),
-            sensitivity * BASE_SENSITIVITY_FACTOR,
-            inertia_tau_secs,
-            writable_platter,
-            pl_rcv,
-            nudge_responsiveness,
-        );
-        let (event_snd, event_rcv) = bounded(100);
+    let driver = PlatterDriver::new(
+        Arc::clone(&initial_state),
+        sensitivity * BASE_SENSITIVITY_FACTOR,
+        inertia_tau_secs,
+        writable_platter,
+        pl_rcv,
+        nudge_responsiveness,
+        Arc::clone(&shutdown),
+        buffer_frames_n,
+    );
+    let (event_snd, event_rcv) = bounded(100);
 
-        let (used_records_prod, used_records_cons) = rtrb::RingBuffer::new(3);
-        let (new_record_prod, new_record_cons) = rtrb::RingBuffer::new(1);
-        let deck_worker = DeckWorker {
-            adjust_playhead: pl_snd.clone(),
-            event_receiver: event_rcv,
-            event_sender: event_snd,
-            record_changer,
-            dispose_record: used_records_cons,
-            change_record: new_record_prod,
-        };
+    let (used_records_prod, used_records_cons) = rtrb::RingBuffer::new(3);
+    let (new_record_prod, new_record_cons) = rtrb::RingBuffer::new(1);
+    let deck_worker = DeckWorker {
+        adjust_playhead: pl_snd.clone(),
+        event_receiver: event_rcv,
+        event_sender: event_snd,
+        record_changer,
+        dispose_record: used_records_cons,
+        change_record: new_record_prod,
+        shutdown,
+    };
+    let audio_handles = AudioProcessorHandles {
+        next_record: new_record_cons,
+        used_records: used_records_prod,
+        platter: readable_platter.clone(),
+    };
 
-        (
-            Self {
-                state: Arc::clone(&initial_state),
-                platter: readable_platter,
-                deck_worker: deck_worker.get_event_sender(),
-                platter_events: pl_snd,
-                tracer: TelemetryTrace::new(),
-                mouse_speed: FirstOrderLPF::new(0.01),
-            },
-            driver,
-            deck_worker,
-            used_records_prod,
-            new_record_cons,
-        )
-    }
+    (
+        DeckController {
+            state: Arc::clone(&initial_state),
+            platter: readable_platter,
+            deck_worker: deck_worker.get_event_sender(),
+            platter_events: pl_snd,
+            tracer: TelemetryTrace::new(),
+            mouse_speed: FirstOrderLPF::new(0.01),
+        },
+        driver,
+        deck_worker,
+        audio_handles,
+    )
+}
 
+impl<const DECK_ID: usize> DeckController<DECK_ID> {
     fn handle_mouse_motion(&mut self, x: i32, current: PlatterState, when: Instant) {
         if let PlatterState::Scratching {
             latest_mouse_x,
@@ -296,9 +307,13 @@ impl DeckController {
         };
         Ok(())
     }
+
+    pub fn get_platter(&self) -> ReadablePlatter {
+        self.platter.clone()
+    }
 }
 
-impl DeckWorker {
+impl<const DECK_ID: usize> DeckWorker<DECK_ID> {
     pub fn get_event_sender(&self) -> Sender<ExternalEvent> {
         self.event_sender.clone()
     }
@@ -306,9 +321,9 @@ impl DeckWorker {
     /// Starts a background thread that connects external components (like the **`RecordChanger`**) to this controller.
     ///
     /// **Must be called at startup**
-    pub fn listen_to_external_events(mut self, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
+    pub fn listen_to_external_events(mut self) -> JoinHandle<()> {
         std::thread::spawn(move || {
-            while !shutdown.load(Ordering::Relaxed) {
+            while !self.shutdown.load(Ordering::Relaxed) {
                 // 1. Drain used records returned from the audio thread
                 while let Ok(used_record) = self.dispose_record.pop() {
                     log_try_send(
@@ -334,7 +349,7 @@ impl DeckWorker {
         match event {
             ExternalEvent::ChangeRecord(record) => match self.change_record.push(record) {
                 Ok(()) => {
-                    println!("Record loaded");
+                    println!("Record loaded to deck {DECK_ID}");
                     log_try_send(
                         &self.adjust_playhead,
                         PlatterEvent::MovePlayhead(Jump::ToZero),
@@ -353,7 +368,10 @@ impl DeckWorker {
             ExternalEvent::LoadRecord(record) => {
                 log_try_send(
                     &self.record_changer,
-                    RecordChangerCommand::Load(record),
+                    RecordChangerCommand::Load {
+                        deck_id: DECK_ID,
+                        path: record,
+                    },
                     "request load track",
                 );
             }

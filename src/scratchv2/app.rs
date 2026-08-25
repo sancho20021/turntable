@@ -18,11 +18,10 @@ use sdl2::event::Event;
 use crate::{
     decoder::SAMPLE_RATE,
     scratchv2::{
-        deck_controller::DeckController,
+        deck_controller::{self},
         platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
         record_changer,
         samples_poller::SamplesPoller,
-        virtual_platter::new_platter,
     },
     sdl_deck_event::to_deck_event,
     telemetry,
@@ -48,37 +47,27 @@ pub fn start(
     let mut pump = sdl.event_pump().unwrap();
 
     let (requested_record_snd, requested_rec_rcv) = bounded(3); // small capacity to prevent backlog when spamming new tracks
-    let (write_platter, read_platter) = new_platter();
-    let (mut controller, platter_driver, deck_worker, dispose_rec, change_rec) =
-        DeckController::new(
-            read_platter.clone(),
-            write_platter,
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (mut controller, platter_driver, deck_worker, audio_processor_handles) =
+        deck_controller::new_deck::<0>(
             1.,
             touchpad_sensitivity,
             motor_inertia_secs,
             nudge_responsiveness,
             requested_record_snd,
+            Arc::clone(&shutdown),
+            buffer_frames_n as usize,
         );
-    let shutdown = Arc::new(AtomicBool::new(false));
     let send_external_events = deck_worker.get_event_sender();
+    let controller_listener = deck_worker.listen_to_external_events();
+
+    let stream = start_deck(buffer_frames_n, audio_processor_handles).unwrap();
     let record_changer = record_changer::start(
         requested_rec_rcv,
-        send_external_events.clone(),
+        [send_external_events.clone()],
         Arc::clone(&shutdown),
     );
-    let controller_listener = deck_worker.listen_to_external_events(Arc::clone(&shutdown));
-
-    let platter_update_freq_hz =
-        PlatterAudioProcessor::platter_update_freq(buffer_frames_n as usize);
-    log::info!("calculated platter update frequency is {platter_update_freq_hz}hz");
-    let driver = platter_driver.start(platter_update_freq_hz, Arc::clone(&shutdown));
-
-    let audio_processor_handles = AudioProcessorHandles {
-        next_record: change_rec,
-        used_records: dispose_rec,
-        platter: read_platter,
-    };
-    let stream = start_deck(buffer_frames_n, audio_processor_handles).unwrap();
+    let driver = platter_driver.start();
 
     for event in pump.wait_iter() {
         if let Event::Quit { .. } = event {

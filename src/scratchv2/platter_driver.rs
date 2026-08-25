@@ -16,6 +16,7 @@ use crate::{
     scratchv2::{
         deck_controller::{DeckState, PlatterState},
         physical_speed::Speed,
+        platter_audio_processor::PlatterAudioProcessor,
         virtual_platter::{PlatterSample, WritablePlatter},
     },
     telemetry::TelemetryTrace,
@@ -95,6 +96,8 @@ pub struct PlatterDriver {
     nudges: NudgeQueue,
     /// for recording metrics
     pub tracer: TelemetryTrace,
+    shutdown: Arc<AtomicBool>,
+    frequency_hz: usize,
 }
 
 impl PlatterDriver {
@@ -105,8 +108,13 @@ impl PlatterDriver {
         platter: WritablePlatter,
         events: Receiver<PlatterEvent>,
         nudge_responsiveness: f32,
+        shutdown: Arc<AtomicBool>,
+        buffer_frames_n: usize,
     ) -> Self {
         let record_speed = Speed::new(inertia_tau_secs, 0.005);
+        let frequency_hz = Self::platter_update_freq(buffer_frames_n);
+        log::info!("calculated platter update frequency is {frequency_hz}hz");
+
         Self {
             state,
             record_speed,
@@ -115,7 +123,14 @@ impl PlatterDriver {
             events,
             tracer: TelemetryTrace::new(),
             nudges: NudgeQueue::new(nudge_responsiveness),
+            shutdown,
+            frequency_hz,
         }
+    }
+
+    /// Calculates optimal update frequency
+    fn platter_update_freq(buffer_frames_n: usize) -> usize {
+        (1. / PlatterAudioProcessor::block_duration(buffer_frames_n).as_secs_f64() * 3.) as usize
     }
 
     /// Calculates platter position in nanos
@@ -236,15 +251,11 @@ impl PlatterDriver {
             .update_playhead(pos.record_pos, pos.timestamp_nanos);
     }
 
-    pub fn start(
-        mut self,
-        update_frequency_hz: usize,
-        shutdown_flag: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<Self> {
+    pub fn start(mut self) -> std::thread::JoinHandle<Self> {
         std::thread::spawn(move || {
-            let interval = Duration::from_secs_f64(1.0 / update_frequency_hz as f64);
+            let interval = Duration::from_secs_f64(1.0 / self.frequency_hz as f64);
 
-            while !shutdown_flag.load(Ordering::Relaxed) {
+            while !self.shutdown.load(Ordering::Relaxed) {
                 let loop_start = Instant::now();
                 self.update_platter();
                 // 5. High-precision sleep to maintain targeted update frequency

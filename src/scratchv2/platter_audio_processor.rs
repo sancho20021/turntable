@@ -50,13 +50,8 @@ fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
 }
 
 impl PlatterAudioProcessor {
-    fn block_duration(buffer_frames_n: usize) -> Duration {
+    pub fn block_duration(buffer_frames_n: usize) -> Duration {
         Duration::from_secs_f64((buffer_frames_n as f64) / (SAMPLE_RATE as f64))
-    }
-
-    /// Calculates optimal update frequency for virtual platter
-    pub fn platter_update_freq(buffer_frames_n: usize) -> usize {
-        (1. / Self::block_duration(buffer_frames_n).as_secs_f64() * 3.) as usize
     }
 
     fn block_dur(&self, buffer_frames_n: usize) -> Duration {
