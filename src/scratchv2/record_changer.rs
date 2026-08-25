@@ -29,6 +29,7 @@ struct RecordDisposer {
 }
 
 struct RecordLoader {
+    loading: Arc<AtomicBool>,
     records: Receiver<String>,
     controller: Sender<ExternalEvent>,
     shutdown: Arc<AtomicBool>,
@@ -60,6 +61,7 @@ impl RecordLoader {
                 },
             };
             println!("Loading: {}", track);
+            self.loading.store(true, Ordering::Relaxed);
             let rec = load_file(track.as_ref());
 
             match rec {
@@ -70,6 +72,7 @@ impl RecordLoader {
                         ExternalEvent::ChangeRecord(rec),
                         "change record",
                     );
+                    self.loading.store(false, Ordering::Relaxed);
                 }
                 Err(e) => {
                     log::error!("failed to load track {track}: {e}");
@@ -90,9 +93,12 @@ pub fn start(
     let (loader_tx, loader_rx) = crossbeam::channel::bounded::<String>(4);
     let (disposer_tx, disposer_rx) = crossbeam::channel::bounded::<Record>(4);
 
+    let loader_busy = Arc::new(AtomicBool::new(false));
+
     let loader = RecordLoader {
         records: loader_rx,
         controller,
+        loading: Arc::clone(&loader_busy),
         shutdown: Arc::clone(&shutdown),
     };
 
@@ -116,10 +122,14 @@ pub fn start(
 
             match cmd {
                 RecordChangerCommand::Load(path) => {
-                    let _ = loader_tx.send(path);
+                    if !loader_busy.load(Ordering::Relaxed) {
+                        log_try_send(&loader_tx, path, "load record");
+                    } else {
+                        println!("Record loader busy");
+                    }
                 }
                 RecordChangerCommand::Dispose(record) => {
-                    let _ = disposer_tx.send(record);
+                    log_try_send(&disposer_tx, record, "dispose record");
                 }
             }
         }

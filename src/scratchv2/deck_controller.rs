@@ -333,11 +333,14 @@ impl DeckWorker {
     fn process_external_event(&mut self, event: ExternalEvent) {
         match event {
             ExternalEvent::ChangeRecord(record) => match self.change_record.push(record) {
-                Ok(()) => log_try_send(
-                    &self.adjust_playhead,
-                    PlatterEvent::MovePlayhead(Jump::ToZero),
-                    "reset playhead",
-                ),
+                Ok(()) => {
+                    println!("Record loaded");
+                    log_try_send(
+                        &self.adjust_playhead,
+                        PlatterEvent::MovePlayhead(Jump::ToZero),
+                        "reset playhead",
+                    )
+                }
                 Err(rtrb::PushError::Full(rejected_record)) => {
                     log::error!("Failed to change record, audio thread record queue is full");
                     log_try_send(
