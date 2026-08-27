@@ -1670,6 +1670,7 @@ dependencies = [
  "rtrb",
  "sdl2",
  "symphonium",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

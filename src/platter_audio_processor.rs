@@ -6,8 +6,8 @@ use crate::{
     decoder::SAMPLE_RATE,
     filters::FirstOrderLPF,
     record::{INanos, Record, UNanos, interpolation::Linear},
-    scratchv2::virtual_platter::{PlatterSample, ReadablePlatter},
     stereo_frame::StereoFrame,
+    virtual_platter::{PlatterSample, ReadablePlatter},
 };
 
 /// time that (approximately) takes to remove the lag between virtual platter and audio playback.

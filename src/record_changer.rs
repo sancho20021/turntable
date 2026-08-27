@@ -10,13 +10,12 @@ use std::{
 use crossbeam::channel::{Receiver, Sender};
 
 use crate::{
+    deck_thread::DeckId,
+    deck_worker::DeckWorkerEvent,
     decoder::load_file,
     record::{Record, interpolation::Interpolator},
-    scratchv2::{
-        deck_controller::{DeckId, ExternalEvent},
-        record_changer::LoaderResult::{NeedContinue, NeedTerminate},
-    },
-    utils::log_try_send,
+    record_changer::LoaderResult::{NeedContinue, NeedTerminate},
+    utils::{log_try_send, unzip_array},
 };
 
 pub enum RecordChangerCommand {
@@ -33,7 +32,7 @@ struct RecordDisposer {
 
 struct LoaderComm {
     records: Receiver<String>,
-    controller: Sender<ExternalEvent>,
+    controller: Sender<DeckWorkerEvent>,
 }
 
 struct RecordLoader<const DECKS: usize> {
@@ -80,7 +79,7 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
                 let rec = Record::new(rec, Interpolator::linear());
                 log_try_send(
                     &comm.controller,
-                    ExternalEvent::ChangeRecord(rec),
+                    DeckWorkerEvent::ChangeRecord(rec),
                     "change record",
                 );
                 loading.store(false, Ordering::Relaxed);
@@ -106,18 +105,9 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
     }
 }
 
-fn unzip_array<const N: usize, T1, T2>(a: [(T1, T2); N]) -> ([T1; N], [T2; N]) {
-    let (v1, v2): (Vec<T1>, Vec<T2>) = a.into_iter().unzip();
-
-    (
-        v1.try_into().unwrap_or_else(|_| unreachable!()),
-        v2.try_into().unwrap_or_else(|_| unreachable!()),
-    )
-}
-
 pub fn start<const DECKS: usize>(
     commands: Receiver<RecordChangerCommand>,
-    controllers: [Sender<ExternalEvent>; DECKS],
+    controllers: [Sender<DeckWorkerEvent>; DECKS],
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     let (disposer_tx, disposer_rx) = crossbeam::channel::bounded::<Record>(4);

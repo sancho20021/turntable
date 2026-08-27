@@ -6,3 +6,5 @@ mod virtual_platter;
 mod physical_speed;
 mod record_changer;
 mod samples_poller;
+mod deck_thread;
+mod deck_worker;

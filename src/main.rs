@@ -1,12 +1,21 @@
+mod app;
+mod deck_controller;
 mod deck_event;
+mod deck_thread;
+mod deck_worker;
 mod decoder;
 mod filters;
+mod physical_speed;
+mod platter_audio_processor;
+mod platter_driver;
 mod record;
-mod scratchv2;
+mod record_changer;
+mod samples_poller;
 mod sdl_deck_event;
 mod stereo_frame;
 mod telemetry;
 mod utils;
+mod virtual_platter;
 
 use clap::{Parser, Subcommand};
 use log::info;
@@ -58,7 +67,7 @@ fn main() {
             println!("Starting Turntable: {:?}", args.command);
             println!("Drag and drop a music file to start");
 
-            scratchv2::app::start(motor_inertia, sensitivity, buffer, nudge);
+            app::start(motor_inertia, sensitivity, buffer, nudge);
         }
     }
 }

@@ -10,16 +10,14 @@ use std::{
 use crossbeam::channel::Receiver;
 
 use crate::{
+    deck_controller::{DeckState, PlatterState},
     deck_event::Direction,
+    physical_speed::Speed,
+    platter_audio_processor::PlatterAudioProcessor,
     record::{INanos, UNanos},
     record_mouse,
-    scratchv2::{
-        deck_controller::{DeckState, PlatterState},
-        physical_speed::Speed,
-        platter_audio_processor::PlatterAudioProcessor,
-        virtual_platter::{PlatterSample, WritablePlatter},
-    },
     telemetry::TelemetryTrace,
+    virtual_platter::{PlatterSample, WritablePlatter},
 };
 
 /// time that fast-forward skips
@@ -88,6 +86,7 @@ impl NudgeQueue {
 }
 
 pub struct PlatterDriver {
+    deck_id: usize,
     state: Arc<DeckState>,
     record_speed: Speed,
     sensitivity: f64,
@@ -102,6 +101,7 @@ pub struct PlatterDriver {
 
 impl PlatterDriver {
     pub fn new(
+        deck_id: usize,
         state: Arc<DeckState>,
         sensitivity: f64,
         inertia_tau_secs: f64,
@@ -116,6 +116,7 @@ impl PlatterDriver {
         log::info!("calculated platter update frequency is {frequency_hz}hz");
 
         Self {
+            deck_id,
             state,
             record_speed,
             sensitivity,
@@ -190,7 +191,12 @@ impl PlatterDriver {
                         )
                     };
 
-                    record_mouse!(self.tracer, now, "extrapolated_mouse_x", extrapolated_mouse);
+                    record_mouse!(
+                        self.tracer,
+                        now,
+                        format!("extrapolated_mouse_x_{}", self.deck_id),
+                        extrapolated_mouse
+                    );
 
                     // 2. Convergence factor (higher lambda = snaps faster, lower = smoother/more inertia)
                     let lambda = 50.0;
@@ -201,7 +207,12 @@ impl PlatterDriver {
                         + (latest_mouse_x as f64 * (1.0 - convergence_weight))
                 };
 
-                record_mouse!(self.tracer, now, "converged_mouse_x", cur_mouse);
+                record_mouse!(
+                    self.tracer,
+                    now,
+                    format!("converged_mouse_x_{}", self.deck_id),
+                    cur_mouse
+                );
 
                 let mouse_delta = cur_mouse - anchor_mouse_x as f64;
 
