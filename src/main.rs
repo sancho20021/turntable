@@ -20,6 +20,8 @@ mod virtual_platter;
 use clap::{Parser, Subcommand};
 use log::info;
 
+use crate::app::start;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
 struct Cli {
@@ -29,8 +31,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the new V2 testing turntable (no mouse tracking, synthetic events)
-    V2 {
+    /// Run the turntable application
+    Run {
+        /// Stereo pair assignments for each deck (e.g., "0" for 1 deck, "0,1" for 2 decks, "1,0" for 2 decks with swapped order, etc)
+        #[arg(
+            short('r'),
+            long = "routing",
+            value_delimiter = ',',
+            default_value = "0"
+        )]
+        routing: Vec<usize>,
+
+        /// Audio output device name or substring query
+        #[arg(short('D'), long)]
+        device: Option<String>,
+
         /// Audio callback buffer size
         #[arg(short, long, default_value_t = 256)]
         buffer: u32,
@@ -57,8 +72,10 @@ fn main() {
 
     let args = Cli::parse();
 
-    match args.command {
-        Commands::V2 {
+    match &args.command {
+        Commands::Run {
+            routing,
+            device,
             buffer,
             sensitivity,
             motor_inertia,
@@ -67,7 +84,14 @@ fn main() {
             println!("Starting Turntable: {:?}", args.command);
             println!("Drag and drop a music file to start");
 
-            app::start(motor_inertia, sensitivity, buffer, nudge);
+            start(
+                &routing,
+                device.as_deref(),
+                *motor_inertia,
+                *sensitivity,
+                *buffer,
+                *nudge,
+            );
         }
     }
 }

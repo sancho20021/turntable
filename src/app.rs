@@ -6,13 +6,12 @@ use std::{
     time::Instant,
 };
 
+use anyhow::{Context, bail};
 use cpal::{
-    BufferSize, Device, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfigRange,
+    BufferSize, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossbeam::channel::bounded;
-use itertools::Itertools;
 use sdl2::event::Event;
 
 use crate::{
@@ -28,24 +27,75 @@ use crate::{
 };
 
 /// Main app loop
+macro_rules! dispatch_app {
+    ($decks:expr, $routing_slice:expr, $device_query:expr, $($args:expr),* $(,)?) => {{
+        let routing_array: [usize; $decks] = $routing_slice
+            .try_into()
+            .expect("Routing slice length does not match deck count");
+        run_app::<$decks>(
+            routing_array,
+            $device_query,
+            $($args),*
+        );
+    }};
+}
+
+/// Main app loop entrypoint.
 pub fn start(
+    deck_routing: &[usize],
+    device_query: Option<&str>,
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
     // buffer in frames
     buffer_frames_n: u32,
     nudge_responsiveness: f32,
 ) {
-    run_app::<1, 2>(
-        [0],
-        motor_inertia_secs,
-        touchpad_sensitivity,
-        buffer_frames_n,
-        nudge_responsiveness,
-    );
+    let decks = deck_routing.len();
+
+    match decks {
+        1 => dispatch_app!(
+            1,
+            deck_routing,
+            device_query,
+            motor_inertia_secs,
+            touchpad_sensitivity,
+            buffer_frames_n,
+            nudge_responsiveness
+        ),
+        2 => dispatch_app!(
+            2,
+            deck_routing,
+            device_query,
+            motor_inertia_secs,
+            touchpad_sensitivity,
+            buffer_frames_n,
+            nudge_responsiveness
+        ),
+        3 => dispatch_app!(
+            3,
+            deck_routing,
+            device_query,
+            motor_inertia_secs,
+            touchpad_sensitivity,
+            buffer_frames_n,
+            nudge_responsiveness
+        ),
+        4 => dispatch_app!(
+            4,
+            deck_routing,
+            device_query,
+            motor_inertia_secs,
+            touchpad_sensitivity,
+            buffer_frames_n,
+            nudge_responsiveness
+        ),
+        _ => panic!("Maximum 4 decks supported"),
+    }
 }
 
-fn run_app<const DECKS: usize, const CHANNELS: usize>(
+fn run_app<const DECKS: usize>(
     deck_routing: [usize; DECKS],
+    device_query: Option<&str>,
     motor_inertia_secs: f64,
     touchpad_sensitivity: f64,
     // buffer in frames
@@ -85,8 +135,13 @@ fn run_app<const DECKS: usize, const CHANNELS: usize>(
         std::array::from_fn(|i| deck_threads[i].deck_worker_channel());
     let started_deck_threads = deck_threads.map(|thread| thread.start());
 
-    let routing = DeckRouting::<DECKS, CHANNELS>::try_new(deck_routing).unwrap();
-    let stream = start_deck(buffer_frames_n, audio_processor_handles, routing).unwrap();
+    let stream = start_deck(
+        buffer_frames_n,
+        audio_processor_handles,
+        deck_routing,
+        device_query,
+    )
+    .unwrap();
 
     let record_changer =
         record_changer::start(requested_rec_rcv, worker_channels, Arc::clone(&shutdown));
@@ -133,82 +188,197 @@ fn run_app<const DECKS: usize, const CHANNELS: usize>(
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
 }
 
-pub fn list_output_devices() -> anyhow::Result<Vec<Device>> {
-    let host = cpal::default_host();
-
-    let devices = host
-        .output_devices()?
-        .unique_by(|device| device.id().unwrap().to_string())
-        .collect();
-
-    Ok(devices)
+fn direction_score(device: &cpal::Device) -> u8 {
+    match device.description().map(|d| d.direction()).ok() {
+        Some(cpal::DeviceDirection::Output) => 2, // Highest priority
+        Some(cpal::DeviceDirection::Duplex) => 1, // Fallback
+        _ => 0,                                   // Input / Unknown
+    }
 }
 
-fn ensure_config_supported(
-    supported: &[SupportedStreamConfigRange],
-    chosen: &StreamConfig,
-) -> anyhow::Result<()> {
-    let ok = supported.iter().any(|range| {
-        range.channels() == chosen.channels
-            && range.sample_format() == SampleFormat::F32
-            && range.min_sample_rate() <= chosen.sample_rate
-            && chosen.sample_rate <= range.max_sample_rate()
-            && match (&chosen.buffer_size, range.buffer_size()) {
-                (BufferSize::Fixed(n), SupportedBufferSize::Range { min, max }) => {
-                    n >= min && n <= max
-                }
-                (BufferSize::Default, _) => true,
-                _ => false,
-            }
-    });
+fn max_channels(device: &cpal::Device) -> u16 {
+    device
+        .supported_output_configs()
+        .map(|configs| configs.map(|c| c.channels()).max().unwrap_or(0))
+        .unwrap_or(0)
+}
 
-    if ok {
-        Ok(())
-    } else {
-        anyhow::bail!("device does not support requested config: {chosen:?} (format: F32)")
+/// Ranking key: (direction_score, max_channels)
+/// Higher values win: e.g. Output (2) beats Duplex (1), then breaks ties by channel count.
+fn device_rank(device: &cpal::Device) -> (u8, u16) {
+    (direction_score(device), max_channels(device))
+}
+
+fn resolve_device(host: &cpal::Host, device_query: Option<&str>) -> anyhow::Result<cpal::Device> {
+    let query = match device_query.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => q.to_lowercase(),
+        None => {
+            log::info!("No device query specified; using default output device.");
+            return host
+                .default_output_device()
+                .context("No default output device found on system");
+        }
+    };
+
+    let all_devices: Vec<_> = host
+        .output_devices()
+        .context("Failed to query output devices")?
+        .collect();
+
+    let matches: Vec<_> = all_devices
+        .into_iter()
+        .filter(|dev| dev.to_string().to_lowercase().contains(&query))
+        .collect();
+
+    if matches.is_empty() {
+        println!("Available output devices:");
+        for dev in host.output_devices()? {
+            println!("  - \"{dev}\"");
+        }
+        bail!("No audio output device found matching query: \"{query}\"");
     }
+
+    if matches.len() == 1 {
+        let device = matches.into_iter().next().unwrap();
+        log::info!("Selected unique output device: \"{device}\"");
+        return Ok(device);
+    }
+
+    let first_name = matches[0].to_string();
+    let all_same_name = matches.iter().all(|dev| dev.to_string() == first_name);
+
+    if !all_same_name {
+        let matched_list = matches
+            .iter()
+            .map(|dev| format!("  - \"{dev}\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        bail!(
+            "Ambiguous audio device query \"{query}\": matches {} distinct devices:\n{matched_list}",
+            matches.len()
+        );
+    }
+
+    for device in &matches {
+        log::info!("supported config of {device}:");
+        for config in device.supported_output_configs()? {
+            log::info!("- {config:?}");
+        }
+    }
+    let best_match = matches.into_iter().max_by_key(device_rank).unwrap();
+
+    log::warn!(
+        "Multiple endpoints found sharing identical name \"{first_name}\". Disambiguated best endpoint (Output > Duplex, Max Channels)."
+    );
+
+    Ok(best_match)
 }
 
 /// Start audio thread
-fn start_deck<const DECKS: usize, const CHANNELS: usize>(
+fn start_deck<const DECKS: usize>(
     // buffer size in frames
     buffer_frames_n: u32,
     audio_processor_handles: [AudioProcessorHandles; DECKS],
-    deck_routing: DeckRouting<DECKS, CHANNELS>,
+    deck_routing: [usize; DECKS],
+    device_query: Option<&str>,
 ) -> anyhow::Result<Stream> {
     let host = cpal::default_host();
+    log::info!("CPAL Host API: {:?}", host.id());
 
-    log::info!("Available output devices:");
-    for device in list_output_devices()? {
-        let id = device.id()?;
-        let device = device.description()?;
-        log::info!("id:{id}, desc:{device}");
+    let device = resolve_device(&host, device_query)?;
+
+    log::info!("Chosen device: {:?}", device);
+
+    let max_pair_idx = deck_routing.iter().copied().max().unwrap_or(0);
+    let min_channels_required = ((max_pair_idx + 1) * 2) as u16;
+
+    let all_configs: Vec<_> = device
+        .supported_output_configs()
+        .context("Failed to query device supported output configs")?
+        .collect();
+
+    let mut valid_configs: Vec<_> = all_configs
+        .iter()
+        .cloned()
+        .filter(|config| {
+            // Must support F32 sample format
+            if config.sample_format() != SampleFormat::F32 {
+                return false;
+            }
+
+            // Must have enough channels and be an even pair count
+            let channels = config.channels();
+            if channels < min_channels_required || channels % 2 != 0 {
+                return false;
+            }
+
+            // Target SAMPLE_RATE must fall within supported range
+            if !(config.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= config.max_sample_rate())
+            {
+                return false;
+            }
+
+            // Requested buffer frame size must fall within supported range
+            match config.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => {
+                    buffer_frames_n >= *min && buffer_frames_n <= *max
+                }
+                cpal::SupportedBufferSize::Unknown => true,
+            }
+        })
+        .collect();
+
+    if valid_configs.is_empty() {
+        let available_str = if all_configs.is_empty() {
+            "  (none reported by driver)".to_string()
+        } else {
+            all_configs
+                .iter()
+                .map(|c| {
+                    format!(
+                        "  - channels: {}, format: {:?}, sample_rate: {}-{} Hz, buffer: {:?}",
+                        c.channels(),
+                        c.sample_format(),
+                        c.min_sample_rate(),
+                        c.max_sample_rate(),
+                        c.buffer_size()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        bail!(
+            "Device \"{device}\" does not support required config:\n\
+        \x20 Required: >= {min_channels_required} channels (even, covering stereo pair {max_pair_idx}), F32 format, rate {SAMPLE_RATE:?}, buffer {buffer_frames_n} frames\n\n\
+        Available device configurations:\n{available_str}"
+        );
     }
 
-    let device = host.default_output_device().expect("No output device");
-    log::info!(
-        "Chosen device: id:{}, desc:{}",
-        device.id()?,
-        device.description()?
-    );
+    // 2. Select the optimal configuration (e.g. smallest suitable channel count >= min_channels_required)
+    valid_configs.sort_by_key(|config| config.channels());
+    let chosen_range = valid_configs.remove(0);
 
-    let target_channels = u16::try_from(CHANNELS)
-        .map_err(|_| anyhow::anyhow!("Requested channels ({CHANNELS}) exceeds u16::MAX"))?;
+    let device_channels = chosen_range.channels() as usize;
 
     let chosen_config = StreamConfig {
-        channels: target_channels,
+        channels: chosen_range.channels(),
         sample_rate: SAMPLE_RATE,
         buffer_size: BufferSize::Fixed(buffer_frames_n),
     };
 
-    log::info!("Supported device output configs:");
-    let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
-    for config in &supported_configs {
-        log::info!("- {config:?}");
-    }
-    ensure_config_supported(&supported_configs, &chosen_config)?;
-    log::info!("Stream config: {:?}", chosen_config);
+    log::info!(
+        "Selected matching output config: channels={}, sample_rate={:?}, buffer_size={} frames",
+        chosen_config.channels,
+        chosen_config.sample_rate,
+        buffer_frames_n
+    );
 
+    // 3. Validate routing against the physical channels offered by the chosen config
+    let deck_routing = DeckRouting::try_new(deck_routing, device_channels)?;
+
+    // 4. Instantiate processor poller and build audio stream
     let processors = audio_processor_handles.map(PlatterAudioProcessor::new);
     let mut samples_poller = SamplesPoller::new(buffer_frames_n as usize, processors, deck_routing);
 
@@ -218,7 +388,7 @@ fn start_deck<const DECKS: usize, const CHANNELS: usize>(
             samples_poller.write_frames(data);
         },
         move |err| {
-            eprintln!("audio error: {err}");
+            log::error!("Audio stream execution error: {err}");
         },
         None,
     )?;
