@@ -1,4 +1,5 @@
 use std::{
+    array,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,10 +16,11 @@ use crossbeam::channel::bounded;
 use sdl2::event::Event;
 
 use turntable_lib::{
-    deck_controller::{self},
+    deck_controller::{self, AppStatus},
     deck_thread::DeckJoinHandle,
     decoder::SAMPLE_RATE,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
+    ratatui::spawn_tui_thread,
     record_changer,
     samples_poller::{DeckRouting, SamplesPoller},
     sdl_deck_event::DeckEventMapper,
@@ -102,6 +104,9 @@ fn run_app<const DECKS: usize>(
     buffer_frames_n: u32,
     nudge_responsiveness: f32,
 ) {
+    let app_status = AppStatus::new();
+    app_status.set(format!("Drag and drop a music file to start"));
+
     let sdl = sdl2::init().unwrap();
     let video = sdl.video().unwrap();
 
@@ -126,6 +131,7 @@ fn run_app<const DECKS: usize>(
             requested_record_snd.clone(),
             Arc::clone(&shutdown),
             buffer_frames_n as usize,
+            &app_status,
         )
     });
 
@@ -143,10 +149,23 @@ fn run_app<const DECKS: usize>(
     )
     .unwrap();
 
-    let record_changer =
-        record_changer::start(requested_rec_rcv, worker_channels, Arc::clone(&shutdown));
+    let record_changer = record_changer::start(
+        requested_rec_rcv,
+        worker_channels,
+        app_status.clone(),
+        Arc::clone(&shutdown),
+    );
 
-    let mut event_mapper = DeckEventMapper::<DECKS>::new();
+    let mut event_mapper = DeckEventMapper::<DECKS>::new(app_status.clone());
+
+    // Spawn polling TUI thread
+    let tui_handle = spawn_tui_thread::<DECKS>(
+        Arc::clone(&event_mapper.active_deck),
+        array::from_fn(|i| controllers[i].get_state()),
+        array::from_fn(|i| controllers[i].get_platter()),
+        app_status.clone(),
+        Arc::clone(&shutdown),
+    );
 
     for event in pump.wait_iter() {
         if let Event::Quit { .. } = event {
@@ -165,7 +184,7 @@ fn run_app<const DECKS: usize>(
     }
 
     // 4. Teardown & Thread Joining
-    println!("Stopping the app");
+    log::info!("Stopping the app");
     drop(stream);
     shutdown.store(true, Ordering::Relaxed);
 
@@ -175,6 +194,10 @@ fn run_app<const DECKS: usize>(
 
     // Join all platter driver threads
     let platter_drivers = started_deck_threads.map(DeckJoinHandle::join);
+
+    if let Err(_) = tui_handle.join() {
+        log::error!("TUI thread panicked");
+    }
 
     // 5. Consolidate telemetry tracers across controllers and driver threads
     let mut tracers = Vec::with_capacity(DECKS * 2);
@@ -231,9 +254,9 @@ fn resolve_device(host: &cpal::Host, device_query: Option<&str>) -> anyhow::Resu
         .collect();
 
     if matches.is_empty() {
-        println!("Available output devices:");
+        log::error!("Available output devices:");
         for dev in host.output_devices()? {
-            println!("  - \"{dev}\"");
+            log::error!("  - \"{dev}\"");
         }
         bail!("No audio output device found matching query: \"{query}\"");
     }

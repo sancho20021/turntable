@@ -11,7 +11,7 @@ use crossbeam::channel::{Receiver, Sender};
 use rtrb::{Consumer, Producer};
 
 use crate::{
-    deck_controller::{DeckState, RecordInfo},
+    deck_controller::{AppStatus, DeckState, RecordInfo},
     deck_thread::DeckId,
     platter_driver::{Jump, PlatterEvent},
     record::Record,
@@ -45,6 +45,7 @@ pub struct DeckWorker {
     dispose_record: Consumer<Record>,
     /// send new record to audio thread
     change_record: Producer<Record>,
+    app_status: AppStatus,
 }
 
 impl DeckWorker {
@@ -58,6 +59,7 @@ impl DeckWorker {
         change_record: Producer<Record>,
         shutdown: Arc<AtomicBool>,
         deck_state: Arc<DeckState>,
+        app_status: AppStatus,
     ) -> Self {
         Self {
             deck_id,
@@ -69,6 +71,7 @@ impl DeckWorker {
             record_changer,
             dispose_record,
             change_record,
+            app_status,
         }
     }
     pub fn get_event_sender(&self) -> Sender<DeckWorkerEvent> {
@@ -107,10 +110,15 @@ impl DeckWorker {
             DeckWorkerEvent::ChangeRecord(record, record_info) => {
                 match self.change_record.push(record) {
                     Ok(()) => {
-                        println!(
-                            "Record {} loaded to deck {}",
-                            record_info.path, self.deck_id
-                        );
+                        {
+                            let msg = format!(
+                                "Record {} loaded to deck {}",
+                                record_info.path, self.deck_id
+                            );
+                            log::info!("{msg}");
+                            self.app_status.set(msg);
+                        }
+
                         log_try_send(
                             &self.adjust_playhead,
                             PlatterEvent::MovePlayhead(Jump::ToZero),

@@ -1,4 +1,10 @@
-use std::time::Instant;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use sdl2::{
     event::Event,
@@ -7,17 +13,22 @@ use sdl2::{
 };
 
 use crate::{
+    deck_controller::AppStatus,
     deck_event::{self, DeckEvent, Direction},
     deck_thread::DeckId,
 };
 
 pub struct DeckEventMapper<const DECKS: usize> {
-    pub active_deck: usize,
+    pub active_deck: Arc<AtomicUsize>,
+    app_status: AppStatus,
 }
 
 impl<const DECKS: usize> DeckEventMapper<DECKS> {
-    pub fn new() -> Self {
-        Self { active_deck: 0 }
+    pub fn new(app_status: AppStatus) -> Self {
+        Self {
+            active_deck: Arc::new(AtomicUsize::new(0)),
+            app_status,
+        }
     }
 
     pub fn to_deck_event(
@@ -72,14 +83,15 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
                     k => {
                         if let Some(deck_idx) = keycode_to_deck_idx(k) {
                             if deck_idx < DECKS {
-                                self.active_deck = deck_idx;
-                                println!("Active Deck = {}", deck_idx + 1);
+                                self.active_deck.store(deck_idx, Ordering::Relaxed);
+                                log::info!("Active Deck = {}", deck_idx + 1);
                             } else {
-                                println!(
+                                // todo: change it from status to temporary warning
+                                self.app_status.set(format!(
                                     "deck {} doesn't exist (only {} decks are running)",
                                     deck_idx + 1,
                                     DECKS
-                                );
+                                ));
                             }
                         }
                         None
@@ -92,7 +104,7 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
         }?;
 
         Some((
-            self.active_deck,
+            self.active_deck.load(Ordering::Relaxed),
             DeckEvent {
                 event: inner_event,
                 timestamp,

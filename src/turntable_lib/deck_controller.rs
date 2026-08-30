@@ -107,6 +107,7 @@ pub fn new_deck(
     record_changer: Sender<RecordChangerCommand>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
+    app_status: &AppStatus,
 ) -> (DeckController, DeckThread, AudioProcessorHandles) {
     let initial_state = Arc::new(DeckState {
         pitch: AtomicF64::new(initial_pitch),
@@ -137,6 +138,7 @@ pub fn new_deck(
         new_record_prod,
         Arc::clone(&shutdown),
         Arc::clone(&initial_state),
+        app_status.clone(),
     );
     let driver = PlatterDriver::new(
         deck_id,
@@ -286,5 +288,38 @@ impl DeckController {
             }
         };
         Ok(())
+    }
+
+    pub fn get_state(&self) -> Arc<DeckState> {
+        Arc::clone(&self.state)
+    }
+
+    pub fn get_platter(&self) -> ReadablePlatter {
+        self.platter.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct AppStatus {
+    pub message: Arc<RwLock<String>>,
+}
+
+impl AppStatus {
+    pub fn new() -> Self {
+        Self {
+            message: Arc::new(RwLock::new(
+                "Drag and drop a music file to start".to_string(),
+            )),
+        }
+    }
+
+    pub fn set(&self, msg: impl Into<String>) {
+        if let Ok(mut lock) = self.message.write() {
+            *lock = msg.into();
+        }
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.message.read().ok().map(|m| m.clone())
     }
 }

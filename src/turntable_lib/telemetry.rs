@@ -72,7 +72,7 @@ impl TelemetryTrace {
         }
 
         writer.flush()?;
-        println!(
+        log::info!(
             "Exported {} telemetry points to {}!",
             self.samples.len(),
             path

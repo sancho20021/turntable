@@ -87,9 +87,7 @@ fn main() {
             motor_inertia,
             nudge,
         } => {
-            println!("Starting Turntable: {:?}", args.command);
-            println!("Drag and drop a music file to start");
-
+            log::info!("Starting Turntable: {:?}", args.command);
             start(
                 &routing,
                 device.as_deref(),

@@ -16,3 +16,4 @@ pub mod stereo_frame;
 pub mod telemetry;
 pub mod utils;
 pub mod virtual_platter;
+pub mod ratatui;

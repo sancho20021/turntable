@@ -276,7 +276,7 @@ impl PlatterDriver {
                 }
             }
 
-            println!("Platter stopped");
+            log::info!("Platter stopped");
             self
         })
     }

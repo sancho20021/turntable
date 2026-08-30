@@ -10,7 +10,7 @@ use std::{
 use crossbeam::channel::{Receiver, Sender};
 
 use crate::{
-    deck_controller::RecordInfo,
+    deck_controller::{AppStatus, RecordInfo},
     deck_thread::DeckId,
     deck_worker::DeckWorkerEvent,
     decoder::load_file,
@@ -40,6 +40,7 @@ struct LoaderComm {
 struct RecordLoader<const DECKS: usize> {
     loading: Arc<AtomicBool>,
     comm: [LoaderComm; DECKS],
+    app_status: AppStatus,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -64,7 +65,11 @@ enum LoaderResult {
 }
 
 impl<const DECKS: usize> RecordLoader<DECKS> {
-    fn try_load_record(loading: &AtomicBool, comm: &LoaderComm) -> LoaderResult {
+    fn try_load_record(
+        loading: &AtomicBool,
+        comm: &LoaderComm,
+        app_status: &AppStatus,
+    ) -> LoaderResult {
         let track = match comm.records.recv_timeout(Duration::from_millis(100)) {
             Ok(rec) => rec,
             Err(e) => match e {
@@ -72,7 +77,7 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
                 crossbeam::channel::RecvTimeoutError::Disconnected => return NeedTerminate,
             },
         };
-        println!("Loading: {}", track);
+        app_status.set(format!("Loading: {}", track));
         loading.store(true, Ordering::Relaxed);
         let rec = load_file(track.as_ref());
 
@@ -103,7 +108,7 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
     fn run(self) {
         while !self.shutdown.load(Ordering::Relaxed) {
             for comm in &self.comm {
-                match Self::try_load_record(&self.loading, comm) {
+                match Self::try_load_record(&self.loading, comm, &self.app_status) {
                     NeedTerminate => break,
                     NeedContinue => (),
                 }
@@ -117,6 +122,7 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
 pub fn start<const DECKS: usize>(
     commands: Receiver<RecordChangerCommand>,
     controllers: [Sender<DeckWorkerEvent>; DECKS],
+    app_status: AppStatus,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     let (disposer_tx, disposer_rx) = crossbeam::channel::bounded::<Record>(4);
@@ -139,6 +145,7 @@ pub fn start<const DECKS: usize>(
         comm,
         loading: Arc::clone(&loader_busy),
         shutdown: Arc::clone(&shutdown),
+        app_status: app_status.clone(),
     };
 
     let disposer = RecordDisposer {
@@ -165,7 +172,7 @@ pub fn start<const DECKS: usize>(
                         if !loader_busy.load(Ordering::Relaxed) {
                             log_try_send(&loaders[deck_id], path, "load record");
                         } else {
-                            println!("Record loader busy");
+                            app_status.set("Record loader busy");
                         }
                     } else {
                         log::error!("invalid deck_id, only {DECKS} decks are available");
