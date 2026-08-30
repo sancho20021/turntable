@@ -50,12 +50,17 @@ fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
 }
 
 impl PlatterAudioProcessor {
-    pub fn block_duration(buffer_frames_n: usize) -> Duration {
+    pub fn frames_to_dur(buffer_frames_n: usize) -> Duration {
         Duration::from_secs_f64((buffer_frames_n as f64) / (SAMPLE_RATE as f64))
     }
 
+    pub fn frames_to_dur_nanos(buffer_frames_n: usize) -> UNanos {
+        let dur = Duration::from_secs_f64((buffer_frames_n as f64) / (SAMPLE_RATE as f64));
+        UNanos(dur.as_nanos() as u64)
+    }
+
     fn block_dur(&self, buffer_frames_n: usize) -> Duration {
-        Self::block_duration(buffer_frames_n)
+        Self::frames_to_dur(buffer_frames_n)
     }
 
     fn set_record(&mut self, record: Record) {

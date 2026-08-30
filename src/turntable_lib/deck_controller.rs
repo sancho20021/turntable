@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -45,6 +45,12 @@ pub enum PlatterState {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordInfo {
+    pub path: String,
+    pub duration: UNanos,
+}
+
 #[derive(Debug)]
 pub struct DeckState {
     /// Target platter speed (1.0 = normal)
@@ -53,6 +59,8 @@ pub struct DeckState {
     pub playing: AtomicBool,
     /// Platter state (scratching or playing)
     pub platter: AtomicCell<PlatterState>,
+    /// Current record playing
+    pub cur_record: RwLock<Option<RecordInfo>>,
 }
 
 impl DeckState {
@@ -104,6 +112,7 @@ pub fn new_deck(
         pitch: AtomicF64::new(initial_pitch),
         playing: AtomicBool::new(true),
         platter: AtomicCell::new(PlatterState::Playing),
+        cur_record: RwLock::new(None),
     });
     let (pl_snd, pl_rcv) = bounded(1000);
     let (writable_platter, readable_platter) = new_platter();
@@ -127,6 +136,7 @@ pub fn new_deck(
         used_records_cons,
         new_record_prod,
         Arc::clone(&shutdown),
+        Arc::clone(&initial_state),
     );
     let driver = PlatterDriver::new(
         deck_id,

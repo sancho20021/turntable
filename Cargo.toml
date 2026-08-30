@@ -3,6 +3,10 @@ name = "turntable"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "turntable_lib"
+path = "src/turntable_lib/mod.rs"
+
 [features]
 default = []
 
@@ -24,6 +28,7 @@ env_logger = "0.11"
 
 itertools = "0.13"
 thiserror = "2.0"
+ratatui = "0.30"
 
 # must be at the end because of config switch
 # cpal = { version = "0.18" }

@@ -131,7 +131,7 @@ impl PlatterDriver {
 
     /// Calculates optimal update frequency
     fn platter_update_freq(buffer_frames_n: usize) -> usize {
-        (1. / PlatterAudioProcessor::block_duration(buffer_frames_n).as_secs_f64() * 3.) as usize
+        (1. / PlatterAudioProcessor::frames_to_dur(buffer_frames_n).as_secs_f64() * 3.) as usize
     }
 
     /// Calculates platter position in nanos
@@ -144,7 +144,7 @@ impl PlatterDriver {
 
         let target_speed = {
             let nudge_raw = self.nudges.current_nudge() as f64;
-            let nudge_modifier = nudge_raw.clamp(-8., 8.) / 100.;
+            let nudge_modifier = nudge_raw.clamp(-16., 16.) / 100.;
             self.state.target_speed() + nudge_modifier
         };
 

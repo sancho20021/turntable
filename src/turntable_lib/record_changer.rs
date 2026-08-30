@@ -10,9 +10,11 @@ use std::{
 use crossbeam::channel::{Receiver, Sender};
 
 use crate::{
+    deck_controller::RecordInfo,
     deck_thread::DeckId,
     deck_worker::DeckWorkerEvent,
     decoder::load_file,
+    platter_audio_processor::PlatterAudioProcessor,
     record::{Record, interpolation::Interpolator},
     record_changer::LoaderResult::{NeedContinue, NeedTerminate},
     utils::{log_try_send, unzip_array},
@@ -76,10 +78,17 @@ impl<const DECKS: usize> RecordLoader<DECKS> {
 
         match rec {
             Ok(rec) => {
+                let samples_n = rec.len();
                 let rec = Record::new(rec, Interpolator::linear());
                 log_try_send(
                     &comm.controller,
-                    DeckWorkerEvent::ChangeRecord(rec),
+                    DeckWorkerEvent::ChangeRecord(
+                        rec,
+                        RecordInfo {
+                            path: track,
+                            duration: PlatterAudioProcessor::frames_to_dur_nanos(samples_n),
+                        },
+                    ),
                     "change record",
                 );
                 loading.store(false, Ordering::Relaxed);

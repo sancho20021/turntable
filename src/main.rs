@@ -1,21 +1,6 @@
 mod app;
-mod deck_controller;
-mod deck_event;
-mod deck_thread;
-mod deck_worker;
-mod decoder;
-mod filters;
-mod physical_speed;
-mod platter_audio_processor;
-mod platter_driver;
-mod record;
-mod record_changer;
-mod samples_poller;
-mod sdl_deck_event;
-mod stereo_frame;
-mod telemetry;
-mod utils;
-mod virtual_platter;
+
+use std::{fs::OpenOptions, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use log::info;
@@ -25,6 +10,14 @@ use crate::app::start;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
 struct Cli {
+    /// Path to log file
+    #[arg(
+        long,
+        global = true,
+        default_value = "/home/sancho20021/spw/localdeck/turntable.log"
+    )]
+    log_file: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -65,12 +58,25 @@ enum Commands {
 }
 
 fn main() {
-    env_logger::builder()
-        .target(env_logger::Target::Stdout)
-        .init();
-    info!("Initialized logging to stdout");
-
     let args = Cli::parse();
+
+    if let Some(parent) = args.log_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // 3. Open or create the target log file
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.log_file)
+        .unwrap_or_else(|err| panic!("Failed to open log file at {:?}: {}", args.log_file, err));
+
+    // 4. Initialize env_logger with target pipe
+    env_logger::builder()
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .init();
+
+    info!("Initialized logging to {:?}", args.log_file);
 
     match &args.command {
         Commands::Run {

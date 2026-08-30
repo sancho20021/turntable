@@ -14,7 +14,7 @@ use cpal::{
 use crossbeam::channel::bounded;
 use sdl2::event::Event;
 
-use crate::{
+use turntable_lib::{
     deck_controller::{self},
     deck_thread::DeckJoinHandle,
     decoder::SAMPLE_RATE,

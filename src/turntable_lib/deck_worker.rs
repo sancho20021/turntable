@@ -11,6 +11,7 @@ use crossbeam::channel::{Receiver, Sender};
 use rtrb::{Consumer, Producer};
 
 use crate::{
+    deck_controller::{DeckState, RecordInfo},
     deck_thread::DeckId,
     platter_driver::{Jump, PlatterEvent},
     record::Record,
@@ -23,13 +24,15 @@ pub enum DeckWorkerEvent {
     /// Load the record
     LoadRecord(String),
     /// Change record after successful loading
-    ChangeRecord(Record),
+    ChangeRecord(Record, RecordInfo),
 }
 
 /// holds deck background thread that handles external events
 pub struct DeckWorker {
     deck_id: DeckId,
     shutdown: Arc<AtomicBool>,
+    // to update deck state
+    deck_state: Arc<DeckState>,
     adjust_playhead: Sender<PlatterEvent>,
     // Receives events from outside senders
     event_receiver: Receiver<DeckWorkerEvent>,
@@ -54,10 +57,12 @@ impl DeckWorker {
         dispose_record: Consumer<Record>,
         change_record: Producer<Record>,
         shutdown: Arc<AtomicBool>,
+        deck_state: Arc<DeckState>,
     ) -> Self {
         Self {
             deck_id,
             shutdown,
+            deck_state,
             adjust_playhead,
             event_receiver,
             event_sender,
@@ -99,24 +104,39 @@ impl DeckWorker {
 
     fn process_external_event(&mut self, event: DeckWorkerEvent) {
         match event {
-            DeckWorkerEvent::ChangeRecord(record) => match self.change_record.push(record) {
-                Ok(()) => {
-                    println!("Record loaded to deck {}", self.deck_id);
-                    log_try_send(
-                        &self.adjust_playhead,
-                        PlatterEvent::MovePlayhead(Jump::ToZero),
-                        "reset playhead",
-                    )
+            DeckWorkerEvent::ChangeRecord(record, record_info) => {
+                match self.change_record.push(record) {
+                    Ok(()) => {
+                        println!(
+                            "Record {} loaded to deck {}",
+                            record_info.path, self.deck_id
+                        );
+                        log_try_send(
+                            &self.adjust_playhead,
+                            PlatterEvent::MovePlayhead(Jump::ToZero),
+                            "reset playhead",
+                        );
+                        let mut cur_rec = match self.deck_state.cur_record.write() {
+                            Ok(cur_rec) => cur_rec,
+                            Err(_) => {
+                                log::error!(
+                                    "Cannot update current record info, lock poisoned (tui thread may be dead)"
+                                );
+                                return;
+                            }
+                        };
+                        *cur_rec = Some(record_info);
+                    }
+                    Err(rtrb::PushError::Full(rejected_record)) => {
+                        log::error!("Failed to change record, audio thread record queue is full");
+                        log_try_send(
+                            &self.record_changer,
+                            RecordChangerCommand::Dispose(rejected_record),
+                            "dispose rejected record",
+                        );
+                    }
                 }
-                Err(rtrb::PushError::Full(rejected_record)) => {
-                    log::error!("Failed to change record, audio thread record queue is full");
-                    log_try_send(
-                        &self.record_changer,
-                        RecordChangerCommand::Dispose(rejected_record),
-                        "dispose rejected record",
-                    );
-                }
-            },
+            }
             DeckWorkerEvent::LoadRecord(record) => {
                 log_try_send(
                     &self.record_changer,
