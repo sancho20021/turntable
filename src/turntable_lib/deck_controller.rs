@@ -14,19 +14,20 @@ use crossbeam::{
 
 use crate::{
     deck_event::{self, DeckEvent},
-    deck_thread::{DeckId, DeckThread},
-    deck_worker::DeckWorker,
     filters::FirstOrderLPF,
     input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
-    record::{INanos, Record, UNanos},
-    record_changer::RecordChangerCommand,
+    record::{INanos, UNanos},
     record_mouse,
     telemetry::TelemetryTrace,
+    tray::{DeckSlot, TrayCommand},
     utils::log_try_send,
     virtual_platter::{ReadablePlatter, new_platter},
 };
+
+/// Which deck a command is addressed to. `0` is deck 1.
+pub type DeckId = usize;
 
 // const SPEED_EPS: f64 = 0.001;
 
@@ -82,8 +83,8 @@ impl DeckState {
 pub struct DeckController {
     deck_id: DeckId,
     state: Arc<DeckState>,
-    /// to stage and commit records, see [`crate::record_changer`]
-    tray: Sender<RecordChangerCommand>,
+    /// to prepare records and load them onto this deck, see [`crate::tray`]
+    tray: Sender<TrayCommand>,
     platter_events: Sender<PlatterEvent>,
     platter: ReadablePlatter,
     /// input speed smoothing, see [`InputProfile::speed_smoothing_tau_secs`]
@@ -105,12 +106,15 @@ pub fn new_deck(
     input: InputProfile,
     inertia_tau_secs: f64,
     nudge_responsiveness: f32,
-    tray: Sender<RecordChangerCommand>,
-    disposer: Sender<Record>,
+    tray: Sender<TrayCommand>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
-    app_status: &AppStatus,
-) -> (DeckController, DeckThread, AudioProcessorHandles) {
+) -> (
+    DeckController,
+    PlatterDriver,
+    AudioProcessorHandles,
+    DeckSlot,
+) {
     let initial_state = Arc::new(DeckState {
         pitch: AtomicF64::new(initial_pitch),
         playing: AtomicBool::new(true),
@@ -120,8 +124,6 @@ pub fn new_deck(
     let (pl_snd, pl_rcv) = bounded(1000);
     let (writable_platter, readable_platter) = new_platter();
 
-    let (event_snd, event_rcv) = bounded(100);
-
     let (used_records_prod, used_records_cons) = rtrb::RingBuffer::new(3);
     let (new_record_prod, new_record_cons) = rtrb::RingBuffer::new(1);
     let audio_handles = AudioProcessorHandles {
@@ -129,19 +131,13 @@ pub fn new_deck(
         used_records: used_records_prod,
         platter: readable_platter.clone(),
     };
+    let deck_slot = DeckSlot {
+        records_in: new_record_prod,
+        records_out: used_records_cons,
+        state: Arc::clone(&initial_state),
+        platter_events: pl_snd.clone(),
+    };
 
-    let deck_worker = DeckWorker::new(
-        deck_id,
-        pl_snd.clone(),
-        event_rcv,
-        event_snd,
-        disposer,
-        used_records_cons,
-        new_record_prod,
-        Arc::clone(&shutdown),
-        Arc::clone(&initial_state),
-        app_status.clone(),
-    );
     let driver = PlatterDriver::new(
         deck_id,
         Arc::clone(&initial_state),
@@ -154,7 +150,6 @@ pub fn new_deck(
         buffer_frames_n,
     );
 
-    let deck_thread = DeckThread::new(deck_worker, driver);
     (
         DeckController {
             deck_id,
@@ -165,8 +160,9 @@ pub fn new_deck(
             tracer: TelemetryTrace::new(),
             input_speed: FirstOrderLPF::new(input.speed_smoothing_tau_secs),
         },
-        deck_thread,
+        driver,
         audio_handles,
+        deck_slot,
     )
 }
 
@@ -269,12 +265,12 @@ impl DeckController {
                 self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch)
             }
             deck_event::Event::StartStop => self.start_or_stop(),
-            deck_event::Event::CommitStaged => log_try_send(
+            deck_event::Event::LoadRecord => log_try_send(
                 &self.tray,
-                RecordChangerCommand::Commit {
+                TrayCommand::LoadRecord {
                     deck_id: self.deck_id,
                 },
-                "commit staged record",
+                "load record from tray",
             ),
             deck_event::Event::PlayheadReset => log_try_send(
                 &self.platter_events,

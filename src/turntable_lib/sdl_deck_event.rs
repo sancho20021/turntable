@@ -15,9 +15,8 @@ use sdl2::{
 };
 
 use crate::{
-    deck_controller::AppStatus,
+    deck_controller::{AppStatus, DeckId},
     deck_event::{self, AppEvent, DeckEvent, Direction, InputEvent},
-    deck_thread::DeckId,
 };
 
 pub struct DeckEventMapper<const DECKS: usize> {
@@ -40,10 +39,10 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
         let deck_event = match event {
             Event::Quit { .. } => return Some(InputEvent::App(AppEvent::Quit)),
 
-            // A dropped file is staged for the app, not for a deck: which deck it
-            // ends up on is decided by whoever commits it.
+            // A dropped file goes in the record tray, not on a deck: which deck it
+            // ends up on is decided by whoever loads it out of the tray.
             Event::DropFile { filename, .. } => {
-                return Some(InputEvent::App(AppEvent::PrepareTrack(filename)));
+                return Some(InputEvent::App(AppEvent::PrepareRecord(filename)));
             }
 
             // The touchpad's input unit is one screen pixel of horizontal travel,
@@ -98,7 +97,7 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
             Keycode::Up => Some(deck_event::Event::PitchUp),
             Keycode::Down => Some(deck_event::Event::PitchDown),
             Keycode::Space => Some(deck_event::Event::StartStop),
-            Keycode::Return | Keycode::KpEnter => Some(deck_event::Event::CommitStaged),
+            Keycode::Return | Keycode::KpEnter => Some(deck_event::Event::LoadRecord),
             Keycode::Right => Some(deck_event::Event::PlayheadFF),
             Keycode::Left => {
                 if is_shift {

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::deck_thread::DeckId;
+use crate::deck_controller::DeckId;
 
 /// Anything an input source can produce.
 ///
@@ -20,9 +20,9 @@ pub enum InputEvent {
 /// A command that belongs to no particular deck.
 #[derive(Debug)]
 pub enum AppEvent {
-    /// A track was handed to the app (drag & drop). It is *staged*, not loaded:
-    /// nothing about this event says which deck it will end up on.
-    PrepareTrack(String),
+    /// A track was handed to the app (drag & drop). It goes in the record tray,
+    /// not on a deck: nothing about this event says where it will end up.
+    PrepareRecord(String),
     /// Shut the app down.
     Quit,
 }
@@ -63,8 +63,8 @@ pub enum Event {
     PitchDown,
     /// Absolute pitch, 1.0 = nominal speed (tempo fader).
     SetPitch(f64),
-    /// Put the track staged in the record tray on this deck.
-    CommitStaged,
+    /// Put the record waiting in the tray on this deck.
+    LoadRecord,
     PlayheadReset,
     PlayheadFF,
     PlayheadRewind,

@@ -15,18 +15,18 @@ use cpal::{
 use crossbeam::channel::bounded;
 
 use turntable_lib::{
-    deck_controller::{self, AppStatus, DeckController},
+    deck_controller::{self, AppStatus, DeckController, DeckId},
     deck_event::{AppEvent, DeckEvent, InputEvent},
-    deck_thread::{DeckId, DeckJoinHandle},
     decoder::SAMPLE_RATE,
     input_profile::InputProfile,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
+    platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
-    record_changer::{self, RecordChangerCommand, TrayState},
     samples_poller::{DeckRouting, SamplesPoller},
     sdl_deck_event::DeckEventMapper,
     telemetry,
-    utils::{log_try_send, unzip_array3},
+    tray::{self, TrayCommand, TrayState},
+    utils::{log_try_send, unzip_array4},
 };
 
 /// Main app loop
@@ -119,10 +119,8 @@ fn run_app<const DECKS: usize>(
 
     let mut pump = sdl.event_pump().unwrap();
 
-    // staging and committing records
+    // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);
-    // records handed back by the audio thread, to be freed off the deck threads
-    let (used_records_snd, used_records_rcv) = bounded(4);
     let tray_state = Arc::new(RwLock::new(TrayState::Empty));
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -136,18 +134,14 @@ fn run_app<const DECKS: usize>(
             motor_inertia_secs,
             nudge_responsiveness,
             tray_snd.clone(),
-            used_records_snd.clone(),
             Arc::clone(&shutdown),
             buffer_frames_n as usize,
-            &app_status,
         )
     });
 
-    let (mut controllers, deck_threads, audio_processor_handles) = unzip_array3(deck_tuples);
+    let (mut controllers, drivers, audio_processor_handles, deck_slots) = unzip_array4(deck_tuples);
 
-    let worker_channels: [_; DECKS] =
-        std::array::from_fn(|i| deck_threads[i].deck_worker_channel());
-    let started_deck_threads = deck_threads.map(|thread| thread.start());
+    let started_drivers = drivers.map(PlatterDriver::start);
 
     let stream = start_deck(
         buffer_frames_n,
@@ -157,11 +151,10 @@ fn run_app<const DECKS: usize>(
     )
     .unwrap();
 
-    let record_changer = record_changer::start(
+    let tray = tray::start(
         tray_rcv,
-        worker_channels,
+        deck_slots,
         Arc::clone(&tray_state),
-        used_records_rcv,
         app_status.clone(),
         Arc::clone(&shutdown),
     );
@@ -186,12 +179,12 @@ fn run_app<const DECKS: usize>(
         match input_event {
             InputEvent::App(AppEvent::Quit) => break,
 
-            // Only stages the track. Which deck it ends up on is decided later, by
-            // whoever commits it: Enter here, a LOAD button on a MIDI controller.
-            InputEvent::App(AppEvent::PrepareTrack(path)) => log_try_send(
+            // Only prepares the record. Which deck it ends up on is decided later,
+            // by whoever loads it: Enter here, a LOAD button on a MIDI controller.
+            InputEvent::App(AppEvent::PrepareRecord(path)) => log_try_send(
                 &tray_snd,
-                RecordChangerCommand::Prepare { path },
-                "stage track",
+                TrayCommand::PrepareRecord { path },
+                "prepare record",
             ),
 
             InputEvent::Deck(deck_idx, event) => {
@@ -205,12 +198,18 @@ fn run_app<const DECKS: usize>(
     drop(stream);
     shutdown.store(true, Ordering::Relaxed);
 
-    if let Err(_) = record_changer.join() {
-        log::error!("Record changer panicked");
+    if let Err(_) = tray.join() {
+        log::error!("Record tray panicked");
     }
 
     // Join all platter driver threads
-    let platter_drivers = started_deck_threads.map(DeckJoinHandle::join);
+    let platter_drivers = started_drivers.map(|handle| match handle.join() {
+        Ok(driver) => Some(driver),
+        Err(e) => {
+            log::error!("Platter driver panicked: {e:?}");
+            None
+        }
+    });
 
     if let Err(_) = tui_handle.join() {
         log::error!("TUI thread panicked");
