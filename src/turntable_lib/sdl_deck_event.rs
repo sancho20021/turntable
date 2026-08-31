@@ -98,6 +98,7 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
             Keycode::Up => Some(deck_event::Event::PitchUp),
             Keycode::Down => Some(deck_event::Event::PitchDown),
             Keycode::Space => Some(deck_event::Event::StartStop),
+            Keycode::Return | Keycode::KpEnter => Some(deck_event::Event::CommitStaged),
             Keycode::Right => Some(deck_event::Event::PlayheadFF),
             Keycode::Left => {
                 if is_shift {

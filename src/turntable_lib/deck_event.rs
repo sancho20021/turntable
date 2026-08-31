@@ -63,7 +63,8 @@ pub enum Event {
     PitchDown,
     /// Absolute pitch, 1.0 = nominal speed (tempo fader).
     SetPitch(f64),
-    LoadTrack(String),
+    /// Put the track staged in the record tray on this deck.
+    CommitStaged,
     PlayheadReset,
     PlayheadFF,
     PlayheadRewind,

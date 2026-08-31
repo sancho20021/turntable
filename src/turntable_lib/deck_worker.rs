@@ -15,15 +15,12 @@ use crate::{
     deck_thread::DeckId,
     platter_driver::{Jump, PlatterEvent},
     record::Record,
-    record_changer::RecordChangerCommand,
     utils::log_try_send,
 };
 
 #[derive(Debug)]
 pub enum DeckWorkerEvent {
-    /// Load the record
-    LoadRecord(String),
-    /// Change record after successful loading
+    /// Put a record staged by the tray on this deck
     ChangeRecord(Record, RecordInfo),
 }
 
@@ -38,8 +35,8 @@ pub struct DeckWorker {
     event_receiver: Receiver<DeckWorkerEvent>,
     // so the controller can clone and hand out senders
     event_sender: Sender<DeckWorkerEvent>,
-    /// communication channel with record changer
-    record_changer: Sender<RecordChangerCommand>,
+    /// records handed back by the audio thread go here to be freed
+    disposer: Sender<Record>,
 
     /// audio thread sends used records
     dispose_record: Consumer<Record>,
@@ -54,7 +51,7 @@ impl DeckWorker {
         adjust_playhead: Sender<PlatterEvent>,
         event_receiver: Receiver<DeckWorkerEvent>,
         event_sender: Sender<DeckWorkerEvent>,
-        record_changer: Sender<RecordChangerCommand>,
+        disposer: Sender<Record>,
         dispose_record: Consumer<Record>,
         change_record: Producer<Record>,
         shutdown: Arc<AtomicBool>,
@@ -68,7 +65,7 @@ impl DeckWorker {
             adjust_playhead,
             event_receiver,
             event_sender,
-            record_changer,
+            disposer,
             dispose_record,
             change_record,
             app_status,
@@ -87,8 +84,8 @@ impl DeckWorker {
                 // 1. Drain used records returned from the audio thread
                 while let Ok(used_record) = self.dispose_record.pop() {
                     log_try_send(
-                        &self.record_changer,
-                        RecordChangerCommand::Dispose(used_record),
+                        &self.disposer,
+                        used_record,
                         "forward returned record to disposer",
                     );
                 }
@@ -137,23 +134,9 @@ impl DeckWorker {
                     }
                     Err(rtrb::PushError::Full(rejected_record)) => {
                         log::error!("Failed to change record, audio thread record queue is full");
-                        log_try_send(
-                            &self.record_changer,
-                            RecordChangerCommand::Dispose(rejected_record),
-                            "dispose rejected record",
-                        );
+                        log_try_send(&self.disposer, rejected_record, "dispose rejected record");
                     }
                 }
-            }
-            DeckWorkerEvent::LoadRecord(record) => {
-                log_try_send(
-                    &self.record_changer,
-                    RecordChangerCommand::Load {
-                        deck_id: self.deck_id,
-                        path: record,
-                    },
-                    "request load track",
-                );
             }
         }
     }

@@ -1,7 +1,7 @@
 use std::{
     array,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -16,17 +16,17 @@ use crossbeam::channel::bounded;
 
 use turntable_lib::{
     deck_controller::{self, AppStatus, DeckController},
-    deck_event::{self, AppEvent, DeckEvent, InputEvent},
+    deck_event::{AppEvent, DeckEvent, InputEvent},
     deck_thread::{DeckId, DeckJoinHandle},
     decoder::SAMPLE_RATE,
     input_profile::InputProfile,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     ratatui::spawn_tui_thread,
-    record_changer,
+    record_changer::{self, RecordChangerCommand, TrayState},
     samples_poller::{DeckRouting, SamplesPoller},
     sdl_deck_event::DeckEventMapper,
     telemetry,
-    utils::unzip_array3,
+    utils::{log_try_send, unzip_array3},
 };
 
 /// Main app loop
@@ -119,7 +119,11 @@ fn run_app<const DECKS: usize>(
 
     let mut pump = sdl.event_pump().unwrap();
 
-    let (requested_record_snd, requested_rec_rcv) = bounded(3);
+    // staging and committing records
+    let (tray_snd, tray_rcv) = bounded(3);
+    // records handed back by the audio thread, to be freed off the deck threads
+    let (used_records_snd, used_records_rcv) = bounded(4);
+    let tray_state = Arc::new(RwLock::new(TrayState::Empty));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let input_profile = InputProfile::touchpad(touchpad_sensitivity);
@@ -131,7 +135,8 @@ fn run_app<const DECKS: usize>(
             input_profile,
             motor_inertia_secs,
             nudge_responsiveness,
-            requested_record_snd.clone(),
+            tray_snd.clone(),
+            used_records_snd.clone(),
             Arc::clone(&shutdown),
             buffer_frames_n as usize,
             &app_status,
@@ -153,8 +158,10 @@ fn run_app<const DECKS: usize>(
     .unwrap();
 
     let record_changer = record_changer::start(
-        requested_rec_rcv,
+        tray_rcv,
         worker_channels,
+        Arc::clone(&tray_state),
+        used_records_rcv,
         app_status.clone(),
         Arc::clone(&shutdown),
     );
@@ -179,17 +186,12 @@ fn run_app<const DECKS: usize>(
         match input_event {
             InputEvent::App(AppEvent::Quit) => break,
 
-            // A staged track goes straight onto the active deck for now. Once the
-            // record tray exists this becomes a `Prepare` command to the tray, and
-            // the deck is picked later by whoever commits it (LOAD button, or the
-            // SDL source auto-committing on drop).
-            InputEvent::App(AppEvent::PrepareTrack(path)) => dispatch_to_deck(
-                &mut controllers,
-                event_mapper.active_deck.load(Ordering::Relaxed),
-                DeckEvent {
-                    event: deck_event::Event::LoadTrack(path),
-                    timestamp: now,
-                },
+            // Only stages the track. Which deck it ends up on is decided later, by
+            // whoever commits it: Enter here, a LOAD button on a MIDI controller.
+            InputEvent::App(AppEvent::PrepareTrack(path)) => log_try_send(
+                &tray_snd,
+                RecordChangerCommand::Prepare { path },
+                "stage track",
             ),
 
             InputEvent::Deck(deck_idx, event) => {

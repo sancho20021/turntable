@@ -15,12 +15,12 @@ use crossbeam::{
 use crate::{
     deck_event::{self, DeckEvent},
     deck_thread::{DeckId, DeckThread},
-    deck_worker::{DeckWorker, DeckWorkerEvent},
+    deck_worker::DeckWorker,
     filters::FirstOrderLPF,
     input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
-    record::{INanos, UNanos},
+    record::{INanos, Record, UNanos},
     record_changer::RecordChangerCommand,
     record_mouse,
     telemetry::TelemetryTrace,
@@ -80,8 +80,10 @@ impl DeckState {
 /// Deck controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
 pub struct DeckController {
+    deck_id: DeckId,
     state: Arc<DeckState>,
-    deck_worker: Sender<DeckWorkerEvent>,
+    /// to stage and commit records, see [`crate::record_changer`]
+    tray: Sender<RecordChangerCommand>,
     platter_events: Sender<PlatterEvent>,
     platter: ReadablePlatter,
     /// input speed smoothing, see [`InputProfile::speed_smoothing_tau_secs`]
@@ -103,7 +105,8 @@ pub fn new_deck(
     input: InputProfile,
     inertia_tau_secs: f64,
     nudge_responsiveness: f32,
-    record_changer: Sender<RecordChangerCommand>,
+    tray: Sender<RecordChangerCommand>,
+    disposer: Sender<Record>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
     app_status: &AppStatus,
@@ -132,7 +135,7 @@ pub fn new_deck(
         pl_snd.clone(),
         event_rcv,
         event_snd,
-        record_changer,
+        disposer,
         used_records_cons,
         new_record_prod,
         Arc::clone(&shutdown),
@@ -154,9 +157,10 @@ pub fn new_deck(
     let deck_thread = DeckThread::new(deck_worker, driver);
     (
         DeckController {
+            deck_id,
             state: Arc::clone(&initial_state),
+            tray,
             platter: readable_platter,
-            deck_worker: deck_thread.deck_worker_channel(),
             platter_events: pl_snd,
             tracer: TelemetryTrace::new(),
             input_speed: FirstOrderLPF::new(input.speed_smoothing_tau_secs),
@@ -265,10 +269,12 @@ impl DeckController {
                 self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch)
             }
             deck_event::Event::StartStop => self.start_or_stop(),
-            deck_event::Event::LoadTrack(track) => log_try_send(
-                &self.deck_worker,
-                DeckWorkerEvent::LoadRecord(track),
-                "load record",
+            deck_event::Event::CommitStaged => log_try_send(
+                &self.tray,
+                RecordChangerCommand::Commit {
+                    deck_id: self.deck_id,
+                },
+                "commit staged record",
             ),
             deck_event::Event::PlayheadReset => log_try_send(
                 &self.platter_events,
