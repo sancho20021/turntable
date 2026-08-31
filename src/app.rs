@@ -4,7 +4,8 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -12,7 +13,7 @@ use cpal::{
     BufferSize, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use crossbeam::channel::bounded;
+use crossbeam::channel::{Receiver, Sender, bounded};
 
 use turntable_lib::{
     deck_controller::{self, AppStatus, DeckController, DeckId},
@@ -139,7 +140,7 @@ fn run_app<const DECKS: usize>(
         )
     });
 
-    let (mut controllers, drivers, audio_processor_handles, deck_slots) = unzip_array4(deck_tuples);
+    let (controllers, drivers, audio_processor_handles, deck_slots) = unzip_array4(deck_tuples);
 
     let started_drivers = drivers.map(PlatterDriver::start);
 
@@ -170,26 +171,34 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
+    // Input sources produce events; the dispatcher applies them. Keeping those
+    // apart is what lets a source live on a thread it does not own - SDL's pump
+    // must stay on the thread that initialised video, and a MIDI callback runs on
+    // a driver thread we are only handed.
+    let (events_snd, events_rcv) = bounded(EVENT_QUEUE_LEN);
+    let dispatcher = spawn_dispatcher(
+        events_rcv,
+        controllers,
+        tray_snd.clone(),
+        Arc::clone(&shutdown),
+    );
+
+    // From here on the main thread is nothing but the SDL input source.
     for event in pump.wait_iter() {
         let now = Instant::now();
         let Some(input_event) = event_mapper.to_input_event(event, now) else {
             continue;
         };
 
-        match input_event {
-            InputEvent::App(AppEvent::Quit) => break,
+        // `wait_iter` cannot be interrupted from outside, so this thread has to
+        // recognise its own stop signal on the way past.
+        if matches!(input_event, InputEvent::App(AppEvent::Quit)) {
+            break;
+        }
 
-            // Only prepares the record. Which deck it ends up on is decided later,
-            // by whoever loads it: Enter here, a LOAD button on a MIDI controller.
-            InputEvent::App(AppEvent::PrepareRecord(path)) => log_try_send(
-                &tray_snd,
-                TrayCommand::PrepareRecord { path },
-                "prepare record",
-            ),
-
-            InputEvent::Deck(deck_idx, event) => {
-                dispatch_to_deck(&mut controllers, deck_idx, event)
-            }
+        if events_snd.send(input_event).is_err() {
+            log::error!("Dispatcher is gone, stopping input");
+            break;
         }
     }
 
@@ -197,6 +206,14 @@ fn run_app<const DECKS: usize>(
     log::info!("Stopping the app");
     drop(stream);
     shutdown.store(true, Ordering::Relaxed);
+
+    let controllers = match dispatcher.join() {
+        Ok(controllers) => Some(controllers),
+        Err(e) => {
+            log::error!("Dispatcher panicked: {e:?}");
+            None
+        }
+    };
 
     if let Err(_) = tray.join() {
         log::error!("Record tray panicked");
@@ -217,7 +234,7 @@ fn run_app<const DECKS: usize>(
 
     // 5. Consolidate telemetry tracers across controllers and driver threads
     let mut tracers = Vec::with_capacity(DECKS * 2);
-    for controller in controllers {
+    for controller in controllers.into_iter().flatten() {
         tracers.push(controller.tracer);
     }
     for driver in platter_drivers.into_iter().flatten() {
@@ -225,6 +242,50 @@ fn run_app<const DECKS: usize>(
     }
 
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
+}
+
+/// Input events buffered between the sources and the dispatcher. Deep enough
+/// that a burst of scratch motion never has to wait; sources block rather than
+/// drop if it ever fills, since a lost scratch position is a heard glitch.
+const EVENT_QUEUE_LEN: usize = 1024;
+
+/// Applies input events to the decks, and owns the controllers while doing so.
+///
+/// Returns them on join, so teardown can still collect their telemetry.
+fn spawn_dispatcher<const DECKS: usize>(
+    events: Receiver<InputEvent>,
+    mut controllers: [DeckController; DECKS],
+    tray: Sender<TrayCommand>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<[DeckController; DECKS]> {
+    std::thread::spawn(move || {
+        while !shutdown.load(Ordering::Relaxed) {
+            let event = match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => event,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            };
+
+            match event {
+                // Stopping is the main thread's job: it drops the audio stream
+                // before the platter threads. Returning is how it hears about it.
+                InputEvent::App(AppEvent::Quit) => break,
+
+                // Only prepares the record. Which deck it ends up on is decided
+                // later, by whoever loads it: Enter here, a LOAD button on MIDI.
+                InputEvent::App(AppEvent::PrepareRecord(path)) => {
+                    log_try_send(&tray, TrayCommand::PrepareRecord { path }, "prepare record")
+                }
+
+                InputEvent::Deck(deck_idx, event) => {
+                    dispatch_to_deck(&mut controllers, deck_idx, event)
+                }
+            }
+        }
+
+        log::info!("Dispatcher stopped");
+        controllers
+    })
 }
 
 /// Hands one deck event to its controller, complaining if the deck does not exist.
