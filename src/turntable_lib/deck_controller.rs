@@ -19,7 +19,7 @@ use crate::{
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
     record::{INanos, UNanos},
-    record_mouse,
+    record_input,
     telemetry::TelemetryTrace,
     tray::{DeckSlot, TrayCommand},
     utils::log_try_send,
@@ -196,13 +196,23 @@ impl DeckController {
                 timestamp: new_timestamp,
             };
             self.state.platter.store(new_state);
-            record_mouse!(self.tracer, new_timestamp, "latest_mouse_x", x as f64);
+            record_input!(
+                self.tracer,
+                new_timestamp,
+                format!("latest_input_{}", self.deck_id),
+                x as f64
+            );
             if let Some(s) = speed {
-                record_mouse!(self.tracer, new_timestamp, "raw_mouse_speed", s);
-                record_mouse!(
+                record_input!(
                     self.tracer,
                     new_timestamp,
-                    "mouse_dt_us",
+                    format!("raw_input_speed_{}", self.deck_id),
+                    s
+                );
+                record_input!(
+                    self.tracer,
+                    new_timestamp,
+                    format!("input_dt_us_{}", self.deck_id),
                     dt_secs * 1_000_000.
                 );
             }
@@ -220,7 +230,12 @@ impl DeckController {
                 timestamp: tstmp,
             };
             self.state.platter.store(scratch_state);
-            record_mouse!(self.tracer, tstmp, "latest_mouse_x", x as f64)
+            record_input!(
+                self.tracer,
+                tstmp,
+                format!("latest_input_{}", self.deck_id),
+                x as f64
+            )
         }
     }
 

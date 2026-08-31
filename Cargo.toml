@@ -10,7 +10,7 @@ path = "src/turntable_lib/mod.rs"
 [features]
 default = []
 
-trace-mouse = []
+trace-input = []
 
 [dependencies]
 

@@ -16,7 +16,7 @@ use crate::{
     physical_speed::Speed,
     platter_audio_processor::PlatterAudioProcessor,
     record::{INanos, UNanos},
-    record_mouse,
+    record_input,
     telemetry::TelemetryTrace,
     virtual_platter::{PlatterSample, WritablePlatter},
 };
@@ -194,10 +194,10 @@ impl PlatterDriver {
                         )
                     };
 
-                    record_mouse!(
+                    record_input!(
                         self.tracer,
                         now,
-                        format!("extrapolated_mouse_x_{}", self.deck_id),
+                        format!("extrapolated_input_{}", self.deck_id),
                         extrapolated_input
                     );
 
@@ -209,10 +209,10 @@ impl PlatterDriver {
                         + (latest_input as f64 * (1.0 - convergence_weight))
                 };
 
-                record_mouse!(
+                record_input!(
                     self.tracer,
                     now,
-                    format!("converged_mouse_x_{}", self.deck_id),
+                    format!("converged_input_{}", self.deck_id),
                     cur_input
                 );
 
