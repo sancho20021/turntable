@@ -12,10 +12,15 @@
 //! devices are collected here instead of being hardcoded where they are used.
 //! Two devices with the same profile behave identically.
 
+use crate::midi::flx4::JOG_TICKS_PER_REVOLUTION;
+
 /// Record time travelled per touchpad pixel at `sensitivity = 1.0`, in
 /// nanoseconds. Chosen so that dragging across a 600 px window scratches
 /// through roughly 0.9 s of audio.
 const TOUCHPAD_BASE_SENSITIVITY: f64 = 1_500_000.0;
+
+/// One revolution of a record at 33 1/3 rpm, in nanoseconds (60 / 33.333 s).
+const RECORD_REVOLUTION_NANOS: u64 = 1_800_000_000;
 
 /// Tuning constants of one scratch input device.
 ///
@@ -71,6 +76,27 @@ impl InputProfile {
         Self {
             nanos_per_input_unit: sensitivity * TOUCHPAD_BASE_SENSITIVITY,
             max_drift_units: 50,
+            convergence_lambda: 50.0,
+            speed_smoothing_tau_secs: 0.01,
+        }
+    }
+
+    /// Profile for a jog wheel: input units are encoder ticks, accumulated by
+    /// [`crate::midi::flx4::Decoder`] into an absolute wheel position.
+    ///
+    /// The gain makes the wheel behave like the record it stands in for: one
+    /// revolution covers [`RECORD_REVOLUTION_NANOS`] of audio, the same as a
+    /// platter at 33 1/3 rpm, so a full turn of the wheel is a full turn of the
+    /// record.
+    ///
+    /// The remaining three are the touchpad's values as a starting point. Jog
+    /// ticks arrive at a different rate and quantisation, so they want tuning
+    /// against a `trace-input` capture rather than trust.
+    pub fn jog_wheel(sensitivity: f64) -> Self {
+        let nanos_per_tick = RECORD_REVOLUTION_NANOS as f64 / JOG_TICKS_PER_REVOLUTION as f64;
+        Self {
+            nanos_per_input_unit: sensitivity * nanos_per_tick,
+            max_drift_units: 20,
             convergence_lambda: 50.0,
             speed_smoothing_tau_secs: 0.01,
         }

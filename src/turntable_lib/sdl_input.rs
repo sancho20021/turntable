@@ -23,16 +23,16 @@ use crate::{
 
 pub struct SdlInputMapper<const DECKS: usize> {
     /// Deck that keyboard and mouse gestures are addressed to, picked with the
-    /// number keys. Owned by this source: it is a keyboard concept, and a MIDI
-    /// controller (which names its deck per message) will not have one.
-    pub active_deck: Arc<AtomicUsize>,
+    /// number keys. A keyboard concept: a MIDI controller names its deck in
+    /// every message and has none, which is why the TUI takes it as an option.
+    active_deck: Arc<AtomicUsize>,
     app_status: AppStatus,
 }
 
 impl<const DECKS: usize> SdlInputMapper<DECKS> {
-    pub fn new(app_status: AppStatus) -> Self {
+    pub fn new(active_deck: Arc<AtomicUsize>, app_status: AppStatus) -> Self {
         Self {
-            active_deck: Arc::new(AtomicUsize::new(0)),
+            active_deck,
             app_status,
         }
     }

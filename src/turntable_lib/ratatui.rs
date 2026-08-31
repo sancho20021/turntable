@@ -44,8 +44,11 @@ fn format_nanos(nanos: INanos) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
+/// `active_deck` is `None` when no input device has such a concept - a MIDI
+/// controller addresses decks directly - and the display drops the marker and
+/// the keyboard hint accordingly.
 pub fn spawn_tui_thread<const DECKS: usize>(
-    active_deck: Arc<AtomicUsize>,
+    active_deck: Option<Arc<AtomicUsize>>,
     deck_states: [Arc<DeckState>; DECKS],
     platters: [ReadablePlatter; DECKS],
     tray_state: Arc<RwLock<TrayState>>,
@@ -67,7 +70,9 @@ pub fn spawn_tui_thread<const DECKS: usize>(
         while !shutdown.load(Ordering::Relaxed) {
             let frame_start = Instant::now();
 
-            let current_active = active_deck.load(Ordering::Relaxed);
+            let current_active = active_deck
+                .as_ref()
+                .map(|deck| deck.load(Ordering::Relaxed));
             let status = app_status.get();
             let tray = tray_state.read().ok().map(|tray| tray.clone());
 
@@ -264,7 +269,7 @@ fn spinner(elapsed: Duration) -> char {
 }
 
 /// One line describing what is in the tray, and how it should be coloured.
-fn tray_line(tray: Option<TrayState>, active_deck_idx: usize) -> (String, Style) {
+fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String, Style) {
     let Some(tray) = tray else {
         return (
             "tray state unavailable, lock poisoned (tray thread may be dead)".to_string(),
@@ -291,17 +296,22 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: usize) -> (String, Style)
             )
         }
 
-        TrayState::Ready { info } => (
-            format!(
-                "●  ready        {:<44} {}   Enter → load on Deck {}",
-                file_name(&info.path),
-                format_nanos(INanos(info.duration.0 as i64)),
-                active_deck_idx + 1,
-            ),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
+        TrayState::Ready { info } => {
+            let hint = match active_deck_idx {
+                Some(idx) => format!("Enter → load on Deck {}", idx + 1),
+                None => "press LOAD on a deck".to_string(),
+            };
+            (
+                format!(
+                    "●  ready        {:<44} {}   {hint}",
+                    file_name(&info.path),
+                    format_nanos(INanos(info.duration.0 as i64)),
+                ),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }
 
         TrayState::Failed { path, error } => (
             format!("✗  failed       {:<44} {error}", file_name(&path)),
@@ -314,7 +324,7 @@ fn render_tui<const DECKS: usize>(
     frame: &mut Frame,
     deck_states: &[Arc<DeckState>; DECKS],
     platters: &[ReadablePlatter; DECKS],
-    active_deck_idx: usize,
+    active_deck_idx: Option<usize>,
     tray: Option<TrayState>,
     status: Option<String>,
 ) {
@@ -344,7 +354,7 @@ fn render_tui<const DECKS: usize>(
         let state = &deck_states[idx];
         let platter = &platters[idx];
 
-        let is_target = idx == active_deck_idx;
+        let is_target = active_deck_idx == Some(idx);
 
         // 1. Highlight active control deck
         let (prefix, row_style) = if is_target {

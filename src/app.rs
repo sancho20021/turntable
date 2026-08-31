@@ -2,7 +2,7 @@ use std::{
     array,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -15,11 +15,13 @@ use cpal::{
 };
 use crossbeam::channel::{Receiver, Sender, bounded};
 
+use crate::InputKind;
 use turntable_lib::{
     deck_controller::{self, AppStatus, DeckController, DeckId},
     decoder::SAMPLE_RATE,
     input_event::{AppEvent, DeckEvent, InputEvent},
     input_profile::InputProfile,
+    midi,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
@@ -30,113 +32,77 @@ use turntable_lib::{
     utils::{log_try_send, unzip_array4},
 };
 
-/// Main app loop
+/// Everything the app was asked to do, as parsed from the command line.
+pub struct Options<'a> {
+    pub input: InputKind,
+    pub midi_port: Option<&'a str>,
+    /// tempo fader range as a fraction, 0.08 = +/-8%
+    pub pitch_range: f64,
+    pub deck_routing: &'a [usize],
+    pub device_query: Option<&'a str>,
+    pub motor_inertia_secs: f64,
+    /// scratch sensitivity factor, applied to whichever input is in use
+    pub sensitivity: f64,
+    /// audio buffer in frames
+    pub buffer_frames_n: u32,
+    pub nudge_responsiveness: f32,
+}
+
+/// Turns the runtime deck count into the const generic the engine is built on.
 macro_rules! dispatch_app {
-    ($decks:expr, $routing_slice:expr, $device_query:expr, $($args:expr),* $(,)?) => {{
-        let routing_array: [usize; $decks] = $routing_slice
+    ($decks:expr, $options:expr) => {{
+        let routing: [usize; $decks] = $options
+            .deck_routing
             .try_into()
             .expect("Routing slice length does not match deck count");
-        run_app::<$decks>(
-            routing_array,
-            $device_query,
-            $($args),*
-        );
+        run_app::<$decks>(routing, &$options);
     }};
 }
 
 /// Main app loop entrypoint.
-pub fn start(
-    deck_routing: &[usize],
-    device_query: Option<&str>,
-    motor_inertia_secs: f64,
-    touchpad_sensitivity: f64,
-    // buffer in frames
-    buffer_frames_n: u32,
-    nudge_responsiveness: f32,
-) {
-    let decks = deck_routing.len();
-
-    match decks {
-        1 => dispatch_app!(
-            1,
-            deck_routing,
-            device_query,
-            motor_inertia_secs,
-            touchpad_sensitivity,
-            buffer_frames_n,
-            nudge_responsiveness
-        ),
-        2 => dispatch_app!(
-            2,
-            deck_routing,
-            device_query,
-            motor_inertia_secs,
-            touchpad_sensitivity,
-            buffer_frames_n,
-            nudge_responsiveness
-        ),
-        3 => dispatch_app!(
-            3,
-            deck_routing,
-            device_query,
-            motor_inertia_secs,
-            touchpad_sensitivity,
-            buffer_frames_n,
-            nudge_responsiveness
-        ),
-        4 => dispatch_app!(
-            4,
-            deck_routing,
-            device_query,
-            motor_inertia_secs,
-            touchpad_sensitivity,
-            buffer_frames_n,
-            nudge_responsiveness
-        ),
+pub fn start(options: Options) {
+    match options.deck_routing.len() {
+        1 => dispatch_app!(1, options),
+        2 => dispatch_app!(2, options),
+        3 => dispatch_app!(3, options),
+        4 => dispatch_app!(4, options),
         _ => panic!("Maximum 4 decks supported"),
     }
 }
 
-fn run_app<const DECKS: usize>(
-    deck_routing: [usize; DECKS],
-    device_query: Option<&str>,
-    motor_inertia_secs: f64,
-    touchpad_sensitivity: f64,
-    // buffer in frames
-    buffer_frames_n: u32,
-    nudge_responsiveness: f32,
-) {
+fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) {
     let app_status = AppStatus::new();
-    app_status.set(format!("Drag and drop a music file to start"));
-
-    let sdl = sdl2::init().unwrap();
-    let video = sdl.video().unwrap();
-
-    let _window = video
-        .window("scratch input", 600, 300)
-        .position_centered()
-        .build()
-        .unwrap();
-
-    let mut pump = sdl.event_pump().unwrap();
 
     // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);
     let tray_state = Arc::new(RwLock::new(TrayState::Empty));
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    let input_profile = InputProfile::touchpad(touchpad_sensitivity);
+    // One input unit is a touchpad pixel or a jog wheel tick depending on what
+    // is driving the decks, which is the only thing the engine needs to be told
+    // about the difference.
+    let input_profile = match options.input {
+        InputKind::Touchpad => InputProfile::touchpad(options.sensitivity),
+        InputKind::Midi => InputProfile::jog_wheel(options.sensitivity),
+    };
+
+    // Only the keyboard has a notion of an active deck; a MIDI controller names
+    // its deck in every message.
+    let active_deck = match options.input {
+        InputKind::Touchpad => Some(Arc::new(AtomicUsize::new(0))),
+        InputKind::Midi => None,
+    };
 
     let deck_tuples = std::array::from_fn(|deck_idx| {
         deck_controller::new_deck(
             deck_idx,
             1.0,
             input_profile,
-            motor_inertia_secs,
-            nudge_responsiveness,
+            options.motor_inertia_secs,
+            options.nudge_responsiveness,
             tray_snd.clone(),
             Arc::clone(&shutdown),
-            buffer_frames_n as usize,
+            options.buffer_frames_n as usize,
         )
     });
 
@@ -145,10 +111,10 @@ fn run_app<const DECKS: usize>(
     let started_drivers = drivers.map(PlatterDriver::start);
 
     let stream = start_deck(
-        buffer_frames_n,
+        options.buffer_frames_n,
         audio_processor_handles,
         deck_routing,
-        device_query,
+        options.device_query,
     )
     .unwrap();
 
@@ -160,8 +126,6 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
-    let mut event_mapper = SdlInputMapper::<DECKS>::new(app_status.clone());
-
     // Input sources produce events; the dispatcher applies them. Keeping those
     // apart is what lets a source live on a thread it does not own - SDL's pump
     // must stay on the thread that initialised video, the TUI is busy drawing,
@@ -170,7 +134,7 @@ fn run_app<const DECKS: usize>(
 
     // Spawn polling TUI thread, which doubles as the drag and drop source
     let tui_handle = spawn_tui_thread::<DECKS>(
-        Arc::clone(&event_mapper.active_deck),
+        active_deck.clone(),
         array::from_fn(|i| controllers[i].get_state()),
         array::from_fn(|i| controllers[i].get_platter()),
         Arc::clone(&tray_state),
@@ -186,29 +150,15 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
-    // From here on the main thread is nothing but the SDL input source.
-    //
-    // The wait has a timeout only so that a quit raised somewhere else - Ctrl-C
-    // in the TUI, a MIDI controller later - is noticed within it. Events arriving
-    // on the pump still wake it immediately, so input latency is untouched.
-    while !dispatcher.is_finished() {
-        let Some(event) = pump.wait_event_timeout(QUIT_POLL_MS) else {
-            continue;
-        };
-
-        let now = Instant::now();
-        let Some(input_event) = event_mapper.to_input_event(event, now) else {
-            continue;
-        };
-
-        if matches!(input_event, InputEvent::App(AppEvent::Quit)) {
-            break;
-        }
-
-        if events_snd.send(input_event).is_err() {
-            log::error!("Dispatcher is gone, stopping input");
-            break;
-        }
+    // Whichever source owns the main thread blocks here until the app stops.
+    match options.input {
+        InputKind::Touchpad => run_sdl_source::<DECKS>(
+            active_deck.expect("touchpad input always has an active deck"),
+            app_status.clone(),
+            &events_snd,
+            &dispatcher,
+        ),
+        InputKind::Midi => run_midi_source(options, &events_snd, &dispatcher),
     }
 
     // 4. Teardown & Thread Joining
@@ -251,6 +201,75 @@ fn run_app<const DECKS: usize>(
     }
 
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
+}
+
+/// Runs the SDL window as the input source, returning when the app should stop.
+///
+/// SDL is only initialised here, so a MIDI-driven run opens no window at all.
+fn run_sdl_source<const DECKS: usize>(
+    active_deck: Arc<AtomicUsize>,
+    app_status: AppStatus,
+    events: &Sender<InputEvent>,
+    dispatcher: &JoinHandle<[DeckController; DECKS]>,
+) {
+    let sdl = sdl2::init().unwrap();
+    let video = sdl.video().unwrap();
+
+    let _window = video
+        .window("scratch input", 600, 300)
+        .position_centered()
+        .build()
+        .unwrap();
+
+    let mut pump = sdl.event_pump().unwrap();
+    let mut mapper = SdlInputMapper::<DECKS>::new(active_deck, app_status);
+
+    // The wait has a timeout only so that a quit raised somewhere else - Ctrl-C
+    // in the TUI - is noticed within it. Events arriving on the pump still wake
+    // it immediately, so input latency is untouched.
+    while !dispatcher.is_finished() {
+        let Some(event) = pump.wait_event_timeout(QUIT_POLL_MS) else {
+            continue;
+        };
+
+        let now = Instant::now();
+        let Some(input_event) = mapper.to_input_event(event, now) else {
+            continue;
+        };
+
+        if matches!(input_event, InputEvent::App(AppEvent::Quit)) {
+            break;
+        }
+
+        if events.send(input_event).is_err() {
+            log::error!("Dispatcher is gone, stopping input");
+            break;
+        }
+    }
+}
+
+/// Opens the MIDI controller and parks until the app should stop.
+///
+/// There is nothing for the main thread to do: midir runs the callback on its
+/// own driver thread, and quitting comes from the TUI.
+fn run_midi_source<const DECKS: usize>(
+    options: &Options,
+    events: &Sender<InputEvent>,
+    dispatcher: &JoinHandle<[DeckController; DECKS]>,
+) {
+    let _connection = match midi::start(options.midi_port, options.pitch_range, events.clone()) {
+        // held for the whole run: dropping it closes the port
+        Ok(connection) => connection,
+        Err(e) => {
+            log::error!("Cannot start MIDI input: {e}");
+            eprintln!("Cannot start MIDI input: {e}");
+            return;
+        }
+    };
+
+    while !dispatcher.is_finished() {
+        std::thread::sleep(Duration::from_millis(QUIT_POLL_MS as u64));
+    }
 }
 
 /// How long the SDL pump blocks before checking whether the app is stopping.
