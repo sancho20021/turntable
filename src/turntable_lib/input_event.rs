@@ -27,9 +27,12 @@ pub enum AppEvent {
     Quit,
 }
 
+/// A deck command, with the moment the input device produced it. Scratch timing
+/// is derived from these timestamps, so they are taken at the source rather than
+/// wherever the command is finally applied.
 #[derive(Debug)]
 pub struct DeckEvent {
-    pub event: Event,
+    pub command: DeckCommand,
     pub timestamp: Instant,
 }
 
@@ -39,16 +42,16 @@ pub enum Direction {
     Backward,
 }
 
-/// A device-independent deck command.
+/// What one deck was told to do, independent of the device that said so.
 ///
 /// The scratch variants carry an absolute **input position** in *input units*,
 /// whose physical meaning is defined by the source device and its
 /// [`crate::input_profile::InputProfile`] (touchpad pixels, jog wheel ticks).
 /// The position only has to be absolute and monotonic in the direction of
 /// travel; its origin is irrelevant, since scratching is anchored on the
-/// position seen at [`Event::ScratchStart`].
+/// position seen at [`DeckCommand::ScratchStart`].
 #[derive(Debug)]
-pub enum Event {
+pub enum DeckCommand {
     /// The user grabbed the platter (mouse down / jog wheel touched).
     ScratchStart(i64),
     /// New input position while the platter is held.

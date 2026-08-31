@@ -1,4 +1,6 @@
-//! Input source: the SDL window (mouse, keyboard, drag & drop).
+//! Input source: the SDL window (mouse and keyboard).
+//!
+//! Records are dropped on the TUI, not here - see [`crate::ratatui`].
 
 use std::{
     sync::{
@@ -16,10 +18,10 @@ use sdl2::{
 
 use crate::{
     deck_controller::{AppStatus, DeckId},
-    deck_event::{self, AppEvent, DeckEvent, Direction, InputEvent},
+    input_event::{AppEvent, DeckCommand, DeckEvent, Direction, InputEvent},
 };
 
-pub struct DeckEventMapper<const DECKS: usize> {
+pub struct SdlInputMapper<const DECKS: usize> {
     /// Deck that keyboard and mouse gestures are addressed to, picked with the
     /// number keys. Owned by this source: it is a keyboard concept, and a MIDI
     /// controller (which names its deck per message) will not have one.
@@ -27,7 +29,7 @@ pub struct DeckEventMapper<const DECKS: usize> {
     app_status: AppStatus,
 }
 
-impl<const DECKS: usize> DeckEventMapper<DECKS> {
+impl<const DECKS: usize> SdlInputMapper<DECKS> {
     pub fn new(app_status: AppStatus) -> Self {
         Self {
             active_deck: Arc::new(AtomicUsize::new(0)),
@@ -36,29 +38,23 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
     }
 
     pub fn to_input_event(&mut self, event: Event, timestamp: Instant) -> Option<InputEvent> {
-        let deck_event = match event {
+        let command = match event {
             Event::Quit { .. } => return Some(InputEvent::App(AppEvent::Quit)),
-
-            // A dropped file goes in the record tray, not on a deck: which deck it
-            // ends up on is decided by whoever loads it out of the tray.
-            Event::DropFile { filename, .. } => {
-                return Some(InputEvent::App(AppEvent::PrepareRecord(filename)));
-            }
 
             // The touchpad's input unit is one screen pixel of horizontal travel,
             // see `InputProfile::touchpad`.
-            Event::MouseMotion { x, .. } => deck_event::Event::ScratchMove(x as i64),
+            Event::MouseMotion { x, .. } => DeckCommand::ScratchMove(x as i64),
 
             Event::MouseButtonDown {
                 mouse_btn: MouseButton::Left,
                 x,
                 ..
-            } => deck_event::Event::ScratchStart(x as i64),
+            } => DeckCommand::ScratchStart(x as i64),
 
             Event::MouseButtonUp {
                 mouse_btn: MouseButton::Left,
                 ..
-            } => deck_event::Event::ScratchEnd,
+            } => DeckCommand::ScratchEnd,
 
             Event::MouseWheel { x, .. } => {
                 let direction = if x < 0 {
@@ -66,7 +62,7 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
                 } else {
                     Direction::Backward
                 };
-                deck_event::Event::Nudge(direction)
+                DeckCommand::Nudge(direction)
             }
 
             Event::KeyDown {
@@ -80,30 +76,27 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
 
         Some(InputEvent::Deck(
             self.active_deck.load(Ordering::Relaxed),
-            DeckEvent {
-                event: deck_event,
-                timestamp,
-            },
+            DeckEvent { command, timestamp },
         ))
     }
 
     /// Keys that are not bound to a deck command switch the active deck instead,
     /// which is why this needs `&mut self` and can return nothing.
-    fn key_down(&mut self, key: Keycode, keymod: Mod) -> Option<deck_event::Event> {
+    fn key_down(&mut self, key: Keycode, keymod: Mod) -> Option<DeckCommand> {
         let is_shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
 
         match key {
-            Keycode::R => Some(deck_event::Event::ResetPitch),
-            Keycode::Up => Some(deck_event::Event::PitchUp),
-            Keycode::Down => Some(deck_event::Event::PitchDown),
-            Keycode::Space => Some(deck_event::Event::StartStop),
-            Keycode::Return | Keycode::KpEnter => Some(deck_event::Event::LoadRecord),
-            Keycode::Right => Some(deck_event::Event::PlayheadFF),
+            Keycode::R => Some(DeckCommand::ResetPitch),
+            Keycode::Up => Some(DeckCommand::PitchUp),
+            Keycode::Down => Some(DeckCommand::PitchDown),
+            Keycode::Space => Some(DeckCommand::StartStop),
+            Keycode::Return | Keycode::KpEnter => Some(DeckCommand::LoadRecord),
+            Keycode::Right => Some(DeckCommand::PlayheadFF),
             Keycode::Left => {
                 if is_shift {
-                    Some(deck_event::Event::PlayheadReset)
+                    Some(DeckCommand::PlayheadReset)
                 } else {
-                    Some(deck_event::Event::PlayheadRewind)
+                    Some(DeckCommand::PlayheadRewind)
                 }
             }
             k => {

@@ -13,8 +13,8 @@ use crossbeam::{
 };
 
 use crate::{
-    deck_event::{self, DeckEvent},
     filters::FirstOrderLPF,
+    input_event::{DeckCommand, DeckEvent},
     input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
@@ -258,55 +258,50 @@ impl DeckController {
         self.state.playing.store(!playing, Ordering::Relaxed);
     }
 
-    pub fn handle_deck_event(&mut self, event: DeckEvent) -> anyhow::Result<()> {
+    pub fn handle_deck_event(&mut self, event: DeckEvent) {
         let current_pitch = self.state.pitch.load(Ordering::Relaxed);
         let current_state = self.state.platter.load();
-        match event.event {
-            deck_event::Event::ScratchMove(pos) => {
+        match event.command {
+            DeckCommand::ScratchMove(pos) => {
                 self.handle_scratch_move(pos, current_state, event.timestamp)
             }
-            deck_event::Event::ScratchStart(pos) => {
+            DeckCommand::ScratchStart(pos) => {
                 self.handle_scratch_start(pos, current_state, event.timestamp)
             }
-            deck_event::Event::ScratchEnd => self.handle_scratch_end(),
-            deck_event::Event::ResetPitch => self.update_pitch(PitchUpdate::Reset, current_pitch),
-            deck_event::Event::SetPitch(pitch) => {
+            DeckCommand::ScratchEnd => self.handle_scratch_end(),
+            DeckCommand::ResetPitch => self.update_pitch(PitchUpdate::Reset, current_pitch),
+            DeckCommand::SetPitch(pitch) => {
                 self.update_pitch(PitchUpdate::Set(pitch), current_pitch)
             }
-            deck_event::Event::PitchUp => {
-                self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch)
-            }
-            deck_event::Event::PitchDown => {
-                self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch)
-            }
-            deck_event::Event::StartStop => self.start_or_stop(),
-            deck_event::Event::LoadRecord => log_try_send(
+            DeckCommand::PitchUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
+            DeckCommand::PitchDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
+            DeckCommand::StartStop => self.start_or_stop(),
+            DeckCommand::LoadRecord => log_try_send(
                 &self.tray,
                 TrayCommand::LoadRecord {
                     deck_id: self.deck_id,
                 },
                 "load record from tray",
             ),
-            deck_event::Event::PlayheadReset => log_try_send(
+            DeckCommand::PlayheadReset => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::ToZero),
                 "reset playhead",
             ),
-            deck_event::Event::PlayheadFF => log_try_send(
+            DeckCommand::PlayheadFF => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::Forward),
                 "fast forward",
             ),
-            deck_event::Event::PlayheadRewind => log_try_send(
+            DeckCommand::PlayheadRewind => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::Backward),
                 "rewind",
             ),
-            deck_event::Event::Nudge(x) => {
+            DeckCommand::Nudge(x) => {
                 log_try_send(&self.platter_events, PlatterEvent::Nudge(x), "nudge");
             }
         };
-        Ok(())
     }
 
     pub fn get_state(&self) -> Arc<DeckState> {

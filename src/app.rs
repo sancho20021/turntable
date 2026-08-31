@@ -17,14 +17,14 @@ use crossbeam::channel::{Receiver, Sender, bounded};
 
 use turntable_lib::{
     deck_controller::{self, AppStatus, DeckController, DeckId},
-    deck_event::{AppEvent, DeckEvent, InputEvent},
     decoder::SAMPLE_RATE,
+    input_event::{AppEvent, DeckEvent, InputEvent},
     input_profile::InputProfile,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
     samples_poller::{DeckRouting, SamplesPoller},
-    sdl_deck_event::DeckEventMapper,
+    sdl_input::SdlInputMapper,
     telemetry,
     tray::{self, TrayCommand, TrayState},
     utils::{log_try_send, unzip_array4},
@@ -160,22 +160,25 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
-    let mut event_mapper = DeckEventMapper::<DECKS>::new(app_status.clone());
+    let mut event_mapper = SdlInputMapper::<DECKS>::new(app_status.clone());
 
-    // Spawn polling TUI thread
+    // Input sources produce events; the dispatcher applies them. Keeping those
+    // apart is what lets a source live on a thread it does not own - SDL's pump
+    // must stay on the thread that initialised video, the TUI is busy drawing,
+    // and a MIDI callback runs on a driver thread we are only handed.
+    let (events_snd, events_rcv) = bounded(EVENT_QUEUE_LEN);
+
+    // Spawn polling TUI thread, which doubles as the drag and drop source
     let tui_handle = spawn_tui_thread::<DECKS>(
         Arc::clone(&event_mapper.active_deck),
         array::from_fn(|i| controllers[i].get_state()),
         array::from_fn(|i| controllers[i].get_platter()),
+        Arc::clone(&tray_state),
         app_status.clone(),
+        events_snd.clone(),
         Arc::clone(&shutdown),
     );
 
-    // Input sources produce events; the dispatcher applies them. Keeping those
-    // apart is what lets a source live on a thread it does not own - SDL's pump
-    // must stay on the thread that initialised video, and a MIDI callback runs on
-    // a driver thread we are only handed.
-    let (events_snd, events_rcv) = bounded(EVENT_QUEUE_LEN);
     let dispatcher = spawn_dispatcher(
         events_rcv,
         controllers,
@@ -184,14 +187,20 @@ fn run_app<const DECKS: usize>(
     );
 
     // From here on the main thread is nothing but the SDL input source.
-    for event in pump.wait_iter() {
+    //
+    // The wait has a timeout only so that a quit raised somewhere else - Ctrl-C
+    // in the TUI, a MIDI controller later - is noticed within it. Events arriving
+    // on the pump still wake it immediately, so input latency is untouched.
+    while !dispatcher.is_finished() {
+        let Some(event) = pump.wait_event_timeout(QUIT_POLL_MS) else {
+            continue;
+        };
+
         let now = Instant::now();
         let Some(input_event) = event_mapper.to_input_event(event, now) else {
             continue;
         };
 
-        // `wait_iter` cannot be interrupted from outside, so this thread has to
-        // recognise its own stop signal on the way past.
         if matches!(input_event, InputEvent::App(AppEvent::Quit)) {
             break;
         }
@@ -244,6 +253,11 @@ fn run_app<const DECKS: usize>(
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
 }
 
+/// How long the SDL pump blocks before checking whether the app is stopping.
+/// Only bounds how fast a quit from another source is noticed; events arriving
+/// on the pump wake it straight away.
+const QUIT_POLL_MS: u32 = 100;
+
 /// Input events buffered between the sources and the dispatcher. Deep enough
 /// that a burst of scratch motion never has to wait; sources block rather than
 /// drop if it ever fills, since a lost scratch position is a heard glitch.
@@ -268,7 +282,8 @@ fn spawn_dispatcher<const DECKS: usize>(
 
             match event {
                 // Stopping is the main thread's job: it drops the audio stream
-                // before the platter threads. Returning is how it hears about it.
+                // before the platter threads. Returning is how it hears about it,
+                // whichever source the quit came from.
                 InputEvent::App(AppEvent::Quit) => break,
 
                 // Only prepares the record. Which deck it ends up on is decided
@@ -295,11 +310,7 @@ fn dispatch_to_deck<const DECKS: usize>(
     event: DeckEvent,
 ) {
     match controllers.get_mut(deck_idx) {
-        Some(controller) => {
-            if let Err(r) = controller.handle_deck_event(event) {
-                log::error!("[Deck {deck_idx}] {r}");
-            }
-        }
+        Some(controller) => controller.handle_deck_event(event),
         None => log::warn!("Received event for non-existent deck index: {deck_idx}"),
     }
 }

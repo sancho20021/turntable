@@ -7,7 +7,7 @@
 //! * touchpad / mouse — one screen pixel of horizontal travel;
 //! * jog wheel (MIDI) — one encoder tick, accumulated since startup.
 //!
-//! Nothing downstream of [`crate::deck_event::Event::ScratchMove`] knows which
+//! Nothing downstream of [`crate::input_event::DeckCommand::ScratchMove`] knows which
 //! of those it is dealing with, so the constants that genuinely differ between
 //! devices are collected here instead of being hardcoded where they are used.
 //! Two devices with the same profile behave identically.

@@ -11,7 +11,7 @@ use crossbeam::channel::Receiver;
 
 use crate::{
     deck_controller::{DeckState, PlatterState},
-    deck_event::Direction,
+    input_event::Direction,
     input_profile::InputProfile,
     physical_speed::Speed,
     platter_audio_processor::PlatterAudioProcessor,

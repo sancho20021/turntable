@@ -12,30 +12,6 @@ pub fn log_try_send<T>(queue: &Sender<T>, event: T, action: &str) {
     }
 }
 
-pub fn unzip_array3<const N: usize, T1, T2, T3>(
-    a: [(T1, T2, T3); N],
-) -> ([T1; N], [T2; N], [T3; N]) {
-    let (v1, v2, v3) = a.into_iter().fold(
-        (
-            Vec::with_capacity(N),
-            Vec::with_capacity(N),
-            Vec::with_capacity(N),
-        ),
-        |(mut v1, mut v2, mut v3), (x, y, z)| {
-            v1.push(x);
-            v2.push(y);
-            v3.push(z);
-            (v1, v2, v3)
-        },
-    );
-
-    (
-        v1.try_into().unwrap_or_else(|_| unreachable!()),
-        v2.try_into().unwrap_or_else(|_| unreachable!()),
-        v3.try_into().unwrap_or_else(|_| unreachable!()),
-    )
-}
-
 pub fn unzip_array4<const N: usize, T1, T2, T3, T4>(
     a: [(T1, T2, T3, T4); N],
 ) -> ([T1; N], [T2; N], [T3; N], [T4; N]) {

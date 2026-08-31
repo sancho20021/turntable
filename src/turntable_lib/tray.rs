@@ -272,9 +272,8 @@ impl<const DECKS: usize> Tray<DECKS> {
         let LoadedRecord { path, result } = loaded;
         match result {
             Ok((record, info)) => {
-                self.app_status.set(format!(
-                    "Ready: {path} - press Enter to load it on the active deck"
-                ));
+                // the tray widget carries the hint; this keeps the full path
+                self.app_status.set(format!("Ready: {path}"));
                 self.prepared = Some((record, info.clone()));
                 self.set_state(TrayState::Ready { info });
             }
