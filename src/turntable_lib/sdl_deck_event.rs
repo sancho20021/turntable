@@ -1,3 +1,5 @@
+//! Input source: the SDL window (mouse, keyboard, drag & drop).
+
 use std::{
     sync::{
         Arc,
@@ -14,11 +16,14 @@ use sdl2::{
 
 use crate::{
     deck_controller::AppStatus,
-    deck_event::{self, DeckEvent, Direction},
+    deck_event::{self, AppEvent, DeckEvent, Direction, InputEvent},
     deck_thread::DeckId,
 };
 
 pub struct DeckEventMapper<const DECKS: usize> {
+    /// Deck that keyboard and mouse gestures are addressed to, picked with the
+    /// number keys. Owned by this source: it is a keyboard concept, and a MIDI
+    /// controller (which names its deck per message) will not have one.
     pub active_deck: Arc<AtomicUsize>,
     app_status: AppStatus,
 }
@@ -31,26 +36,30 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
         }
     }
 
-    pub fn to_deck_event(
-        &mut self,
-        event: Event,
-        timestamp: Instant,
-    ) -> Option<(DeckId, DeckEvent)> {
-        let inner_event = match event {
+    pub fn to_input_event(&mut self, event: Event, timestamp: Instant) -> Option<InputEvent> {
+        let deck_event = match event {
+            Event::Quit { .. } => return Some(InputEvent::App(AppEvent::Quit)),
+
+            // A dropped file is staged for the app, not for a deck: which deck it
+            // ends up on is decided by whoever commits it.
+            Event::DropFile { filename, .. } => {
+                return Some(InputEvent::App(AppEvent::PrepareTrack(filename)));
+            }
+
             // The touchpad's input unit is one screen pixel of horizontal travel,
             // see `InputProfile::touchpad`.
-            Event::MouseMotion { x, .. } => Some(deck_event::Event::ScratchMove(x as i64)),
+            Event::MouseMotion { x, .. } => deck_event::Event::ScratchMove(x as i64),
 
             Event::MouseButtonDown {
                 mouse_btn: MouseButton::Left,
                 x,
                 ..
-            } => Some(deck_event::Event::ScratchStart(x as i64)),
+            } => deck_event::Event::ScratchStart(x as i64),
 
             Event::MouseButtonUp {
                 mouse_btn: MouseButton::Left,
                 ..
-            } => Some(deck_event::Event::ScratchEnd),
+            } => deck_event::Event::ScratchEnd,
 
             Event::MouseWheel { x, .. } => {
                 let direction = if x < 0 {
@@ -58,59 +67,62 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
                 } else {
                     Direction::Backward
                 };
-                Some(deck_event::Event::Nudge(direction))
+                deck_event::Event::Nudge(direction)
             }
 
             Event::KeyDown {
                 keycode: Some(key),
                 keymod,
                 ..
-            } => {
-                let is_shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+            } => self.key_down(key, keymod)?,
 
-                match key {
-                    Keycode::R => Some(deck_event::Event::ResetPitch),
-                    Keycode::Up => Some(deck_event::Event::PitchUp),
-                    Keycode::Down => Some(deck_event::Event::PitchDown),
-                    Keycode::Space => Some(deck_event::Event::StartStop),
-                    Keycode::Right => Some(deck_event::Event::PlayheadFF),
-                    Keycode::Left => {
-                        if is_shift {
-                            Some(deck_event::Event::PlayheadReset)
-                        } else {
-                            Some(deck_event::Event::PlayheadRewind)
-                        }
-                    }
-                    k => {
-                        if let Some(deck_idx) = keycode_to_deck_idx(k) {
-                            if deck_idx < DECKS {
-                                self.active_deck.store(deck_idx, Ordering::Relaxed);
-                                log::info!("Active Deck = {}", deck_idx + 1);
-                            } else {
-                                // todo: change it from status to temporary warning
-                                self.app_status.set(format!(
-                                    "deck {} doesn't exist (only {} decks are running)",
-                                    deck_idx + 1,
-                                    DECKS
-                                ));
-                            }
-                        }
-                        None
-                    }
-                }
-            }
+            _ => return None,
+        };
 
-            Event::DropFile { filename, .. } => Some(deck_event::Event::LoadTrack(filename)),
-            _ => None,
-        }?;
-
-        Some((
+        Some(InputEvent::Deck(
             self.active_deck.load(Ordering::Relaxed),
             DeckEvent {
-                event: inner_event,
+                event: deck_event,
                 timestamp,
             },
         ))
+    }
+
+    /// Keys that are not bound to a deck command switch the active deck instead,
+    /// which is why this needs `&mut self` and can return nothing.
+    fn key_down(&mut self, key: Keycode, keymod: Mod) -> Option<deck_event::Event> {
+        let is_shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+
+        match key {
+            Keycode::R => Some(deck_event::Event::ResetPitch),
+            Keycode::Up => Some(deck_event::Event::PitchUp),
+            Keycode::Down => Some(deck_event::Event::PitchDown),
+            Keycode::Space => Some(deck_event::Event::StartStop),
+            Keycode::Right => Some(deck_event::Event::PlayheadFF),
+            Keycode::Left => {
+                if is_shift {
+                    Some(deck_event::Event::PlayheadReset)
+                } else {
+                    Some(deck_event::Event::PlayheadRewind)
+                }
+            }
+            k => {
+                if let Some(deck_idx) = keycode_to_deck_idx(k) {
+                    if deck_idx < DECKS {
+                        self.active_deck.store(deck_idx, Ordering::Relaxed);
+                        log::info!("Active Deck = {}", deck_idx + 1);
+                    } else {
+                        // todo: change it from status to temporary warning
+                        self.app_status.set(format!(
+                            "deck {} doesn't exist (only {} decks are running)",
+                            deck_idx + 1,
+                            DECKS
+                        ));
+                    }
+                }
+                None
+            }
+        }
     }
 }
 

@@ -1,5 +1,32 @@
 use std::time::Instant;
 
+use crate::deck_thread::DeckId;
+
+/// Anything an input source can produce.
+///
+/// Input sources (the SDL window today; a MIDI controller and the TUI later)
+/// speak only this vocabulary, so the app loop is the single place that knows
+/// how a gesture becomes an action.
+#[derive(Debug)]
+pub enum InputEvent {
+    /// Addressed at one deck. How the deck is chosen is the source's business:
+    /// the SDL source tags everything with its currently active deck, whereas a
+    /// MIDI controller names the deck in the message itself.
+    Deck(DeckId, DeckEvent),
+    /// Addressed at the app as a whole.
+    App(AppEvent),
+}
+
+/// A command that belongs to no particular deck.
+#[derive(Debug)]
+pub enum AppEvent {
+    /// A track was handed to the app (drag & drop). It is *staged*, not loaded:
+    /// nothing about this event says which deck it will end up on.
+    PrepareTrack(String),
+    /// Shut the app down.
+    Quit,
+}
+
 #[derive(Debug)]
 pub struct DeckEvent {
     pub event: Event,

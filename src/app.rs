@@ -13,11 +13,11 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use crossbeam::channel::bounded;
-use sdl2::event::Event;
 
 use turntable_lib::{
-    deck_controller::{self, AppStatus},
-    deck_thread::DeckJoinHandle,
+    deck_controller::{self, AppStatus, DeckController},
+    deck_event::{self, AppEvent, DeckEvent, InputEvent},
+    deck_thread::{DeckId, DeckJoinHandle},
     decoder::SAMPLE_RATE,
     input_profile::InputProfile,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
@@ -171,17 +171,29 @@ fn run_app<const DECKS: usize>(
     );
 
     for event in pump.wait_iter() {
-        if let Event::Quit { .. } = event {
-            break;
-        }
+        let now = Instant::now();
+        let Some(input_event) = event_mapper.to_input_event(event, now) else {
+            continue;
+        };
 
-        if let Some((deck_idx, event)) = event_mapper.to_deck_event(event, Instant::now()) {
-            if let Some(controller) = controllers.get_mut(deck_idx) {
-                if let Err(r) = controller.handle_deck_event(event) {
-                    log::error!("[Deck {deck_idx}] {r}");
-                }
-            } else {
-                log::warn!("Received event for non-existent deck index: {deck_idx}");
+        match input_event {
+            InputEvent::App(AppEvent::Quit) => break,
+
+            // A staged track goes straight onto the active deck for now. Once the
+            // record tray exists this becomes a `Prepare` command to the tray, and
+            // the deck is picked later by whoever commits it (LOAD button, or the
+            // SDL source auto-committing on drop).
+            InputEvent::App(AppEvent::PrepareTrack(path)) => dispatch_to_deck(
+                &mut controllers,
+                event_mapper.active_deck.load(Ordering::Relaxed),
+                DeckEvent {
+                    event: deck_event::Event::LoadTrack(path),
+                    timestamp: now,
+                },
+            ),
+
+            InputEvent::Deck(deck_idx, event) => {
+                dispatch_to_deck(&mut controllers, deck_idx, event)
             }
         }
     }
@@ -212,6 +224,22 @@ fn run_app<const DECKS: usize>(
     }
 
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
+}
+
+/// Hands one deck event to its controller, complaining if the deck does not exist.
+fn dispatch_to_deck<const DECKS: usize>(
+    controllers: &mut [DeckController; DECKS],
+    deck_idx: DeckId,
+    event: DeckEvent,
+) {
+    match controllers.get_mut(deck_idx) {
+        Some(controller) => {
+            if let Err(r) = controller.handle_deck_event(event) {
+                log::error!("[Deck {deck_idx}] {r}");
+            }
+        }
+        None => log::warn!("Received event for non-existent deck index: {deck_idx}"),
+    }
 }
 
 fn direction_score(device: &cpal::Device) -> u8 {
