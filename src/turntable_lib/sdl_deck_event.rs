@@ -37,19 +37,20 @@ impl<const DECKS: usize> DeckEventMapper<DECKS> {
         timestamp: Instant,
     ) -> Option<(DeckId, DeckEvent)> {
         let inner_event = match event {
-            Event::MouseMotion { x, .. } => Some(deck_event::Event::MouseMotion(x)),
+            // The touchpad's input unit is one screen pixel of horizontal travel,
+            // see `InputProfile::touchpad`.
+            Event::MouseMotion { x, .. } => Some(deck_event::Event::ScratchMove(x as i64)),
 
             Event::MouseButtonDown {
                 mouse_btn: MouseButton::Left,
                 x,
                 ..
-            } => Some(deck_event::Event::MouseDown(x)),
+            } => Some(deck_event::Event::ScratchStart(x as i64)),
 
             Event::MouseButtonUp {
                 mouse_btn: MouseButton::Left,
-                x,
                 ..
-            } => Some(deck_event::Event::MouseUp(x)),
+            } => Some(deck_event::Event::ScratchEnd),
 
             Event::MouseWheel { x, .. } => {
                 let direction = if x < 0 {

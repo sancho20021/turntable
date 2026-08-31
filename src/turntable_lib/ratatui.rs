@@ -4,12 +4,14 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    deck_controller::{AppStatus, DeckState}, record::{INanos, UNanos}, virtual_platter::ReadablePlatter,
+    deck_controller::{AppStatus, DeckState},
+    record::{INanos, UNanos},
+    virtual_platter::ReadablePlatter,
 };
 
 /// Converts nanoseconds to a "mm:ss" string (e.g. 185_000_000_000 -> "03:05")

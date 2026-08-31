@@ -12,6 +12,7 @@ use crossbeam::channel::Receiver;
 use crate::{
     deck_controller::{DeckState, PlatterState},
     deck_event::Direction,
+    input_profile::InputProfile,
     physical_speed::Speed,
     platter_audio_processor::PlatterAudioProcessor,
     record::{INanos, UNanos},
@@ -89,7 +90,8 @@ pub struct PlatterDriver {
     deck_id: usize,
     state: Arc<DeckState>,
     record_speed: Speed,
-    sensitivity: f64,
+    /// tuning of the scratch input device currently driving this deck
+    input: InputProfile,
     platter: WritablePlatter,
     events: Receiver<PlatterEvent>,
     nudges: NudgeQueue,
@@ -103,7 +105,7 @@ impl PlatterDriver {
     pub fn new(
         deck_id: usize,
         state: Arc<DeckState>,
-        sensitivity: f64,
+        input: InputProfile,
         inertia_tau_secs: f64,
         platter: WritablePlatter,
         events: Receiver<PlatterEvent>,
@@ -119,7 +121,7 @@ impl PlatterDriver {
             deck_id,
             state,
             record_speed,
-            sensitivity,
+            input,
             platter,
             events,
             tracer: TelemetryTrace::new(),
@@ -163,31 +165,32 @@ impl PlatterDriver {
             }
             PlatterState::Scratching {
                 anchor_pos: anchor_platter,
-                anchor_mouse_x,
-                latest_mouse_x,
-                timestamp: latest_mouse_t,
-                mouse_speed,
+                anchor_input,
+                latest_input,
+                timestamp: latest_input_t,
+                input_speed,
             } => {
-                let cur_mouse: f64 = {
+                let cur_input: f64 = {
                     // we go 2ms in past to extrapolate less
-                    let dt_secs: f64 = ((now.0 - latest_mouse_t.0).max(2_000_000) - 2_000_000)
+                    let dt_secs: f64 = ((now.0 - latest_input_t.0).max(2_000_000) - 2_000_000)
                         as f64
                         / 1_000_000_000.;
 
-                    // 1. Calculate where the mouse *would* be if it kept moving
-                    let extrapolated_mouse = {
+                    // 1. Calculate where the input *would* be if it kept moving
+                    let extrapolated_input = {
                         // for extrapolation we clamp dt
                         let dt_secs = dt_secs.clamp(-20. / 1_000., 10. / 1_000.);
 
-                        let raw_extrapolated: f64 = match mouse_speed {
-                            Some(speed) => latest_mouse_x as f64 + (speed * dt_secs),
-                            None => latest_mouse_x as f64,
+                        let raw_extrapolated: f64 = match input_speed {
+                            Some(speed) => latest_input as f64 + (speed * dt_secs),
+                            None => latest_input as f64,
                         };
 
-                        let max_drift_pixels = 50.;
+                        // never run further than the device's profile allows
+                        let max_drift = self.input.max_drift_units as f64;
                         raw_extrapolated.clamp(
-                            latest_mouse_x as f64 - max_drift_pixels,
-                            latest_mouse_x as f64 + max_drift_pixels,
+                            latest_input as f64 - max_drift,
+                            latest_input as f64 + max_drift,
                         )
                     };
 
@@ -195,29 +198,28 @@ impl PlatterDriver {
                         self.tracer,
                         now,
                         format!("extrapolated_mouse_x_{}", self.deck_id),
-                        extrapolated_mouse
+                        extrapolated_input
                     );
 
                     // 2. Convergence factor (higher lambda = snaps faster, lower = smoother/more inertia)
-                    let lambda = 50.0;
-                    let convergence_weight = (-lambda * dt_secs).exp(); // Drops from 1.0 to 0.0 over time
+                    let convergence_weight = (-self.input.convergence_lambda * dt_secs).exp(); // Drops from 1.0 to 0.0 over time
 
                     // 3. Blend between extrapolation (short-term) and the hard target (long-term)
-                    (extrapolated_mouse * convergence_weight)
-                        + (latest_mouse_x as f64 * (1.0 - convergence_weight))
+                    (extrapolated_input * convergence_weight)
+                        + (latest_input as f64 * (1.0 - convergence_weight))
                 };
 
                 record_mouse!(
                     self.tracer,
                     now,
                     format!("converged_mouse_x_{}", self.deck_id),
-                    cur_mouse
+                    cur_input
                 );
 
-                let mouse_delta = cur_mouse - anchor_mouse_x as f64;
+                let input_delta = cur_input - anchor_input as f64;
 
-                // Map mouse movement to playhead offset
-                let position_delta = (mouse_delta * self.sensitivity) as i64;
+                // Map input movement to playhead offset
+                let position_delta = (input_delta * self.input.nanos_per_input_unit) as i64;
                 let new_sample = PlatterSample {
                     timestamp_nanos: now,
                     record_pos: INanos(anchor_platter.0 + position_delta),

@@ -19,6 +19,7 @@ use turntable_lib::{
     deck_controller::{self, AppStatus},
     deck_thread::DeckJoinHandle,
     decoder::SAMPLE_RATE,
+    input_profile::InputProfile,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     ratatui::spawn_tui_thread,
     record_changer,
@@ -121,11 +122,13 @@ fn run_app<const DECKS: usize>(
     let (requested_record_snd, requested_rec_rcv) = bounded(3);
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let input_profile = InputProfile::touchpad(touchpad_sensitivity);
+
     let deck_tuples = std::array::from_fn(|deck_idx| {
         deck_controller::new_deck(
             deck_idx,
             1.0,
-            touchpad_sensitivity,
+            input_profile,
             motor_inertia_secs,
             nudge_responsiveness,
             requested_record_snd.clone(),
