@@ -8,7 +8,7 @@ use crate::record::UNanos;
 #[derive(Debug, Clone)]
 pub struct TelemetrySample {
     pub timestamp_micros: u64,
-    pub metric_name: &'static str,
+    pub metric_name: String,
     pub value: f64,
 }
 
@@ -26,10 +26,10 @@ impl TelemetryTrace {
 
     /// Record a math metric snapshot in time
     #[inline]
-    pub fn record(&mut self, timestamp: UNanos, metric_name: &'static str, value: f64) {
+    pub fn record<S: AsRef<str>>(&mut self, timestamp: UNanos, metric_name: S, value: f64) {
         self.samples.push(TelemetrySample {
             timestamp_micros: timestamp.as_micros(),
-            metric_name,
+            metric_name: metric_name.as_ref().to_string(),
             value,
         });
     }
@@ -91,10 +91,10 @@ where
 }
 
 #[macro_export]
-macro_rules! record_mouse {
+macro_rules! record_input {
     // If the feature flag IS active, expand to the actual function call
     ($trace:expr, $timestamp:expr, $metric:expr, $value:expr) => {
-        #[cfg(feature = "trace-mouse")]
+        #[cfg(feature = "trace-input")]
         {
             $trace.record($timestamp, $metric, $value);
         }

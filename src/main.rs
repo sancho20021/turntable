@@ -2,10 +2,19 @@ mod app;
 
 use std::{fs::OpenOptions, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
 
 use crate::app::start;
+
+/// Which device drives the decks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum InputKind {
+    /// SDL window: mouse scratching plus the keyboard bindings
+    Touchpad,
+    /// MIDI controller (DDJ-FLX4): jog wheels, transport, tempo faders
+    Midi,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
@@ -24,8 +33,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// List MIDI input ports and exit
+    ListMidi,
+
     /// Run the turntable application
     Run {
+        /// Input device driving the decks
+        #[arg(short('I'), long, value_enum, default_value_t = InputKind::Touchpad)]
+        input: InputKind,
+
+        /// MIDI port index or name substring (default: the first DDJ port)
+        #[arg(long)]
+        midi_port: Option<String>,
+
+        /// Tempo fader range as a fraction, e.g. 0.08 for +/-8%
+        #[arg(long, default_value_t = 0.08)]
+        pitch_range: f64,
+
         /// Stereo pair assignments for each deck (e.g., "0" for 1 deck, "0,1" for 2 decks, "1,0" for 2 decks with swapped order, etc)
         #[arg(
             short('r'),
@@ -43,7 +67,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 256)]
         buffer: u32,
 
-        /// Touchpad sensitivity factor
+        /// Scratch sensitivity factor, applied to whichever input is in use
         #[arg(short('t'), long, default_value_t = 1.)]
         sensitivity: f64,
 
@@ -79,7 +103,24 @@ fn main() {
     info!("Initialized logging to {:?}", args.log_file);
 
     match &args.command {
+        Commands::ListMidi => match turntable_lib::midi::list_ports() {
+            Ok(ports) if ports.is_empty() => println!("No MIDI input ports found"),
+            Ok(ports) => {
+                println!("MIDI input ports:");
+                for (i, name) in ports.iter().enumerate() {
+                    println!("  [{i}] {name}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Cannot list MIDI ports: {e}");
+                std::process::exit(1);
+            }
+        },
+
         Commands::Run {
+            input,
+            midi_port,
+            pitch_range,
             routing,
             device,
             buffer,
@@ -88,14 +129,17 @@ fn main() {
             nudge,
         } => {
             log::info!("Starting Turntable: {:?}", args.command);
-            start(
-                &routing,
-                device.as_deref(),
-                *motor_inertia,
-                *sensitivity,
-                *buffer,
-                *nudge,
-            );
+            start(app::Options {
+                input: *input,
+                midi_port: midi_port.as_deref(),
+                pitch_range: *pitch_range,
+                deck_routing: routing,
+                device_query: device.as_deref(),
+                motor_inertia_secs: *motor_inertia,
+                sensitivity: *sensitivity,
+                buffer_frames_n: *buffer,
+                nudge_responsiveness: *nudge,
+            });
         }
     }
 }

@@ -13,19 +13,21 @@ use crossbeam::{
 };
 
 use crate::{
-    deck_event::{self, DeckEvent},
-    deck_thread::{DeckId, DeckThread},
-    deck_worker::{DeckWorker, DeckWorkerEvent},
     filters::FirstOrderLPF,
+    input_event::{DeckCommand, DeckEvent},
+    input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
     record::{INanos, UNanos},
-    record_changer::RecordChangerCommand,
-    record_mouse,
+    record_input,
     telemetry::TelemetryTrace,
+    tray::{DeckSlot, TrayCommand},
     utils::log_try_send,
     virtual_platter::{ReadablePlatter, new_platter},
 };
+
+/// Which deck a command is addressed to. `0` is deck 1.
+pub type DeckId = usize;
 
 // const SPEED_EPS: f64 = 0.001;
 
@@ -33,14 +35,14 @@ use crate::{
 pub enum PlatterState {
     Playing,
     Scratching {
-        /// The exact state of the virtual platter when the mouse went down
+        /// The exact state of the virtual platter when the platter was grabbed
         anchor_pos: INanos,
-        /// The mouse X position when the mouse went down
-        anchor_mouse_x: i32,
-        /// The latest mouse position sent by the OS
-        latest_mouse_x: i32,
-        /// latest mouse speed in i32/sec, if known
-        mouse_speed: Option<f64>,
+        /// The input position (in input units) when the platter was grabbed
+        anchor_input: i64,
+        /// The latest input position reported by the input device
+        latest_input: i64,
+        /// Latest input speed in input units / sec, if known
+        input_speed: Option<f64>,
         timestamp: UNanos,
     },
 }
@@ -79,12 +81,14 @@ impl DeckState {
 /// Deck controller that can be used to update virtual platter
 /// based on the state which can be either normal playback or scratching mode.
 pub struct DeckController {
+    deck_id: DeckId,
     state: Arc<DeckState>,
-    deck_worker: Sender<DeckWorkerEvent>,
+    /// to prepare records and load them onto this deck, see [`crate::tray`]
+    tray: Sender<TrayCommand>,
     platter_events: Sender<PlatterEvent>,
     platter: ReadablePlatter,
-    /// mouse speed smoothing
-    mouse_speed: FirstOrderLPF,
+    /// input speed smoothing, see [`InputProfile::speed_smoothing_tau_secs`]
+    input_speed: FirstOrderLPF,
     /// For recording metrics
     pub tracer: TelemetryTrace,
 }
@@ -96,29 +100,27 @@ enum PitchUpdate {
     Adjust(f64),
 }
 
-static BASE_SENSITIVITY_FACTOR: f64 = 1_500_000.0;
-
 pub fn new_deck(
     deck_id: DeckId,
-    initial_pitch: f64,
-    sensitivity: f64,
+    input: InputProfile,
     inertia_tau_secs: f64,
-    nudge_responsiveness: f32,
-    record_changer: Sender<RecordChangerCommand>,
+    tray: Sender<TrayCommand>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
-    app_status: &AppStatus,
-) -> (DeckController, DeckThread, AudioProcessorHandles) {
+) -> (
+    DeckController,
+    PlatterDriver,
+    AudioProcessorHandles,
+    DeckSlot,
+) {
     let initial_state = Arc::new(DeckState {
-        pitch: AtomicF64::new(initial_pitch),
+        pitch: AtomicF64::new(1.0),
         playing: AtomicBool::new(true),
         platter: AtomicCell::new(PlatterState::Playing),
         cur_record: RwLock::new(None),
     });
     let (pl_snd, pl_rcv) = bounded(1000);
     let (writable_platter, readable_platter) = new_platter();
-
-    let (event_snd, event_rcv) = bounded(100);
 
     let (used_records_prod, used_records_cons) = rtrb::RingBuffer::new(3);
     let (new_record_prod, new_record_cons) = rtrb::RingBuffer::new(1);
@@ -127,52 +129,46 @@ pub fn new_deck(
         used_records: used_records_prod,
         platter: readable_platter.clone(),
     };
+    let deck_slot = DeckSlot {
+        records_in: new_record_prod,
+        records_out: used_records_cons,
+        state: Arc::clone(&initial_state),
+        platter_events: pl_snd.clone(),
+    };
 
-    let deck_worker = DeckWorker::new(
-        deck_id,
-        pl_snd.clone(),
-        event_rcv,
-        event_snd,
-        record_changer,
-        used_records_cons,
-        new_record_prod,
-        Arc::clone(&shutdown),
-        Arc::clone(&initial_state),
-        app_status.clone(),
-    );
     let driver = PlatterDriver::new(
         deck_id,
         Arc::clone(&initial_state),
-        sensitivity * BASE_SENSITIVITY_FACTOR,
+        input.clone(),
         inertia_tau_secs,
         writable_platter,
         pl_rcv,
-        nudge_responsiveness,
         shutdown,
         buffer_frames_n,
     );
 
-    let deck_thread = DeckThread::new(deck_worker, driver);
     (
         DeckController {
+            deck_id,
             state: Arc::clone(&initial_state),
+            tray,
             platter: readable_platter,
-            deck_worker: deck_thread.deck_worker_channel(),
             platter_events: pl_snd,
             tracer: TelemetryTrace::new(),
-            mouse_speed: FirstOrderLPF::new(0.01),
+            input_speed: FirstOrderLPF::new(input.speed_smoothing_tau_secs),
         },
-        deck_thread,
+        driver,
         audio_handles,
+        deck_slot,
     )
 }
 
 impl DeckController {
-    fn handle_mouse_motion(&mut self, x: i32, current: PlatterState, when: Instant) {
+    fn handle_scratch_move(&mut self, x: i64, current: PlatterState, when: Instant) {
         if let PlatterState::Scratching {
-            latest_mouse_x,
+            latest_input,
             anchor_pos,
-            anchor_mouse_x,
+            anchor_input,
             timestamp: prev_timestamp,
             ..
         } = current
@@ -184,50 +180,65 @@ impl DeckController {
                     None
                 } else {
                     Some(
-                        self.mouse_speed
-                            .advance(dt_secs, (x - latest_mouse_x) as f64 / dt_secs),
+                        self.input_speed
+                            .advance(dt_secs, (x - latest_input) as f64 / dt_secs),
                     )
                 }
             };
             let new_state = PlatterState::Scratching {
                 anchor_pos,
-                anchor_mouse_x,
-                latest_mouse_x: x,
-                mouse_speed: speed,
+                anchor_input,
+                latest_input: x,
+                input_speed: speed,
                 timestamp: new_timestamp,
             };
             self.state.platter.store(new_state);
-            record_mouse!(self.tracer, new_timestamp, "latest_mouse_x", x as f64);
+            record_input!(
+                self.tracer,
+                new_timestamp,
+                format!("latest_input_{}", self.deck_id),
+                x as f64
+            );
             if let Some(s) = speed {
-                record_mouse!(self.tracer, new_timestamp, "raw_mouse_speed", s);
-                record_mouse!(
+                record_input!(
                     self.tracer,
                     new_timestamp,
-                    "mouse_dt_us",
+                    format!("raw_input_speed_{}", self.deck_id),
+                    s
+                );
+                record_input!(
+                    self.tracer,
+                    new_timestamp,
+                    format!("input_dt_us_{}", self.deck_id),
                     dt_secs * 1_000_000.
                 );
             }
         }
     }
 
-    fn handle_mouse_down(&mut self, x: i32, current: PlatterState, when: Instant) {
+    fn handle_scratch_start(&mut self, x: i64, current: PlatterState, when: Instant) {
         if let PlatterState::Playing = current {
             let tstmp = self.platter.timestamp(when);
             let scratch_state = PlatterState::Scratching {
                 anchor_pos: self.platter.get_playhead().record_pos,
-                anchor_mouse_x: x,
-                latest_mouse_x: x,
-                mouse_speed: None,
+                anchor_input: x,
+                latest_input: x,
+                input_speed: None,
                 timestamp: tstmp,
             };
             self.state.platter.store(scratch_state);
-            record_mouse!(self.tracer, tstmp, "latest_mouse_x", x as f64)
+            record_input!(
+                self.tracer,
+                tstmp,
+                format!("latest_input_{}", self.deck_id),
+                x as f64
+            )
         }
     }
 
-    fn handle_mouse_up(&mut self) {
+    fn handle_scratch_end(&mut self) {
         self.state.platter.store(PlatterState::Playing);
-        self.mouse_speed.reset();
+        self.input_speed.reset();
     }
 
     fn update_pitch(&self, update: PitchUpdate, cur_speed: f64) {
@@ -244,50 +255,50 @@ impl DeckController {
         self.state.playing.store(!playing, Ordering::Relaxed);
     }
 
-    pub fn handle_deck_event(&mut self, event: DeckEvent) -> anyhow::Result<()> {
+    pub fn handle_deck_event(&mut self, event: DeckEvent) {
         let current_pitch = self.state.pitch.load(Ordering::Relaxed);
         let current_state = self.state.platter.load();
-        match event.event {
-            deck_event::Event::MouseMotion(pos) => {
-                self.handle_mouse_motion(pos, current_state, event.timestamp)
+        match event.command {
+            DeckCommand::ScratchMove(pos) => {
+                self.handle_scratch_move(pos, current_state, event.timestamp)
             }
-            deck_event::Event::MouseDown(pos) => {
-                self.handle_mouse_down(pos, current_state, event.timestamp)
+            DeckCommand::ScratchStart(pos) => {
+                self.handle_scratch_start(pos, current_state, event.timestamp)
             }
-            deck_event::Event::MouseUp(_) => self.handle_mouse_up(),
-            deck_event::Event::ResetPitch => self.update_pitch(PitchUpdate::Reset, current_pitch),
-            deck_event::Event::PitchUp => {
-                self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch)
+            DeckCommand::ScratchEnd => self.handle_scratch_end(),
+            DeckCommand::ResetPitch => self.update_pitch(PitchUpdate::Reset, current_pitch),
+            DeckCommand::SetPitch(pitch) => {
+                self.update_pitch(PitchUpdate::Set(pitch), current_pitch)
             }
-            deck_event::Event::PitchDown => {
-                self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch)
-            }
-            deck_event::Event::StartStop => self.start_or_stop(),
-            deck_event::Event::LoadTrack(track) => log_try_send(
-                &self.deck_worker,
-                DeckWorkerEvent::LoadRecord(track),
-                "load record",
+            DeckCommand::PitchUp => self.update_pitch(PitchUpdate::Adjust(0.01), current_pitch),
+            DeckCommand::PitchDown => self.update_pitch(PitchUpdate::Adjust(-0.01), current_pitch),
+            DeckCommand::StartStop => self.start_or_stop(),
+            DeckCommand::LoadRecord => log_try_send(
+                &self.tray,
+                TrayCommand::LoadRecord {
+                    deck_id: self.deck_id,
+                },
+                "load record from tray",
             ),
-            deck_event::Event::PlayheadReset => log_try_send(
+            DeckCommand::PlayheadReset => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::ToZero),
                 "reset playhead",
             ),
-            deck_event::Event::PlayheadFF => log_try_send(
+            DeckCommand::PlayheadFF => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::Forward),
                 "fast forward",
             ),
-            deck_event::Event::PlayheadRewind => log_try_send(
+            DeckCommand::PlayheadRewind => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::Backward),
                 "rewind",
             ),
-            deck_event::Event::Nudge(x) => {
+            DeckCommand::Nudge(x) => {
                 log_try_send(&self.platter_events, PlatterEvent::Nudge(x), "nudge");
             }
         };
-        Ok(())
     }
 
     pub fn get_state(&self) -> Arc<DeckState> {
