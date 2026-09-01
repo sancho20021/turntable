@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::Sender;
+use percent_encoding::percent_decode_str;
 
 use crate::{
     deck_controller::{AppStatus, DeckState},
@@ -150,108 +151,30 @@ fn to_input_event(event: TermEvent) -> Option<InputEvent> {
 }
 
 /// Pulls a usable path out of what a terminal sends when a file is dropped on
-/// it: the path as text, shell-quoted or backslash-escaped, sometimes as a
-/// `file://` URI, usually with a trailing space. Several files dropped at once
-/// arrive space separated, and we take the first.
-fn parse_dropped_path(paste: &str) -> Option<String> {
-    let token = first_shell_token(paste.trim());
-    let path = strip_file_uri(&token).unwrap_or(token);
-    (!path.is_empty()).then_some(path)
-}
-
-/// The first shell-style token in `text`, with quoting and escapes resolved.
+/// it. Terminals disagree on the format, so both real ones are handled: the
+/// path as text, shell-quoted or backslash-escaped, or a `file://` URI with the
+/// awkward characters percent-encoded. Several files dropped at once arrive
+/// space separated, and we take the first.
 ///
-/// One token can mix quoting styles, which is why this walks the whole string
-/// instead of looking at the first character and guessing. A name with an
-/// apostrophe is the usual case: `Jesse James - 50's Japan.mp3` arrives as
+/// The shell half is [`shlex`]'s job rather than ours because one token can mix
+/// quoting styles: a name with an apostrophe arrives as
 /// `'Jesse James - 50'\''s Japan.mp3'` - quoted, then an escaped quote, then
-/// quoted again - because a single-quoted string cannot contain a single quote.
-fn first_shell_token(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
+/// quoted again, because a single-quoted string cannot contain a single quote.
+///
+/// Returns `None` for a paste that is empty or not lexable at all (an
+/// unterminated quote, say), which loads nothing rather than a guessed path.
+fn parse_dropped_path(paste: &str) -> Option<String> {
+    let token = shlex::split(paste)?.into_iter().next()?;
 
-    while let Some(c) = chars.next() {
-        match c {
-            // unquoted whitespace ends the token
-            c if c.is_whitespace() => break,
+    let path = match token.strip_prefix("file://") {
+        // an optional host sits between the scheme and the path
+        Some(rest) => percent_decode_str(&rest[rest.find('/')?..])
+            .decode_utf8_lossy()
+            .into_owned(),
+        None => token,
+    };
 
-            // an escape outside quotes carries the next character through
-            '\\' => {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            }
-
-            // single quotes are literal all the way to the closing quote
-            '\'' => {
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
-                    }
-                    out.push(c);
-                }
-            }
-
-            // double quotes still honour escapes
-            '"' => {
-                while let Some(c) = chars.next() {
-                    match c {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                out.push(escaped);
-                            }
-                        }
-                        c => out.push(c),
-                    }
-                }
-            }
-
-            c => out.push(c),
-        }
-    }
-
-    out
-}
-
-/// `file:///home/me/a%20track.mp3` -> `/home/me/a track.mp3`.
-fn strip_file_uri(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("file://")?;
-    // an optional host sits between the scheme and the path
-    let slash = rest.find('/')?;
-    Some(percent_decode(&rest[slash..]))
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(byte) = hex_pair(bytes[i + 1], bytes[i + 2]) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_pair(hi: u8, lo: u8) -> Option<u8> {
-    fn digit(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    Some(digit(hi)? * 16 + digit(lo)?)
+    (!path.is_empty()).then_some(path)
 }
 
 /// Just the file name, so a long path does not eat the whole row. The full path
@@ -544,5 +467,12 @@ mod tests {
     fn nothing_usable() {
         assert_eq!(parse_dropped_path(""), None);
         assert_eq!(parse_dropped_path("   \n"), None);
+    }
+
+    #[test]
+    fn unlexable_paste_loads_nothing() {
+        // No terminal sends these; loading nothing beats loading a guess.
+        assert_eq!(parse_dropped_path("'/music/unterminated.mp3"), None);
+        assert_eq!(parse_dropped_path("/music/trailing\\"), None);
     }
 }
