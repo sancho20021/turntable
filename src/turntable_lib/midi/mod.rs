@@ -15,13 +15,13 @@
 pub mod flx4;
 pub mod message;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use crossbeam::channel::Sender;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 
-use crate::{input_event::InputEvent, midi::message::MidiMessage};
+use crate::{clock_sync::ExternalClock, input_event::InputEvent, midi::message::MidiMessage};
 
 /// Names a controller port matched by substring, or by index if the query
 /// parses as a number. Without a query, the first port that looks like a DDJ.
@@ -91,16 +91,20 @@ pub fn start(
     let port_name = input.port_name(&port)?;
 
     let mut decoder = flx4::Decoder::new();
+    let mut clock = ExternalClock::default();
 
     let connection = input
         .connect(
             &port,
             "turntable-midi-in",
-            move |_timestamp_micros, bytes, ()| {
-                // Taken here rather than downstream: scratch speed is derived
-                // from these, so they have to be stamped where the input
-                // actually arrived.
-                let timestamp = Instant::now();
+            move |timestamp_micros, bytes, ()| {
+                // midir's stamp beats reading the clock here: on ALSA and
+                // CoreMIDI the driver applies it when the bytes actually
+                // arrive, so it does not carry the jitter of getting this
+                // thread scheduled. Scratch speed is derived from the gaps
+                // between these, so that jitter would land in the velocity.
+                let timestamp =
+                    clock.stamp(Duration::from_micros(timestamp_micros), Instant::now());
 
                 let Some(message) = MidiMessage::parse(bytes) else {
                     log::warn!("Not a valid MIDI message: {bytes:02X?}");

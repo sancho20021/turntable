@@ -235,6 +235,12 @@ fn run_sdl_source<const DECKS: usize>(
             continue;
         };
 
+        // Deliberately not `event.timestamp()`: SDL2 stamps events with
+        // `SDL_GetTicks()`, in whole milliseconds, and mouse motion arrives
+        // every 1-8 ms - quantising the gaps to a millisecond would cost more
+        // than the scheduling jitter it saves. The MIDI source does use its
+        // device's stamp, because ALSA's is microseconds; see
+        // [`turntable_lib::clock_sync`] for when that trade is worth making.
         let now = Instant::now();
         let Some(input_event) = mapper.to_input_event(event, now) else {
             continue;
