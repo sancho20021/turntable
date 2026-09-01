@@ -45,6 +45,7 @@ pub struct Options<'a> {
     pub sensitivity: f64,
     /// audio buffer in frames
     pub buffer_frames_n: u32,
+    /// nudge / pitch bend responsiveness factor, applied to whichever input is in use
     pub nudge_responsiveness: f32,
 }
 
@@ -82,8 +83,12 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     // is driving the decks, which is the only thing the engine needs to be told
     // about the difference.
     let input_profile = match options.input {
-        InputKind::Touchpad => InputProfile::touchpad(options.sensitivity),
-        InputKind::Midi => InputProfile::jog_wheel(options.sensitivity),
+        InputKind::Touchpad => {
+            InputProfile::touchpad(options.sensitivity, options.nudge_responsiveness)
+        }
+        InputKind::Midi => {
+            InputProfile::jog_wheel(options.sensitivity, options.nudge_responsiveness)
+        }
     };
 
     // Only the keyboard has a notion of an active deck; a MIDI controller names
@@ -96,10 +101,8 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     let deck_tuples = std::array::from_fn(|deck_idx| {
         deck_controller::new_deck(
             deck_idx,
-            1.0,
-            input_profile,
+            input_profile.clone(),
             options.motor_inertia_secs,
-            options.nudge_responsiveness,
             tray_snd.clone(),
             Arc::clone(&shutdown),
             options.buffer_frames_n as usize,

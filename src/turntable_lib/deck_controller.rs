@@ -102,10 +102,8 @@ enum PitchUpdate {
 
 pub fn new_deck(
     deck_id: DeckId,
-    initial_pitch: f64,
     input: InputProfile,
     inertia_tau_secs: f64,
-    nudge_responsiveness: f32,
     tray: Sender<TrayCommand>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
@@ -116,7 +114,7 @@ pub fn new_deck(
     DeckSlot,
 ) {
     let initial_state = Arc::new(DeckState {
-        pitch: AtomicF64::new(initial_pitch),
+        pitch: AtomicF64::new(1.0),
         playing: AtomicBool::new(true),
         platter: AtomicCell::new(PlatterState::Playing),
         cur_record: RwLock::new(None),
@@ -141,11 +139,10 @@ pub fn new_deck(
     let driver = PlatterDriver::new(
         deck_id,
         Arc::clone(&initial_state),
-        input,
+        input.clone(),
         inertia_tau_secs,
         writable_platter,
         pl_rcv,
-        nudge_responsiveness,
         shutdown,
         buffer_frames_n,
     );

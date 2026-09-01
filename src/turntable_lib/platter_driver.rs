@@ -54,7 +54,7 @@ struct NudgeQueue {
 impl NudgeQueue {
     pub fn new(responsiveness: f32) -> Self {
         Self {
-            responsiveness: responsiveness * 2.,
+            responsiveness,
             forward: Default::default(),
             backward: Default::default(),
         }
@@ -109,7 +109,6 @@ impl PlatterDriver {
         inertia_tau_secs: f64,
         platter: WritablePlatter,
         events: Receiver<PlatterEvent>,
-        nudge_responsiveness: f32,
         shutdown: Arc<AtomicBool>,
         buffer_frames_n: usize,
     ) -> Self {
@@ -121,11 +120,11 @@ impl PlatterDriver {
             deck_id,
             state,
             record_speed,
+            nudges: NudgeQueue::new(input.nudge_responsiveness),
             input,
             platter,
             events,
             tracer: TelemetryTrace::new(),
-            nudges: NudgeQueue::new(nudge_responsiveness),
             shutdown,
             frequency_hz,
         }

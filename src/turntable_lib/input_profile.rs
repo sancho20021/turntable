@@ -22,13 +22,20 @@ const TOUCHPAD_BASE_SENSITIVITY: f64 = 1_500_000.0;
 /// One revolution of a record at 33 1/3 rpm, in nanoseconds (60 / 33.333 s).
 const RECORD_REVOLUTION_NANOS: u64 = 1_800_000_000;
 
+const TOUCHPAD_NUDGE_MULTIPLIER: f32 = 2.0;
+
+/// Nudge strength per jog-wheel bend message, at `nudge_responsiveness = 1.0`.
+/// Turning the side of the wheel emits a nudge per encoder tick, i.e. many per
+/// gesture rather than one per press, so each one has to count for much less.
+const JOG_NUDGE_MULTIPLIER: f32 = 0.25;
+
 /// Tuning constants of one scratch input device.
 ///
 /// All of these are read on the platter thread every update (via
 /// [`crate::platter_driver::PlatterDriver`]) except
 /// [`Self::speed_smoothing_tau_secs`], which is consumed once when the
 /// controller's speed filter is built.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InputProfile {
     /// **Scratch gain**: nanoseconds of record time per one input unit of
     /// travel, i.e. how far the playhead moves for a given amount of input
@@ -64,6 +71,15 @@ pub struct InputProfile {
     /// timing jitters; this is how much of that noise is averaged out. Higher =
     /// steadier speed estimate but slower to react to direction changes.
     pub speed_smoothing_tau_secs: f64,
+
+    /// **Nudge strength**: how much pitch bend a single nudge event is worth
+    /// while it is alive (see [`crate::platter_driver`]).
+    ///
+    /// Unit: percent of nominal speed per in-flight nudge. Devices differ in
+    /// how many nudge events one gesture produces, so the user-facing
+    /// `nudge_responsiveness` is scaled per device to keep a nudge feeling the
+    /// same regardless of what emitted it.
+    pub nudge_responsiveness: f32,
 }
 
 impl InputProfile {
@@ -71,13 +87,16 @@ impl InputProfile {
     /// events arrive at roughly the pointer's report rate (~125-1000 Hz).
     ///
     /// `sensitivity` is the user-facing multiplier on top of
-    /// [`TOUCHPAD_BASE_SENSITIVITY`] (1.0 = default feel).
-    pub fn touchpad(sensitivity: f64) -> Self {
+    /// [`TOUCHPAD_BASE_SENSITIVITY`] (1.0 = default feel), and
+    /// `nudge_responsiveness` the one on top of
+    /// [`TOUCHPAD_NUDGE_MULTIPLIER`].
+    pub fn touchpad(sensitivity: f64, nudge_responsiveness: f32) -> Self {
         Self {
             nanos_per_input_unit: sensitivity * TOUCHPAD_BASE_SENSITIVITY,
             max_drift_units: 50,
             convergence_lambda: 50.0,
             speed_smoothing_tau_secs: 0.01,
+            nudge_responsiveness: nudge_responsiveness * TOUCHPAD_NUDGE_MULTIPLIER,
         }
     }
 
@@ -92,13 +111,14 @@ impl InputProfile {
     /// The remaining three are the touchpad's values as a starting point. Jog
     /// ticks arrive at a different rate and quantisation, so they want tuning
     /// against a `trace-input` capture rather than trust.
-    pub fn jog_wheel(sensitivity: f64) -> Self {
+    pub fn jog_wheel(sensitivity: f64, nudge_responsiveness: f32) -> Self {
         let nanos_per_tick = RECORD_REVOLUTION_NANOS as f64 / JOG_TICKS_PER_REVOLUTION as f64;
         Self {
             nanos_per_input_unit: sensitivity * nanos_per_tick,
             max_drift_units: 20,
             convergence_lambda: 50.0,
             speed_smoothing_tau_secs: 0.01,
+            nudge_responsiveness: nudge_responsiveness * JOG_NUDGE_MULTIPLIER,
         }
     }
 }

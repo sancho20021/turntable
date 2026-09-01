@@ -19,10 +19,10 @@
 //! (Some controllers in this family also mirror shifted buttons onto channel
 //! + 4; `scope_of` accepts those channels too, harmless if unused.)
 //!
-//! Anything not in the table is logged raw by [`super::run_midi_source`], which
-//! is how the shifted jog numbers above were found - keep extending it that way.
+//! Anything not in the table is logged raw by [`super::start`], which is how the
+//! shifted jog numbers above were found - keep extending it that way.
 
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
 use crate::{
     deck_controller::DeckId,
@@ -41,10 +41,53 @@ pub enum Deck {
 }
 
 impl Deck {
-    fn deck_id(self) -> DeckId {
+    /// 0 or 1. Doubles as the index into this decoder's per-deck state and as
+    /// the [`DeckId`] the rest of the app knows the deck by.
+    fn index(self) -> DeckId {
         match self {
             Deck::One => 0,
             Deck::Two => 1,
+        }
+    }
+}
+
+/// A button we have a binding for. Every other note number on a known channel
+/// decodes to [`Button::Unmapped`] rather than being dropped, so pressing an
+/// unbound button still shows up in the log with its note number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    PlayPause,
+    Cue,
+    Shift,
+    /// LOAD lives on the shared mixer channel and names its target deck in the
+    /// note number, so it carries the deck itself.
+    Load(Deck),
+    Unmapped(u8),
+}
+
+impl Button {
+    fn from_note(deck: Option<Deck>, note: u8) -> Self {
+        match (deck, note) {
+            // Per-deck transport buttons (channels 1/2, or 5/6 with shift).
+            (Some(_), 0x0B) => Button::PlayPause,
+            (Some(_), 0x0C) => Button::Cue,
+            (Some(_), 0x3F) => Button::Shift,
+            // LOAD buttons live on the shared mixer channel, one note each.
+            (None, 0x46) => Button::Load(Deck::One),
+            (None, 0x47) => Button::Load(Deck::Two),
+            _ => Button::Unmapped(note),
+        }
+    }
+}
+
+impl fmt::Display for Button {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Button::PlayPause => f.write_str("PLAY/PAUSE"),
+            Button::Cue => f.write_str("CUE"),
+            Button::Shift => f.write_str("SHIFT"),
+            Button::Load(deck) => write!(f, "LOAD -> deck {}", deck.index() + 1),
+            Button::Unmapped(note) => write!(f, "unmapped note 0x{note:02X}"),
         }
     }
 }
@@ -87,10 +130,9 @@ pub enum Event {
     /// PLAY / CUE / LOAD / SHIFT: a plain press or release.
     Button {
         deck: Option<Deck>,
-        name: &'static str,
+        button: Button,
         shifted: bool,
         pressed: bool,
-        velocity: u8,
     },
     /// Capacitive touch sensor on top of the jog wheel. Carries the running tick
     /// total so a scratch can be anchored at the moment the hand lands.
@@ -135,13 +177,6 @@ pub struct Decoder {
     shift_held: [bool; 2],
 }
 
-fn deck_index(deck: Deck) -> usize {
-    match deck {
-        Deck::One => 0,
-        Deck::Two => 1,
-    }
-}
-
 impl Decoder {
     pub fn new() -> Self {
         Self::default()
@@ -150,23 +185,17 @@ impl Decoder {
     /// True while that deck's SHIFT key is down. Not needed for decoding
     /// (shifted presses arrive on their own channel) but handy for status.
     pub fn shift_held(&self, deck: Deck) -> bool {
-        self.shift_held[deck_index(deck)]
+        self.shift_held[deck.index()]
     }
 
-    /// Try to turn one MIDI message into an [`Event`]. `None` means "this
-    /// control isn't in our table".
+    /// Try to turn one MIDI message into an [`Event`]. `None` means the message
+    /// is not a control at all - a channel that is not a deck or the mixer, a CC
+    /// we have no mapping for, or a [`MidiMessage::Other`]. An unrecognised
+    /// *note* is not dropped here: it comes back as [`Button::Unmapped`].
     pub fn decode(&mut self, msg: &MidiMessage) -> Option<Event> {
         match *msg {
-            MidiMessage::NoteOn {
-                channel,
-                note,
-                velocity,
-            } => self.note(channel, note, velocity, true),
-            MidiMessage::NoteOff {
-                channel,
-                note,
-                velocity,
-            } => self.note(channel, note, velocity, false),
+            MidiMessage::NoteOn { channel, note, .. } => self.note(channel, note, true),
+            MidiMessage::NoteOff { channel, note } => self.note(channel, note, false),
             MidiMessage::ControlChange {
                 channel,
                 controller,
@@ -176,7 +205,7 @@ impl Decoder {
         }
     }
 
-    fn note(&mut self, channel: u8, note: u8, velocity: u8, pressed: bool) -> Option<Event> {
+    fn note(&mut self, channel: u8, note: u8, pressed: bool) -> Option<Event> {
         let Scope { deck, shifted } = scope_of(channel)?;
         let shifted = shifted || deck.is_some_and(|d| self.shift_held(d));
 
@@ -188,26 +217,17 @@ impl Decoder {
                 deck,
                 shifted,
                 touching: pressed,
-                total: self.jog_total[deck_index(deck)],
+                total: self.jog_total[deck.index()],
             });
         }
 
-        let name = match (deck, note) {
-            // Per-deck transport buttons (channels 1/2, or 5/6 with shift).
-            (Some(_), 0x0B) => "PLAY/PAUSE",
-            (Some(_), 0x0C) => "CUE",
-            (Some(_), 0x3F) => "SHIFT",
-            // LOAD buttons live on the shared mixer channel, one note each.
-            (None, 0x46) => "LOAD -> deck 1",
-            (None, 0x47) => "LOAD -> deck 2",
-            _ => return None,
-        };
+        let button = Button::from_note(deck, note);
 
         // The SHIFT key press itself: remember it, and don't label it
         // "SHIFT + SHIFT".
-        let shifted = if note == 0x3F {
+        let shifted = if button == Button::Shift {
             if let Some(d) = deck {
-                self.shift_held[deck_index(d)] = pressed;
+                self.shift_held[d.index()] = pressed;
             }
             false
         } else {
@@ -216,10 +236,9 @@ impl Decoder {
 
         Some(Event::Button {
             deck,
-            name,
+            button,
             shifted,
             pressed,
-            velocity,
         })
     }
 
@@ -235,7 +254,7 @@ impl Decoder {
             0x21 | 0x22 | 0x29 => {
                 let deck = deck?;
                 let ticks = i16::from(value) - 0x40;
-                let total = &mut self.jog_total[deck_index(deck)];
+                let total = &mut self.jog_total[deck.index()];
                 *total += i64::from(ticks);
                 Some(Event::JogTurn {
                     deck,
@@ -255,12 +274,12 @@ impl Decoder {
             // bits. We buffer the MSB and emit once the LSB lands.
             0x00 => {
                 let deck = deck?;
-                self.tempo_msb[deck_index(deck)] = Some(value);
+                self.tempo_msb[deck.index()] = Some(value);
                 Some(Event::TempoPartial { deck, msb: value })
             }
             0x20 => {
                 let deck = deck?;
-                let msb = self.tempo_msb[deck_index(deck)].take()?;
+                let msb = self.tempo_msb[deck.index()].take()?;
                 let raw = (u16::from(msb) << 7) | u16::from(value);
                 Some(Event::Tempo {
                     deck,
@@ -289,7 +308,7 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
             total,
             ..
         } => (
-            deck.deck_id(),
+            deck.index(),
             if touching {
                 DeckCommand::ScratchStart(total)
             } else {
@@ -323,29 +342,34 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
                     return None;
                 }
             };
-            (deck.deck_id(), command)
+            (deck.index(), command)
         }
 
         // Deck 1 is nominal speed at the centre detent, faster above it.
         Event::Tempo { deck, offset, .. } => (
-            deck.deck_id(),
+            deck.index(),
             DeckCommand::SetPitch(1.0 + f64::from(offset) * pitch_range),
         ),
 
         Event::Button {
             deck,
-            name,
+            button,
             pressed: true,
             ..
-        } => match name {
-            "PLAY/PAUSE" => (deck?.deck_id(), DeckCommand::StartStop),
-            "CUE" => (deck?.deck_id(), DeckCommand::PlayheadReset),
+        } => match button {
+            Button::PlayPause => (deck?.index(), DeckCommand::StartStop),
+            Button::Cue => (deck?.index(), DeckCommand::PlayheadReset),
             // The LOAD buttons name their target deck, so they are the only
             // controls that reach across from the mixer channel to a deck.
-            "LOAD -> deck 1" => (0, DeckCommand::LoadRecord),
-            "LOAD -> deck 2" => (1, DeckCommand::LoadRecord),
-            // SHIFT is a modifier the decoder already tracked
-            _ => return None,
+            Button::Load(target) => (target.index(), DeckCommand::LoadRecord),
+            // SHIFT is a modifier the decoder already tracked.
+            Button::Shift => return None,
+            // Not bound to anything - logged here because the decoder no longer
+            // drops it, which is how a new binding gets found.
+            Button::Unmapped(note) => {
+                log::debug!("Unmapped button on note 0x{note:02X}");
+                return None;
+            }
         },
 
         // releases and the buffered half of a fader move do nothing
@@ -417,10 +441,13 @@ mod tests {
                 velocity: 127,
             })
             .expect("play event");
-        let Event::Button { shifted, name, .. } = ev else {
+        let Event::Button {
+            shifted, button, ..
+        } = ev
+        else {
             panic!("not a button");
         };
-        assert!(shifted, "{name} should be flagged as shifted");
+        assert!(shifted, "{button} should be flagged as shifted");
     }
 
     #[test]
