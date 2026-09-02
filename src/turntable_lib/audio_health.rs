@@ -1,11 +1,10 @@
 //! Audio-thread health metrics.
 //!
-//! The audio callback must not log: `env_logger`'s file target does a `format!`,
-//! takes a mutex and issues an unbuffered `write()` per record, which at a
-//! 32-frame quantum costs a sizeable fraction of a 667us budget - and blocks for
+//! The audio callback cannot log: `env_logger`'s file target formats, takes a
+//! mutex and issues an unbuffered `write()` per record, which blocks for
 //! milliseconds whenever the filesystem commits its journal. So the callback
-//! only bumps relaxed atomics here and occasionally pushes a detail event onto a
-//! lock-free queue. [`spawn_monitor`] does all the logging on its own thread.
+//! only bumps relaxed atomics here and pushes the occasional detail event onto a
+//! lock-free queue; [`spawn_monitor`] does the logging on its own thread.
 
 use std::{
     sync::{
@@ -16,15 +15,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crossbeam::atomic::AtomicCell;
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Capacity of the detail-event queue. Events are rate limited at the source, so
 /// this only has to absorb a burst.
 const EVENT_QUEUE_CAPACITY: usize = 64;
 
-/// Minimum spacing between detail events pushed from the audio thread. A detail
-/// event is a concrete example, not a rate: the per-window counters already say
-/// how often something happens, so one per second is plenty.
+/// Minimum spacing between detail events from the audio thread. They are
+/// examples, not a rate - the counters carry the rate.
 const EVENT_MIN_INTERVAL_NANOS: u64 = 1_000_000_000;
 
 /// How often the monitor emits a line.
@@ -40,45 +39,117 @@ const NEAR_BUDGET_PERCENT: u64 = 80;
 /// this the sync loop is doing its job.
 const LAG_WARN_NANOS: i64 = 20_000_000;
 
+/// Longest gap between callbacks still worth reading as lost audio. Beyond this
+/// the device clock has jumped rather than the stream stalled: cpal stamps
+/// callbacks from PipeWire's graph clock and falls back to `CLOCK_MONOTONIC`
+/// when that is unavailable, and the two have different epochs.
+const MAX_PLAUSIBLE_GAP_NANOS: u64 = 1_000_000_000;
+
+/// Callbacks lost in one second at or above which the engine is failing rather
+/// than glitching. One or two is a click you can play through; three in a single
+/// second is the sound breaking up.
+const MANY_LOST_CALLBACKS: u64 = 3;
+
+/// Whether audio is being lost, judged on the last second.
+///
+/// Damage only. Thin margin and sync trouble go to the log; neither is audio
+/// anyone has lost yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HealthLevel {
+    /// Nothing lost.
+    Clean,
+    /// A few callbacks lost - clicks, not a breakdown.
+    Glitching,
+    /// [`MANY_LOST_CALLBACKS`] or more lost in one second.
+    Failing,
+}
+
+impl HealthLevel {
+    /// Classifies one second's worth of loss.
+    fn of(lost: u64) -> Self {
+        match lost {
+            0 => Self::Clean,
+            n if n < MANY_LOST_CALLBACKS => Self::Glitching,
+            _ => Self::Failing,
+        }
+    }
+}
+
+/// The verdict a display shows, computed once a second by the monitor.
+#[derive(Debug, Clone, Copy)]
+pub struct HealthDigest {
+    pub level: HealthLevel,
+    /// Callbacks lost in the last second.
+    pub lost: u64,
+    /// When the monitor started, so "clean for" has a floor.
+    pub started: Instant,
+    /// End of the last second in which anything was lost.
+    pub last_loss: Option<Instant>,
+}
+
+impl HealthDigest {
+    fn new(started: Instant) -> Self {
+        Self {
+            level: HealthLevel::Clean,
+            lost: 0,
+            started,
+            last_loss: None,
+        }
+    }
+
+    /// How long the engine has been losing nothing.
+    pub fn clean_for(&self) -> Duration {
+        self.last_loss.unwrap_or(self.started).elapsed()
+    }
+}
+
 /// Per-deck sound-quality health. Lives inside [`AudioHealth`]; one instance per
 /// deck, because a single shared lag gauge would be overwritten by whichever
 /// deck ran last.
 pub struct DeckHealth {
-    /// Blocks this deck rendered. Not health on its own; it's what the rest of
+    /// Callbacks this deck rendered. Not health on its own; it's what the rest of
     /// this struct divides by.
-    pub blocks_processed: AtomicU64,
+    pub callbacks_rendered: AtomicU64,
 
-    /// How far the playback clock currently trails the platter (a gauge, not a
-    /// counter). It is both the audible offset and the gain applied to slope
-    /// noise by the extrapolation in the audio processor.
+    /// How far the playback clock trails the platter (a gauge, not a counter).
+    /// Both the audible offset and the gain the extrapolation applies to slope
+    /// noise.
     pub playback_lag_nanos: AtomicI64,
-    /// Blocks where the lag correction hit its +/-5ms clamp, so it ran at its
+    /// Callbacks where the lag correction hit its +/-5ms clamp, so it ran at its
     /// ceiling of ~2.5ms/s of catch-up. The lag still moves at that rate; which
     /// way depends on whether skips inject lag faster. Read alongside
     /// `playback_lag_nanos` for the direction.
-    pub blocks_with_lag_correction_maxed: AtomicU64,
-    /// Blocks that found no fresh platter sample and had to extrapolate from a
-    /// stale slope. Should be 0 while the platter thread outruns the audio one.
+    pub callbacks_with_lag_correction_maxed: AtomicU64,
+    /// Callbacks that found no fresh platter sample and had to extrapolate from a
+    /// stale slope. Zero while the platter thread outruns the audio one.
     pub callbacks_without_fresh_platter_sample: AtomicU64,
     /// Times a whole decoded track was freed inside the callback because the
     /// recycling ring was full. Always causes a stall. Expected value: 0.
     pub tracks_freed_on_audio_thread: AtomicU64,
+
+    /// Times the playhead was repositioned: a load, a rewind, a fast-forward.
+    pub playhead_jumps: AtomicU64,
 }
 
 impl DeckHealth {
     fn new() -> Self {
         Self {
-            blocks_processed: AtomicU64::new(0),
+            callbacks_rendered: AtomicU64::new(0),
             playback_lag_nanos: AtomicI64::new(0),
-            blocks_with_lag_correction_maxed: AtomicU64::new(0),
+            callbacks_with_lag_correction_maxed: AtomicU64::new(0),
             callbacks_without_fresh_platter_sample: AtomicU64::new(0),
             tracks_freed_on_audio_thread: AtomicU64::new(0),
+            playhead_jumps: AtomicU64::new(0),
         }
     }
 
+    pub fn playback_lag(&self) -> i64 {
+        self.playback_lag_nanos.load(Relaxed)
+    }
+
     #[inline]
-    pub fn block_processed(&self) {
-        self.blocks_processed.fetch_add(1, Relaxed);
+    pub fn callback_rendered(&self) {
+        self.callbacks_rendered.fetch_add(1, Relaxed);
     }
 
     #[inline]
@@ -88,7 +159,7 @@ impl DeckHealth {
 
     #[inline]
     pub fn lag_correction_maxed(&self) {
-        self.blocks_with_lag_correction_maxed.fetch_add(1, Relaxed);
+        self.callbacks_with_lag_correction_maxed.fetch_add(1, Relaxed);
     }
 
     #[inline]
@@ -100,6 +171,11 @@ impl DeckHealth {
     #[inline]
     pub fn track_freed_on_audio_thread(&self) {
         self.tracks_freed_on_audio_thread.fetch_add(1, Relaxed);
+    }
+
+    #[inline]
+    pub fn playhead_jumped(&self) {
+        self.playhead_jumps.fetch_add(1, Relaxed);
     }
 }
 
@@ -115,7 +191,7 @@ pub struct AudioHealth {
     /// Time one callback has to finish: `frames_per_callback_expected / SAMPLE_RATE`.
     pub callback_budget_nanos: u64,
     /// Frames per callback we configured. The negotiated PipeWire quantum can
-    /// differ from this; that divergence is `blocks_silenced_by_frame_mismatch`.
+    /// differ from this; that divergence is `callbacks_silenced_by_frame_mismatch`.
     pub frames_per_callback_expected: u32,
     /// Device clock at the first callback, so event timestamps can be reported
     /// relative to the start of the stream rather than to boot. Not a metric.
@@ -132,9 +208,8 @@ pub struct AudioHealth {
     /// skipped us. `× callback_budget_nanos` is the silence that reached the DAC.
     pub callbacks_skipped: AtomicU64,
     /// How many separate times a skip happened, regardless of how many callbacks
-    /// each one swallowed. `callbacks_skipped / skip_incidents` is the average
-    /// hole size: many small holes are constant crackle, few large ones are
-    /// occasional stutters.
+    /// each one swallowed. Against `callbacks_skipped` it separates constant
+    /// crackle from a few long stutters.
     pub skip_incidents: AtomicU64,
     /// Longest time between two consecutive callbacks this window. Divide by
     /// `callback_budget_nanos` for the worst single hole, in callbacks. Not
@@ -142,21 +217,19 @@ pub struct AudioHealth {
     pub longest_gap_between_callbacks_nanos_window: AtomicU64,
     /// Longest gap of the whole run, for the teardown summary.
     pub longest_gap_between_callbacks_nanos_session: AtomicU64,
-    /// Blocks we zero-filled ourselves because the callback's frame count did
+    /// Callbacks we filled with silence ourselves because the callback's frame count did
     /// not match `frames_per_callback_expected`. On time, but silent, so the
     /// device clock never sees these.
-    pub blocks_silenced_by_frame_mismatch: AtomicU64,
+    pub callbacks_silenced_by_frame_mismatch: AtomicU64,
 
     // ---- cause: whose fault was it? ---------------------------------------
-    /// Callbacks that took >= 100% of budget, i.e. we definitely caused a skip.
-    /// Both this and `callbacks_skipped` high means we are too slow; skips with
-    /// this at zero means the graph skipped us and our DSP is not the problem.
+    /// Callbacks that took >= 100% of budget, i.e. we caused a skip ourselves.
+    /// Skips with this at zero were the graph skipping us, not our DSP.
     pub callbacks_over_budget: AtomicU64,
 
     // ---- capacity: is this buffer size viable? ----------------------------
     /// Callbacks that took >= 80% of budget, over-budget ones included. Rises
-    /// before audio breaks, so it is the warning ahead of
-    /// `callbacks_over_budget`.
+    /// before audio breaks.
     pub callbacks_near_budget: AtomicU64,
     /// Slowest callback this window. Cleared by the monitor each tick.
     pub longest_callback_nanos_window: AtomicU64,
@@ -167,6 +240,12 @@ pub struct AudioHealth {
     /// Detail events dropped because the event queue was full. Guards against
     /// reading a sparse event log as "few problems".
     pub detail_events_dropped: AtomicU64,
+    /// Times the device clock jumped further than [`MAX_PLAUSIBLE_GAP_NANOS`],
+    /// leaving a hole in the skip accounting rather than a dropout.
+    pub clock_discontinuities: AtomicU64,
+
+    /// The verdict for a display, written by the monitor once a second.
+    digest: AtomicCell<HealthDigest>,
 
     /// Per-deck sound-quality health, indexed by deck id.
     decks: Vec<Arc<DeckHealth>>,
@@ -191,14 +270,21 @@ impl AudioHealth {
             skip_incidents: AtomicU64::new(0),
             longest_gap_between_callbacks_nanos_window: AtomicU64::new(0),
             longest_gap_between_callbacks_nanos_session: AtomicU64::new(0),
-            blocks_silenced_by_frame_mismatch: AtomicU64::new(0),
+            callbacks_silenced_by_frame_mismatch: AtomicU64::new(0),
             callbacks_over_budget: AtomicU64::new(0),
             callbacks_near_budget: AtomicU64::new(0),
             longest_callback_nanos_window: AtomicU64::new(0),
             longest_callback_nanos_session: AtomicU64::new(0),
             detail_events_dropped: AtomicU64::new(0),
+            clock_discontinuities: AtomicU64::new(0),
+            digest: AtomicCell::new(HealthDigest::new(Instant::now())),
             decks: (0..decks).map(|_| Arc::new(DeckHealth::new())).collect(),
         })
+    }
+
+    /// The verdict for a display. See [`HealthDigest`].
+    pub fn digest(&self) -> HealthDigest {
+        self.digest.load()
     }
 
     /// Handle for one deck's processor to write its own metrics through.
@@ -255,9 +341,8 @@ impl AudioEvent {
 
 /// The audio thread's handle onto [`AudioHealth`].
 ///
-/// Owns the cursor state that must not be shared: two decks writing the same
-/// `prev_callback_nanos` would make the gap arithmetic meaningless, so it lives
-/// here rather than in the shared struct.
+/// Owns the cursor state that must not be shared: two writers of
+/// `prev_callback_nanos` would make the gap arithmetic meaningless.
 pub struct HealthRecorder {
     health: Arc<AudioHealth>,
     events: Producer<AudioEvent>,
@@ -287,8 +372,8 @@ impl HealthRecorder {
     }
 
     /// Counts the callback and works out how many the device expected in the
-    /// meantime. `callback_nanos` is the device clock, not ours: it is the only
-    /// source that knows how much audio actually left the DAC.
+    /// meantime. `callback_nanos` is the device clock, the only one that knows
+    /// how many callbacks the graph made while we were away.
     #[inline]
     pub fn on_callback_start(&mut self, callback_nanos: u64) {
         self.health.callbacks_served.fetch_add(1, Relaxed);
@@ -307,6 +392,13 @@ impl HealthRecorder {
 
         if self.prev_callback_nanos != 0 && callback_nanos > self.prev_callback_nanos {
             let gap = callback_nanos - self.prev_callback_nanos;
+
+            if gap > MAX_PLAUSIBLE_GAP_NANOS {
+                self.health.clock_discontinuities.fetch_add(1, Relaxed);
+                self.prev_callback_nanos = callback_nanos;
+                return;
+            }
+
             self.health
                 .longest_gap_between_callbacks_nanos_window
                 .fetch_max(gap, Relaxed);
@@ -336,7 +428,7 @@ impl HealthRecorder {
     #[inline]
     pub fn on_frame_mismatch(&mut self, callback_nanos: u64, got: u32) {
         self.health
-            .blocks_silenced_by_frame_mismatch
+            .callbacks_silenced_by_frame_mismatch
             .fetch_add(1, Relaxed);
         let expected = self.health.frames_per_callback_expected;
         self.push(AudioEvent::FrameMismatch {
@@ -374,8 +466,7 @@ impl HealthRecorder {
         }
     }
 
-    /// Rate limited at the source: a sustained failure must not flood the queue,
-    /// the counters already carry its rate.
+    /// Rate limited at the source so a sustained failure cannot flood the queue.
     #[inline]
     fn push(&mut self, event: AudioEvent) {
         let at = event.at_nanos();
@@ -394,17 +485,19 @@ impl HealthRecorder {
 }
 
 struct DeckSnapshot {
-    blocks_processed: u64,
+    callbacks_rendered: u64,
     lag_correction_maxed: u64,
     stale_platter_samples: u64,
     tracks_freed: u64,
+    playhead_jumps: u64,
 }
 
 struct Snapshot {
+    clock_discontinuities: u64,
     callbacks_served: u64,
     callbacks_skipped: u64,
     skip_incidents: u64,
-    blocks_silenced_by_frame_mismatch: u64,
+    callbacks_silenced_by_frame_mismatch: u64,
     callbacks_over_budget: u64,
     callbacks_near_budget: u64,
     detail_events_dropped: u64,
@@ -414,11 +507,12 @@ struct Snapshot {
 impl Snapshot {
     fn take(health: &AudioHealth) -> Self {
         Self {
+            clock_discontinuities: health.clock_discontinuities.load(Relaxed),
             callbacks_served: health.callbacks_served.load(Relaxed),
             callbacks_skipped: health.callbacks_skipped.load(Relaxed),
             skip_incidents: health.skip_incidents.load(Relaxed),
-            blocks_silenced_by_frame_mismatch: health
-                .blocks_silenced_by_frame_mismatch
+            callbacks_silenced_by_frame_mismatch: health
+                .callbacks_silenced_by_frame_mismatch
                 .load(Relaxed),
             callbacks_over_budget: health.callbacks_over_budget.load(Relaxed),
             callbacks_near_budget: health.callbacks_near_budget.load(Relaxed),
@@ -427,12 +521,13 @@ impl Snapshot {
                 .decks()
                 .iter()
                 .map(|deck| DeckSnapshot {
-                    blocks_processed: deck.blocks_processed.load(Relaxed),
-                    lag_correction_maxed: deck.blocks_with_lag_correction_maxed.load(Relaxed),
+                    callbacks_rendered: deck.callbacks_rendered.load(Relaxed),
+                    lag_correction_maxed: deck.callbacks_with_lag_correction_maxed.load(Relaxed),
                     stale_platter_samples: deck
                         .callbacks_without_fresh_platter_sample
                         .load(Relaxed),
                     tracks_freed: deck.tracks_freed_on_audio_thread.load(Relaxed),
+                    playhead_jumps: deck.playhead_jumps.load(Relaxed),
                 })
                 .collect(),
         }
@@ -472,6 +567,7 @@ pub fn spawn_monitor(
         let session_start = Instant::now();
         let mut previous = Snapshot::take(&health);
         let mut window_start = Instant::now();
+        let mut last_loss = None;
 
         while !shutdown.load(Relaxed) {
             std::thread::sleep(POLL_INTERVAL);
@@ -479,7 +575,8 @@ pub fn spawn_monitor(
 
             if window_start.elapsed() >= REPORT_INTERVAL {
                 let current = Snapshot::take(&health);
-                report_window(&health, &previous, &current);
+                let lost = report_window(&health, &previous, &current);
+                publish_digest(&health, &mut last_loss, lost, session_start);
                 previous = current;
                 window_start = Instant::now();
             }
@@ -526,17 +623,37 @@ fn drain_events(health: &AudioHealth, events: &mut Consumer<AudioEvent>) {
     }
 }
 
-fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) {
+/// Turns one second of counters into the verdict a display shows.
+fn publish_digest(
+    health: &AudioHealth,
+    last_loss: &mut Option<Instant>,
+    lost: u64,
+    session_start: Instant,
+) {
+    if lost > 0 {
+        *last_loss = Some(Instant::now());
+    }
+
+    health.digest.store(HealthDigest {
+        level: HealthLevel::of(lost),
+        lost,
+        started: session_start,
+        last_loss: *last_loss,
+    });
+}
+
+fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) -> u64 {
     let budget = health.callback_budget_nanos;
 
     let served = current.callbacks_served - previous.callbacks_served;
     let skipped = current.callbacks_skipped - previous.callbacks_skipped;
     let incidents = current.skip_incidents - previous.skip_incidents;
     let silenced =
-        current.blocks_silenced_by_frame_mismatch - previous.blocks_silenced_by_frame_mismatch;
+        current.callbacks_silenced_by_frame_mismatch - previous.callbacks_silenced_by_frame_mismatch;
     let over = current.callbacks_over_budget - previous.callbacks_over_budget;
     let near = current.callbacks_near_budget - previous.callbacks_near_budget;
     let dropped = current.detail_events_dropped - previous.detail_events_dropped;
+    let clock_jumps = current.clock_discontinuities - previous.clock_discontinuities;
     let expected = served + skipped;
 
     let slowest = health.longest_callback_nanos_window.swap(0, Relaxed);
@@ -548,7 +665,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
     let summary = format!(
         "audio: {served}/{expected} callbacks, {skipped} skipped in {incidents} incident(s) \
          ({:.1}%, {:.1}ms silence), longest gap {:.2}ms | slowest {:.0}us of {:.0}us budget \
-         ({:.0}%) | near-budget {near}, over-budget {over} | silenced blocks {silenced}",
+         ({:.0}%) | near-budget {near}, over-budget {over} | silenced {silenced}",
         percent(skipped, expected),
         millis(skipped * budget),
         millis(longest_gap),
@@ -567,6 +684,13 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         log::warn!("audio: {dropped} detail event(s) dropped, event log is incomplete");
     }
 
+    if clock_jumps > 0 {
+        log::warn!(
+            "audio: device clock jumped {clock_jumps} time(s); skips are unmeasured across those"
+        );
+    }
+
+
     for (deck_id, (deck, before)) in health
         .decks()
         .iter()
@@ -574,26 +698,32 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         .enumerate()
     {
         let after = &current.decks[deck_id];
-        let blocks = after.blocks_processed - before.blocks_processed;
+        let rendered = after.callbacks_rendered - before.callbacks_rendered;
         let maxed = after.lag_correction_maxed - before.lag_correction_maxed;
         let stale = after.stale_platter_samples - before.stale_platter_samples;
         let freed = after.tracks_freed - before.tracks_freed;
-        let lag = deck.playback_lag_nanos.load(Relaxed);
+        let jumps = after.playhead_jumps - before.playhead_jumps;
+        let lag = deck.playback_lag();
+
+        if jumps > 0 {
+            log::info!("audio deck{deck_id}: {jumps} playhead jump(s)");
+        }
 
         let line = format!(
-            "audio deck{deck_id}: lag {:.0}ms | correction maxed {maxed}/{blocks} blocks | \
+            "audio deck{deck_id}: lag {:.0}ms | correction maxed {maxed}/{rendered} callbacks | \
              {stale} stale platter sample(s) | {freed} track(s) freed on audio thread",
             lag as f64 / 1_000_000.0,
         );
 
-        // A saturated correction or a large lag is the whole point of this line,
-        // so it must not be hidden at info while only stale/freed promote it.
         if freed > 0 || stale > 0 || maxed > 0 || lag.abs() > LAG_WARN_NANOS {
             log::warn!("{line}");
         } else {
             log::info!("{line}");
         }
     }
+
+    // A silenced callback was served but carried no audio, so it counts as lost.
+    skipped + silenced
 }
 
 fn report_session(health: &AudioHealth, elapsed: Duration) {
@@ -605,7 +735,7 @@ fn report_session(health: &AudioHealth, elapsed: Duration) {
     log::info!(
         "audio session: {:.1}s, {served}/{expected} callbacks served, {skipped} skipped \
          ({:.2}%, {:.0}ms silence) in {} incident(s), longest gap {:.2}ms, \
-         slowest callback {:.0}us of {:.0}us budget, {} silenced block(s), \
+         slowest callback {:.0}us of {:.0}us budget, {} silenced callback(s), \
          {} over budget, {} near budget, {} detail event(s) dropped",
         elapsed.as_secs_f64(),
         percent(skipped, expected),
@@ -618,22 +748,85 @@ fn report_session(health: &AudioHealth, elapsed: Duration) {
         ),
         micros(health.longest_callback_nanos_session.load(Relaxed)),
         micros(budget),
-        health.blocks_silenced_by_frame_mismatch.load(Relaxed),
+        health.callbacks_silenced_by_frame_mismatch.load(Relaxed),
         health.callbacks_over_budget.load(Relaxed),
         health.callbacks_near_budget.load(Relaxed),
         health.detail_events_dropped.load(Relaxed),
     );
 
+    let clock_jumps = health.clock_discontinuities.load(Relaxed);
+    if clock_jumps > 0 {
+        log::info!("audio session: device clock jumped {clock_jumps} time(s)");
+    }
+
     for (deck_id, deck) in health.decks().iter().enumerate() {
         log::info!(
-            "audio session deck{deck_id}: {} blocks, lag {:.0}ms at exit, \
-             correction maxed on {} block(s), {} stale platter sample(s), \
+            "audio session deck{deck_id}: {} callbacks, lag {:.0}ms at exit, \
+             correction maxed on {} callback(s), {} stale platter sample(s), \
              {} track(s) freed on audio thread",
-            deck.blocks_processed.load(Relaxed),
+            deck.callbacks_rendered.load(Relaxed),
             deck.playback_lag_nanos.load(Relaxed) as f64 / 1_000_000.0,
-            deck.blocks_with_lag_correction_maxed.load(Relaxed),
+            deck.callbacks_with_lag_correction_maxed.load(Relaxed),
             deck.callbacks_without_fresh_platter_sample.load(Relaxed),
             deck.tracks_freed_on_audio_thread.load(Relaxed),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioHealth, HealthLevel, MANY_LOST_CALLBACKS, new_recorder};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// 64 frames at 48kHz: a 1333us budget, as `--buffer 64` gives.
+    fn recorder() -> super::HealthRecorder {
+        new_recorder(AudioHealth::new(64, 48_000, 1)).0
+    }
+
+    #[test]
+    fn a_missed_callback_counts_as_skipped() {
+        let mut r = recorder();
+        r.on_callback_start(1_000_000_000);
+        r.on_callback_start(1_000_000_000 + 4 * 1_333_333);
+        assert_eq!(r.health().callbacks_skipped.load(Relaxed), 3);
+        assert_eq!(r.health().clock_discontinuities.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_clock_jump_is_not_millions_of_dropouts() {
+        let mut r = recorder();
+        r.on_callback_start(1_000_000_000);
+        // cpal falls back from PipeWire's graph clock to CLOCK_MONOTONIC, so the
+        // stamp leaps epochs. It is not 7389 seconds of lost audio.
+        r.on_callback_start(1_000_000_000 + 7_389_843_500_000);
+        assert_eq!(r.health().callbacks_skipped.load(Relaxed), 0);
+        assert_eq!(r.health().clock_discontinuities.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn ordinary_jitter_is_not_a_skip() {
+        let mut r = recorder();
+        r.on_callback_start(1_000_000_000);
+        r.on_callback_start(1_000_000_000 + 1_700_000);
+        assert_eq!(r.health().callbacks_skipped.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn losing_nothing_is_clean() {
+        assert_eq!(HealthLevel::of(0), HealthLevel::Clean);
+    }
+
+    /// Literal on purpose: written against [`MANY_LOST_CALLBACKS`] it would
+    /// hold for any value of it.
+    #[test]
+    fn one_or_two_dropouts_is_a_glitch() {
+        assert_eq!(HealthLevel::of(1), HealthLevel::Glitching);
+        assert_eq!(HealthLevel::of(2), HealthLevel::Glitching);
+    }
+
+    #[test]
+    fn three_or_more_is_failing() {
+        assert_eq!(HealthLevel::of(3), HealthLevel::Failing);
+        assert_eq!(HealthLevel::of(1500), HealthLevel::Failing);
     }
 }

@@ -30,6 +30,7 @@ use crossbeam::channel::Sender;
 use percent_encoding::percent_decode_str;
 
 use crate::{
+    audio_health::{AudioHealth, HealthLevel},
     deck_controller::{AppStatus, DeckState},
     input_event::{AppEvent, InputEvent},
     record::{INanos, UNanos},
@@ -54,6 +55,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     platters: [ReadablePlatter; DECKS],
     tray_state: Arc<RwLock<TrayState>>,
     app_status: AppStatus,
+    health: Arc<AudioHealth>,
     events: Sender<InputEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
@@ -66,7 +68,9 @@ pub fn spawn_tui_thread<const DECKS: usize>(
             log::error!("cannot enable bracketed paste, drag and drop will not work: {e}");
         }
 
-        let tick_rate = Duration::from_millis(33); // ~30 FPS polling rate
+        // Doubles as the terminal poll timeout, so also the worst-case delay
+        // before a dropped file is noticed.
+        let tick_rate = Duration::from_millis(66); // ~15 FPS
 
         while !shutdown.load(Ordering::Relaxed) {
             let frame_start = Instant::now();
@@ -79,7 +83,15 @@ pub fn spawn_tui_thread<const DECKS: usize>(
 
             terminal
                 .draw(|frame| {
-                    render_tui(frame, &deck_states, &platters, current_active, tray, status);
+                    render_tui(
+                        frame,
+                        &deck_states,
+                        &platters,
+                        current_active,
+                        tray,
+                        status,
+                        &health,
+                    );
                 })
                 .expect("Failed to draw TUI frame");
 
@@ -243,6 +255,48 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
     }
 }
 
+/// Renders a duration the way you would say it out loud.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+
+/// One line saying whether audio is being lost, and how it should be coloured.
+fn health_line(health: &AudioHealth) -> (String, Style) {
+    let digest = health.digest();
+
+    match digest.level {
+        HealthLevel::Clean => (
+            format!(
+                "●  clean       nothing lost in {}",
+                format_duration(digest.clean_for())
+            ),
+            Style::default().fg(Color::Green),
+        ),
+
+        HealthLevel::Glitching => (
+            format!(
+                "▲  glitch      {} dropout{} in the last second",
+                digest.lost,
+                if digest.lost == 1 { "" } else { "s" },
+            ),
+            Style::default().fg(Color::Yellow),
+        ),
+
+        HealthLevel::Failing => (
+            format!(
+                "✗  LOSING AUDIO   {} dropouts in the last second - raise --buffer",
+                digest.lost,
+            ),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
 fn render_tui<const DECKS: usize>(
     frame: &mut Frame,
     deck_states: &[Arc<DeckState>; DECKS],
@@ -250,12 +304,15 @@ fn render_tui<const DECKS: usize>(
     active_deck_idx: Option<usize>,
     tray: Option<TrayState>,
     status: Option<String>,
+    health: &AudioHealth,
 ) {
-    // 1. Split layout vertically into deck table, record tray and status bar
+    // 1. Split layout vertically into deck table, audio health, record tray and
+    //    status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
@@ -354,16 +411,25 @@ fn render_tui<const DECKS: usize>(
     // Render deck status table in top chunk
     frame.render_widget(table, chunks[0]);
 
-    // 2. What is waiting to be loaded
+    // 2. Is the engine actually delivering the audio it computed
+    let (health_text, health_style) = health_line(health);
+    let health_widget = Paragraph::new(health_text).style(health_style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Audio Health "),
+    );
+    frame.render_widget(health_widget, chunks[1]);
+
+    // 3. What is waiting to be loaded
     let (tray_text, tray_style) = tray_line(tray, active_deck_idx);
     let tray_widget = Paragraph::new(tray_text).style(tray_style).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" Record Tray "),
     );
-    frame.render_widget(tray_widget, chunks[1]);
+    frame.render_widget(tray_widget, chunks[2]);
 
-    // 3. Handle status message rendering in bottom chunk
+    // 4. Handle status message rendering in bottom chunk
     let (status_text, status_style) = match status {
         Some(msg) => (msg, Style::default().fg(Color::Yellow)),
         None => (
@@ -379,12 +445,21 @@ fn render_tui<const DECKS: usize>(
     );
 
     // Render system status box in bottom chunk
-    frame.render_widget(status_widget, chunks[2]);
+    frame.render_widget(status_widget, chunks[3]);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_dropped_path;
+    use super::{format_duration, parse_dropped_path};
+    use std::time::Duration;
+
+    #[test]
+    fn durations_read_the_way_you_say_them() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
+        assert_eq!(format_duration(Duration::from_secs(62)), "1m 02s");
+        assert_eq!(format_duration(Duration::from_secs(3725)), "1h 02m");
+    }
 
     #[test]
     fn plain_path() {

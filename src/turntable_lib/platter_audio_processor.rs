@@ -57,23 +57,15 @@ pub struct PlatterAudioProcessor {
 
 /// Hands the decoded track to the tray rather than freeing it here.
 ///
-/// A processor is only ever dropped when the stream is torn down, and that runs
-/// on the RT-promoted audio thread: cpal's PipeWire worker owns our callback and
-/// drops it as it exits, while the main thread waits in `Stream::drop`. Freeing
-/// a track there - around 100MB for a four-minute file, measured at 5.3ms - is
-/// more continuous CPU than the `RLIMIT_RTTIME` that RT promotion carries (one
-/// buffer period: 5.3ms at 256 frames, 667us at 32), and the kernel answers with
-/// SIGXCPU: terminate and dump core.
+/// A processor is dropped on the RT-promoted audio thread, because cpal's
+/// PipeWire worker owns our callback and drops it as it exits. Freeing a track
+/// costs more continuous CPU than the `RLIMIT_RTTIME` that RT promotion carries,
+/// and the kernel answers with SIGXCPU, so it goes down the same disposal ring as
+/// a live swap: see [`PlatterAudioProcessor::set_record`]. Teardown joins the
+/// tray after the stream so it is still there to receive it.
 ///
-/// So it goes down the same disposal ring a live record swap uses, see
-/// [`PlatterAudioProcessor::set_record`]. Pushing moves only the `Vec`'s pointer,
-/// length and capacity; the tray thread does the actual freeing, and teardown
-/// joins it after the stream for exactly that reason.
-///
-/// Leaking is the fallback, not the plan: with the tray's consumer already gone
-/// our producer would be the ring's last owner, and deallocating it would drop
-/// the record here - the very SIGXCPU above. A moment before the process exits,
-/// letting the OS reclaim the pages is the cheaper mistake.
+/// The fallback leaks because with the tray's consumer gone our producer would be
+/// the ring's last owner, and deallocating it would drop the record here.
 impl Drop for PlatterAudioProcessor {
     fn drop(&mut self) {
         let Some(record) = self.cur_record.take() else {
@@ -162,7 +154,7 @@ impl PlatterAudioProcessor {
 
     /// Warning: this function must be very fast, no allocation
     pub fn write_frames(&mut self, frames: &mut [StereoFrame]) {
-        self.health.block_processed();
+        self.health.callback_rendered();
         let samples_n = frames.len() as i64;
         if let Ok(record) = self.handles.next_record.pop() {
             self.set_record(record);
@@ -183,10 +175,7 @@ impl PlatterAudioProcessor {
             // =================================================================
             // JUMP case, we jump to the latest observation no matter how big is the current lag
             // =================================================================
-            log::info!(
-                "Playhead jumped: jump distance: {:.2}s",
-                observed_played_nanos.0 as f64 / 1_000_000_000.0
-            );
+            self.health.playhead_jumped();
             let playhead = INanos(
                 self.second_measurement.record_pos.0
                     - (self.last_speed * block_duration.as_nanos() as f64) as i64,

@@ -32,8 +32,8 @@ impl<const DECKS: usize> SamplesPoller<DECKS> {
     }
 
     /// `callback_nanos` is the device clock stamp of this callback, the only
-    /// source that knows how much audio actually left the DAC while we were
-    /// away. See [`crate::audio_health::HealthRecorder::on_callback_start`].
+    /// clock that knows how many callbacks the graph made while we were away.
+    /// See [`crate::audio_health::HealthRecorder::on_callback_start`].
     pub fn write_frames(&mut self, data: &mut [f32], callback_nanos: u64) {
         let started = Instant::now();
         self.health.on_callback_start(callback_nanos);
@@ -75,7 +75,7 @@ impl<const DECKS: usize> SamplesPoller<DECKS> {
     }
 
     /// Closes out the health bookkeeping for one callback. Called on every exit
-    /// path, so a silenced block still shows up as time spent.
+    /// path, so a silenced callback still shows up as time spent.
     fn finish(&mut self, callback_nanos: u64, started: Instant, frames: usize) {
         let elapsed_nanos = started.elapsed().as_nanos() as u64;
         self.health

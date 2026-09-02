@@ -24,6 +24,14 @@ use crate::{
 /// time that fast-forward skips
 static FF_TIME: UNanos = UNanos(15 * 1_000_000_000);
 
+/// Most input events one platter update will absorb.
+const MAX_EVENTS_PER_UPDATE: usize = 1000;
+
+/// Platter updates per audio callback. One is the floor - below it a callback
+/// finds no fresh sample and extrapolates from a stale slope - and the loop
+/// below undershoots whatever it asks for, so two.
+const UPDATES_PER_CALLBACK: f64 = 2.;
+
 #[derive(Debug)]
 pub enum Jump {
     /// set playhead to the start
@@ -114,7 +122,7 @@ impl PlatterDriver {
     ) -> Self {
         let record_speed = Speed::new(inertia_tau_secs, 0.005);
         let frequency_hz = Self::platter_update_freq(buffer_frames_n);
-        log::info!("calculated platter update frequency is {frequency_hz}hz");
+        log::info!("platter update frequency is a nominal {frequency_hz}hz");
 
         Self {
             deck_id,
@@ -130,9 +138,10 @@ impl PlatterDriver {
         }
     }
 
-    /// Calculates optimal update frequency
+    /// Nominal update frequency. The loop achieves somewhat less.
     fn platter_update_freq(buffer_frames_n: usize) -> usize {
-        (1. / PlatterAudioProcessor::frames_to_dur(buffer_frames_n).as_secs_f64() * 3.) as usize
+        let callback_rate = 1. / PlatterAudioProcessor::frames_to_dur(buffer_frames_n).as_secs_f64();
+        (callback_rate * UPDATES_PER_CALLBACK) as usize
     }
 
     /// Calculates platter position in nanos
@@ -252,10 +261,11 @@ impl PlatterDriver {
 
     /// Updates virtual platter according to current state
     pub fn update_platter(&mut self) {
-        // to not get stuck handling updates
-        for _ in 0..1000 {
-            if let Ok(upd) = self.events.try_recv() {
-                self.handle_event(upd);
+        // Bounded so a flood of input cannot starve the position update below.
+        for _ in 0..MAX_EVENTS_PER_UPDATE {
+            match self.events.try_recv() {
+                Ok(event) => self.handle_event(event),
+                Err(_) => break,
             }
         }
         let pos = self.calculate_position();

@@ -83,12 +83,9 @@ enum Commands {
 
 /// Puts panics in the log file, where they survive the TUI.
 ///
-/// Without this a panic is effectively invisible: the TUI holds the terminal in
-/// raw mode and owns the alternate screen, so the default handler's message is
-/// swallowed and all that reaches the user is the shell reporting a dropped
-/// core. A panic that unwinds out of the audio callback's C boundary aborts the
-/// process rather than unwinding, but the hook still runs first, so this is what
-/// catches that case too.
+/// The TUI holds the terminal in raw mode, so the default handler's message is
+/// swallowed. Also catches a panic that aborts across the audio callback's C
+/// boundary, since the hook runs before the abort.
 fn install_panic_logger() {
     let default_hook = std::panic::take_hook();
 
@@ -101,14 +98,13 @@ fn install_panic_logger() {
         };
         let message = info.payload_as_str().unwrap_or("<non-string payload>");
 
-        // Logged before anything else is attempted, so the log has the panic even
-        // if restoring the terminal below hangs or panics in turn.
+        // Logged first, so the log has the panic even if the restore below hangs.
         log::error!(
             "PANIC on thread '{thread_name}' at {location}: {message}\nbacktrace:\n{}",
             std::backtrace::Backtrace::force_capture()
         );
 
-        // Leaving raw mode is what makes the default handler's output readable.
+        // Leaving raw mode makes the default handler's output readable.
         ratatui::restore();
         default_hook(info);
     }));
