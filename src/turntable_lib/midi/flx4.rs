@@ -59,6 +59,10 @@ pub enum Button {
     PlayPause,
     Cue,
     Shift,
+    /// CUE/LOOP CALL, the two arrows under the jog wheel. Halve and double the
+    /// active loop on the stock firmware; here they seek.
+    SeekBack,
+    SeekForward,
     /// LOAD lives on the shared mixer channel and names its target deck in the
     /// note number, so it carries the deck itself.
     Load(Deck),
@@ -71,6 +75,8 @@ impl Button {
             // Per-deck transport buttons (channels 1/2, or 5/6 with shift).
             (Some(_), 0x0B) => Button::PlayPause,
             (Some(_), 0x0C) => Button::Cue,
+            (Some(_), 0x51) => Button::SeekBack,
+            (Some(_), 0x53) => Button::SeekForward,
             (Some(_), 0x3F) => Button::Shift,
             // LOAD buttons live on the shared mixer channel, one note each.
             (None, 0x46) => Button::Load(Deck::One),
@@ -85,6 +91,8 @@ impl fmt::Display for Button {
         match *self {
             Button::PlayPause => f.write_str("PLAY/PAUSE"),
             Button::Cue => f.write_str("CUE"),
+            Button::SeekBack => f.write_str("CUE/LOOP CALL <"),
+            Button::SeekForward => f.write_str("CUE/LOOP CALL >"),
             Button::Shift => f.write_str("SHIFT"),
             Button::Load(deck) => write!(f, "LOAD -> deck {}", deck.index() + 1),
             Button::Unmapped(note) => write!(f, "unmapped note 0x{note:02X}"),
@@ -359,6 +367,8 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
         } => match button {
             Button::PlayPause => (deck?.index(), DeckCommand::StartStop),
             Button::Cue => (deck?.index(), DeckCommand::PlayheadReset),
+            Button::SeekBack => (deck?.index(), DeckCommand::PlayheadRewind),
+            Button::SeekForward => (deck?.index(), DeckCommand::PlayheadFF),
             // The LOAD buttons name their target deck, so they are the only
             // controls that reach across from the mixer channel to a deck.
             Button::Load(target) => (target.index(), DeckCommand::LoadRecord),
@@ -400,6 +410,18 @@ mod tests {
             value: lsb,
         })
         .expect("tempo event")
+    }
+
+    /// Press a button on a deck channel and map it through to a deck command.
+    fn press(channel: u8, note: u8) -> InputEvent {
+        let event = Decoder::new()
+            .decode(&MidiMessage::NoteOn {
+                channel,
+                note,
+                velocity: 0x7F,
+            })
+            .expect("button event");
+        to_input_event(event, 0.08, Instant::now()).expect("deck command")
     }
 
     fn jog(decoder: &mut Decoder, channel: u8, value: u8) -> Event {
@@ -508,4 +530,37 @@ mod tests {
         assert_eq!(deck_id, 0);
         assert!(matches!(deck_event.command, DeckCommand::ScratchMove(4)));
     }
+    #[test]
+    fn cue_loop_call_seeks_on_either_deck() {
+        for (channel, deck) in [(0u8, 0usize), (1, 1)] {
+            assert!(
+                matches!(
+                    press(channel, 0x51),
+                    InputEvent::Deck(
+                        d,
+                        DeckEvent {
+                            command: DeckCommand::PlayheadRewind,
+                            ..
+                        }
+                    ) if d == deck
+                ),
+                "channel {channel} note 0x51 should rewind deck {deck}"
+            );
+            assert!(
+                matches!(
+                    press(channel, 0x53),
+                    InputEvent::Deck(
+                        d,
+                        DeckEvent {
+                            command: DeckCommand::PlayheadFF,
+                            ..
+                        }
+                    ) if d == deck
+                ),
+                "channel {channel} note 0x53 should fast-forward deck {deck}"
+            );
+        }
+    }
+
 }
+
