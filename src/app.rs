@@ -17,6 +17,7 @@ use crossbeam::channel::{Receiver, Sender, bounded};
 
 use crate::InputKind;
 use turntable_lib::{
+    audio_health::{self, AudioHealth, HealthRecorder},
     deck_controller::{self, AppStatus, DeckController, DeckId},
     decoder::SAMPLE_RATE,
     input_event::{AppEvent, DeckEvent, InputEvent},
@@ -98,6 +99,11 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         InputKind::Midi => None,
     };
 
+    // One health struct for the whole stream, with a slot per deck. The audio
+    // thread only ever bumps atomics in it; the monitor thread does the logging.
+    let health = AudioHealth::new(options.buffer_frames_n, SAMPLE_RATE, DECKS);
+    let (health_recorder, health_events) = audio_health::new_recorder(Arc::clone(&health));
+
     let deck_tuples = std::array::from_fn(|deck_idx| {
         deck_controller::new_deck(
             deck_idx,
@@ -106,6 +112,7 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
             tray_snd.clone(),
             Arc::clone(&shutdown),
             options.buffer_frames_n as usize,
+            health.deck(deck_idx),
         )
     });
 
@@ -118,8 +125,11 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         audio_processor_handles,
         deck_routing,
         options.device_query,
+        health_recorder,
     )
     .unwrap();
+
+    let health_monitor = audio_health::spawn_monitor(health, health_events, Arc::clone(&shutdown));
 
     let tray = tray::start(
         tray_rcv,
@@ -192,6 +202,11 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
 
     if let Err(_) = tui_handle.join() {
         log::error!("TUI thread panicked");
+    }
+
+    // Joined last of the workers: it reports the session totals on the way out.
+    if let Err(_) = health_monitor.join() {
+        log::error!("Audio health monitor panicked");
     }
 
     // 5. Consolidate telemetry tracers across controllers and driver threads
@@ -437,6 +452,7 @@ fn start_deck<const DECKS: usize>(
     audio_processor_handles: [AudioProcessorHandles; DECKS],
     deck_routing: [usize; DECKS],
     device_query: Option<&str>,
+    health: HealthRecorder,
 ) -> anyhow::Result<Stream> {
     let host = cpal::default_host();
     log::info!("CPAL Host API: {:?}", host.id());
@@ -535,12 +551,16 @@ fn start_deck<const DECKS: usize>(
 
     // 4. Instantiate processor poller and build audio stream
     let processors = audio_processor_handles.map(PlatterAudioProcessor::new);
-    let mut samples_poller = SamplesPoller::new(buffer_frames_n as usize, processors, deck_routing);
+    let mut samples_poller =
+        SamplesPoller::new(buffer_frames_n as usize, processors, deck_routing, health);
 
     let stream = device.build_output_stream(
         chosen_config,
-        move |data: &mut [f32], _| {
-            samples_poller.write_frames(data);
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // The device clock, not ours: the only source that knows how many
+            // callbacks the graph made while we were not looking.
+            let callback_nanos = info.timestamp().callback.as_nanos() as u64;
+            samples_poller.write_frames(data, callback_nanos);
         },
         move |err| {
             log::error!("Audio stream execution error: {err}");

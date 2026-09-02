@@ -1,11 +1,18 @@
+use std::time::Instant;
+
 use thiserror::Error;
 
-use crate::{platter_audio_processor::PlatterAudioProcessor, stereo_frame::StereoFrame};
+use crate::{
+    audio_health::HealthRecorder, platter_audio_processor::PlatterAudioProcessor,
+    stereo_frame::StereoFrame,
+};
 
 pub struct SamplesPoller<const DECKS: usize> {
     buffers: [Vec<StereoFrame>; DECKS],
     audio_processors: [PlatterAudioProcessor; DECKS],
     routing: DeckRouting<DECKS>,
+    /// audio-thread end of the health metrics, see [`crate::audio_health`]
+    health: HealthRecorder,
 }
 
 impl<const DECKS: usize> SamplesPoller<DECKS> {
@@ -13,21 +20,32 @@ impl<const DECKS: usize> SamplesPoller<DECKS> {
         samples_n: usize,
         audio_processors: [PlatterAudioProcessor; DECKS],
         routing: DeckRouting<DECKS>,
+        health: HealthRecorder,
     ) -> Self {
         let buf = vec![StereoFrame::default(); samples_n];
         Self {
             buffers: std::array::from_fn(|_| buf.clone()),
             audio_processors,
             routing,
+            health,
         }
     }
 
-    pub fn write_frames(&mut self, data: &mut [f32]) {
+    /// `callback_nanos` is the device clock stamp of this callback, the only
+    /// source that knows how much audio actually left the DAC while we were
+    /// away. See [`crate::audio_health::HealthRecorder::on_callback_start`].
+    pub fn write_frames(&mut self, data: &mut [f32], callback_nanos: u64) {
+        let started = Instant::now();
+        self.health.on_callback_start(callback_nanos);
+
         let channels = self.routing.channels();
         let total_samples = data.len() / channels;
 
         if data.len() % channels != 0 || total_samples != self.buffers[0].len() {
             data.fill(0.0);
+            self.health
+                .on_frame_mismatch(callback_nanos, total_samples as u32);
+            self.finish(callback_nanos, started, total_samples);
             return;
         }
 
@@ -52,6 +70,16 @@ impl<const DECKS: usize> SamplesPoller<DECKS> {
                 data[output_offset + ch_right] = frame.r;
             }
         }
+
+        self.finish(callback_nanos, started, total_samples);
+    }
+
+    /// Closes out the health bookkeeping for one callback. Called on every exit
+    /// path, so a silenced block still shows up as time spent.
+    fn finish(&mut self, callback_nanos: u64, started: Instant, frames: usize) {
+        let elapsed_nanos = started.elapsed().as_nanos() as u64;
+        self.health
+            .on_callback_end(callback_nanos, elapsed_nanos, frames as u32);
     }
 }
 

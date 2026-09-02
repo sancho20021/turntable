@@ -13,6 +13,7 @@ use crossbeam::{
 };
 
 use crate::{
+    audio_health::DeckHealth,
     filters::FirstOrderLPF,
     input_event::{DeckCommand, DeckEvent},
     input_profile::InputProfile,
@@ -107,6 +108,7 @@ pub fn new_deck(
     tray: Sender<TrayCommand>,
     shutdown: Arc<AtomicBool>,
     buffer_frames_n: usize,
+    health: Arc<DeckHealth>,
 ) -> (
     DeckController,
     PlatterDriver,
@@ -128,6 +130,7 @@ pub fn new_deck(
         next_record: new_record_cons,
         used_records: used_records_prod,
         platter: readable_platter.clone(),
+        health,
     };
     let deck_slot = DeckSlot {
         records_in: new_record_prod,

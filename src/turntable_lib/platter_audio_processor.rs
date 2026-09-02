@@ -1,8 +1,9 @@
-use std::time::{Duration, Instant};
+use std::{sync::Arc, time::Duration};
 
 use rtrb::{Consumer, Producer};
 
 use crate::{
+    audio_health::DeckHealth,
     decoder::SAMPLE_RATE,
     filters::FirstOrderLPF,
     record::{INanos, Record, UNanos, interpolation::Linear},
@@ -17,6 +18,11 @@ static SYNC_TIME: Duration = Duration::from_millis(2000);
 
 static PLAYHEAD_LPF_TAU: f64 = 0.025;
 
+/// How far the filtered lag is allowed to run before the correction saturates.
+/// Hitting it caps the catch-up rate; see
+/// [`DeckHealth::blocks_with_lag_correction_maxed`].
+static LAG_CLAMP: INanos = INanos(5_000_000);
+
 /// Communication channels for audio processor
 pub struct AudioProcessorHandles {
     /// record sent to play instead of current record
@@ -25,6 +31,8 @@ pub struct AudioProcessorHandles {
     pub used_records: Producer<Record>,
     /// source of platter position
     pub platter: ReadablePlatter,
+    /// where this deck reports its own health, see [`crate::audio_health`]
+    pub health: Arc<DeckHealth>,
 }
 
 /// The self-contained logic unit that transforms platter ticks into audio samples.
@@ -43,6 +51,45 @@ pub struct PlatterAudioProcessor {
     filtered_lag: INanos,
     /// last speed of playback
     last_speed: f64,
+    /// this deck's health metrics
+    health: Arc<DeckHealth>,
+}
+
+/// Hands the decoded track to the tray rather than freeing it here.
+///
+/// A processor is only ever dropped when the stream is torn down, and that runs
+/// on the RT-promoted audio thread: cpal's PipeWire worker owns our callback and
+/// drops it as it exits, while the main thread waits in `Stream::drop`. Freeing
+/// a track there - around 100MB for a four-minute file, measured at 5.3ms - is
+/// more continuous CPU than the `RLIMIT_RTTIME` that RT promotion carries (one
+/// buffer period: 5.3ms at 256 frames, 667us at 32), and the kernel answers with
+/// SIGXCPU: terminate and dump core.
+///
+/// So it goes down the same disposal ring a live record swap uses, see
+/// [`PlatterAudioProcessor::set_record`]. Pushing moves only the `Vec`'s pointer,
+/// length and capacity; the tray thread does the actual freeing, and teardown
+/// joins it after the stream for exactly that reason.
+///
+/// Leaking is the fallback, not the plan: with the tray's consumer already gone
+/// our producer would be the ring's last owner, and deallocating it would drop
+/// the record here - the very SIGXCPU above. A moment before the process exits,
+/// letting the OS reclaim the pages is the cheaper mistake.
+impl Drop for PlatterAudioProcessor {
+    fn drop(&mut self) {
+        let Some(record) = self.cur_record.take() else {
+            return;
+        };
+
+        if self.handles.used_records.is_abandoned() {
+            std::mem::forget(record);
+            return;
+        }
+
+        match self.handles.used_records.push(record) {
+            Ok(()) => {}
+            Err(rtrb::PushError::Full(record)) => std::mem::forget(record),
+        }
+    }
 }
 
 fn ma_filter(old_value: f64, new_value: f64, new_value_proportion: f64) -> f64 {
@@ -65,13 +112,12 @@ impl PlatterAudioProcessor {
 
     fn set_record(&mut self, record: Record) {
         if let Some(old_record) = self.cur_record.replace(record) {
-            // in case of failure, we will drop it in audio thread which may lead to buffer overrun / underrun
+            // in case of failure, we will drop it in audio thread which frees the
+            // whole decoded track here and stalls the callback
             match self.handles.used_records.push(old_record) {
                 Ok(()) => {}
                 Err(rtrb::PushError::Full(old_rec)) => {
-                    log::warn!(
-                        "Failed to send used record to record changer, dropping on audio thread (may cause buffer overrun / underrun)"
-                    );
+                    self.health.track_freed_on_audio_thread();
                     drop(old_rec);
                 }
             }
@@ -79,6 +125,7 @@ impl PlatterAudioProcessor {
     }
 
     pub fn new(handles: AudioProcessorHandles) -> Self {
+        let health = Arc::clone(&handles.health);
         let first_measurement = handles.platter.get_playhead();
         let second_measurement = PlatterSample {
             timestamp_nanos: UNanos(first_measurement.timestamp_nanos.0 + 1),
@@ -93,6 +140,7 @@ impl PlatterAudioProcessor {
             filtered_target_playhead: FirstOrderLPF::new(PLAYHEAD_LPF_TAU),
             filtered_lag: INanos(0),
             last_speed: 0., // one of sources of slow startup
+            health,
         };
         processor
     }
@@ -101,6 +149,10 @@ impl PlatterAudioProcessor {
         if self.second_measurement.timestamp_nanos != cur.timestamp_nanos {
             self.first_measurement = self.second_measurement;
             self.second_measurement = cur;
+        } else {
+            // no fresh platter sample, so the slope below is stale and the
+            // extrapolation is guessing
+            self.health.stale_platter_sample();
         }
     }
     /// Converts sample number to nanosecs
@@ -110,7 +162,7 @@ impl PlatterAudioProcessor {
 
     /// Warning: this function must be very fast, no allocation
     pub fn write_frames(&mut self, frames: &mut [StereoFrame]) {
-        let start = Instant::now();
+        self.health.block_processed();
         let samples_n = frames.len() as i64;
         if let Ok(record) = self.handles.next_record.pop() {
             self.set_record(record);
@@ -174,12 +226,16 @@ impl PlatterAudioProcessor {
                             ma_filter(self.filtered_lag.0 as f64, lags_behind.0 as f64, 0.1) as i64,
                         );
 
-                    self.filtered_lag = self
-                        .filtered_lag
-                        .clamp(INanos(-5_000_000), INanos(5_000_000)); // TODO: think of good numbers
+                    let unclamped = self.filtered_lag;
+                    self.filtered_lag =
+                        unclamped.clamp(INanos(-LAG_CLAMP.0), LAG_CLAMP); // TODO: think of good numbers
+                    if self.filtered_lag != unclamped {
+                        self.health.lag_correction_maxed();
+                    }
 
-                    log::debug!("raw lag = {}ms", lags_behind.as_millis());
-                    log::debug!("filtered lag = {}ms", self.filtered_lag.as_millis());
+                    // the raw lag is the gauge worth watching: it is both the
+                    // audible offset and the gain on slope noise below
+                    self.health.set_playback_lag(lags_behind.0);
                 }
 
                 // if we add lags_behind to target_timestamp, we will remove the lag.
@@ -188,7 +244,6 @@ impl PlatterAudioProcessor {
                     self.filtered_lag.0
                         / ((SYNC_TIME.as_nanos() / block_duration.as_nanos()) as i64),
                 );
-                log::debug!("stepped filtered lag = {}", lags_behind_step.as_millis());
                 UNanos((target_timestamp.0 as i64 + lags_behind_step.0) as u64)
             };
 
@@ -220,19 +275,6 @@ impl PlatterAudioProcessor {
             )
         };
 
-        log::debug!(
-            "observations at {}ms, ..+{}ms",
-            self.first_measurement.timestamp_nanos.as_millis(),
-            (self.second_measurement.timestamp_nanos.0 - self.first_measurement.timestamp_nanos.0)
-                / 1000000
-        );
-        log::debug!(
-            "playing at = {}ms, ..+{:.0}ms at speed {:.2}",
-            self.last_played.timestamp_nanos.as_millis(),
-            (target_playhead.timestamp_nanos.0 - self.last_played.timestamp_nanos.0) / 1000000,
-            step.0 as f64 / (self.sample_to_nanos(1.))
-        );
-
         self.last_speed =
             (target_playhead.record_pos.0 - playhead.0) as f64 / block_duration.as_nanos() as f64;
 
@@ -245,15 +287,6 @@ impl PlatterAudioProcessor {
             }
         } else {
             frames.fill(StereoFrame::default());
-        }
-
-        let elapsed = start.elapsed();
-        if elapsed > Duration::from_micros(1500) {
-            log::warn!(
-                "write frames took {}us at timestamp={}us",
-                elapsed.as_micros(),
-                self.last_played.timestamp_nanos.as_micros()
-            );
         }
     }
 }

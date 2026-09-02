@@ -81,6 +81,39 @@ enum Commands {
     },
 }
 
+/// Puts panics in the log file, where they survive the TUI.
+///
+/// Without this a panic is effectively invisible: the TUI holds the terminal in
+/// raw mode and owns the alternate screen, so the default handler's message is
+/// swallowed and all that reaches the user is the shell reporting a dropped
+/// core. A panic that unwinds out of the audio callback's C boundary aborts the
+/// process rather than unwinding, but the hook still runs first, so this is what
+/// catches that case too.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let location = match info.location() {
+            Some(l) => format!("{}:{}:{}", l.file(), l.line(), l.column()),
+            None => "<unknown location>".to_string(),
+        };
+        let message = info.payload_as_str().unwrap_or("<non-string payload>");
+
+        // Logged before anything else is attempted, so the log has the panic even
+        // if restoring the terminal below hangs or panics in turn.
+        log::error!(
+            "PANIC on thread '{thread_name}' at {location}: {message}\nbacktrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+
+        // Leaving raw mode is what makes the default handler's output readable.
+        ratatui::restore();
+        default_hook(info);
+    }));
+}
+
 fn main() {
     let args = Cli::parse();
 
@@ -99,6 +132,8 @@ fn main() {
     env_logger::builder()
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
+
+    install_panic_logger();
 
     info!("Initialized logging to {:?}", args.log_file);
 
