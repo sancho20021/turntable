@@ -140,7 +140,8 @@ impl PlatterDriver {
 
     /// Nominal update frequency. The loop achieves somewhat less.
     fn platter_update_freq(buffer_frames_n: usize) -> usize {
-        let callback_rate = 1. / PlatterAudioProcessor::frames_to_dur(buffer_frames_n).as_secs_f64();
+        let callback_rate =
+            1. / PlatterAudioProcessor::frames_to_dur(buffer_frames_n).as_secs_f64();
         (callback_rate * UPDATES_PER_CALLBACK) as usize
     }
 

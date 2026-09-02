@@ -159,7 +159,8 @@ impl DeckHealth {
 
     #[inline]
     pub fn lag_correction_maxed(&self) {
-        self.callbacks_with_lag_correction_maxed.fetch_add(1, Relaxed);
+        self.callbacks_with_lag_correction_maxed
+            .fetch_add(1, Relaxed);
     }
 
     #[inline]
@@ -648,8 +649,8 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
     let served = current.callbacks_served - previous.callbacks_served;
     let skipped = current.callbacks_skipped - previous.callbacks_skipped;
     let incidents = current.skip_incidents - previous.skip_incidents;
-    let silenced =
-        current.callbacks_silenced_by_frame_mismatch - previous.callbacks_silenced_by_frame_mismatch;
+    let silenced = current.callbacks_silenced_by_frame_mismatch
+        - previous.callbacks_silenced_by_frame_mismatch;
     let over = current.callbacks_over_budget - previous.callbacks_over_budget;
     let near = current.callbacks_near_budget - previous.callbacks_near_budget;
     let dropped = current.detail_events_dropped - previous.detail_events_dropped;
@@ -690,13 +691,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         );
     }
 
-
-    for (deck_id, (deck, before)) in health
-        .decks()
-        .iter()
-        .zip(previous.decks.iter())
-        .enumerate()
-    {
+    for (deck_id, (deck, before)) in health.decks().iter().zip(previous.decks.iter()).enumerate() {
         let after = &current.decks[deck_id];
         let rendered = after.callbacks_rendered - before.callbacks_rendered;
         let maxed = after.lag_correction_maxed - before.lag_correction_maxed;

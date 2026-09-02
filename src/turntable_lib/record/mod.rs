@@ -42,8 +42,12 @@ impl Record {
         SAMPLE_RATE as f64 * (nanos.0 as f64 / 1_000_000_000.)
     }
     pub fn get_sample(&self, position: INanos) -> StereoFrame {
-        let position = self.nanosecs_to_sample(position);
+        self.get_sample_at(self.nanosecs_to_sample(position))
+    }
 
+    /// Interpolates at a fractional sample index, the unit the audio loop steps
+    /// in so a whole block stays on one grid.
+    pub fn get_sample_at(&self, position: f64) -> StereoFrame {
         if !(0. <= position && position < self.samples.len() as f64) {
             return StereoFrame::default();
         }

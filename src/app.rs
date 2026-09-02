@@ -129,11 +129,8 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     )
     .unwrap();
 
-    let health_monitor = audio_health::spawn_monitor(
-        Arc::clone(&health),
-        health_events,
-        Arc::clone(&shutdown),
-    );
+    let health_monitor =
+        audio_health::spawn_monitor(Arc::clone(&health), health_events, Arc::clone(&shutdown));
 
     let tray = tray::start(
         tray_rcv,
