@@ -5,7 +5,7 @@ use rtrb::{Consumer, Producer};
 use crate::{
     audio_health::DeckHealth,
     decoder::SAMPLE_RATE,
-    filters::FirstOrderLPF,
+    filters::{FirstOrderLPF, StereoDcBlocker},
     record::{INanos, Record, UNanos, interpolation::Linear},
     stereo_frame::StereoFrame,
     virtual_platter::{PlatterSample, ReadablePlatter},
@@ -17,6 +17,20 @@ use crate::{
 static SYNC_TIME: Duration = Duration::from_millis(2000);
 
 static PLAYHEAD_LPF_TAU: f64 = 0.025;
+// static PLAYHEAD_LPF_TAU: f64 = 0.05;
+
+/// Corner of the output high-pass, in Hz.
+///
+/// A parked playhead renders the same sample over and over, so a deck sitting
+/// still holds whatever level it stopped on - up to full scale - as a DC offset,
+/// and the step down to silence when the stream closes is a click the offset was
+/// storing up. Draining it here is also the more faithful deck: a cartridge is a
+/// velocity transducer, so a record at rest puts out nothing, and one moving
+/// slower than this corner puts out proportionally less.
+///
+/// Lower it to keep more sub-bass, at the
+/// price of a slower drain.
+static DC_BLOCKER_HZ: f64 = 10.;
 
 /// How far the filtered lag is allowed to run before the correction saturates.
 /// Hitting it caps the catch-up rate; see
@@ -51,6 +65,8 @@ pub struct PlatterAudioProcessor {
     filtered_lag: INanos,
     /// last speed of playback
     last_speed: f64,
+    /// drains the DC a still playhead would otherwise hold, see [`DC_BLOCKER_HZ`]
+    dc_blocker: StereoDcBlocker,
     /// this deck's health metrics
     health: Arc<DeckHealth>,
 }
@@ -132,6 +148,7 @@ impl PlatterAudioProcessor {
             filtered_target_playhead: FirstOrderLPF::new(PLAYHEAD_LPF_TAU),
             filtered_lag: INanos(0),
             last_speed: 0., // one of sources of slow startup
+            dc_blocker: StereoDcBlocker::new(DC_BLOCKER_HZ, SAMPLE_RATE),
             health,
         };
         processor
@@ -275,12 +292,16 @@ impl PlatterAudioProcessor {
             let target = rec.nanosecs_to_sample(target_playhead.record_pos);
             let step = (target - position) / samples_n as f64;
 
-            for frame in frames {
+            for frame in &mut *frames {
                 *frame = rec.get_sample_at(position);
                 position += step;
             }
         } else {
             frames.fill(StereoFrame::default());
+        }
+
+        for frame in frames {
+            *frame = self.dc_blocker.advance(*frame);
         }
     }
 }
@@ -320,6 +341,9 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
+        // These tests read the playhead off the samples, which the output
+        // high-pass would filter along with everything else.
+        processor.dc_blocker = StereoDcBlocker::bypass();
         records_in.push(ramp_record(200_000)).unwrap();
         // the record is picked up on the next callback
         processor.write_frames(&mut [StereoFrame::default(); FRAMES]);
@@ -390,20 +414,72 @@ mod tests {
         }
     }
 
-    /// Nothing has played yet, so there is no clock to carry forward.
-    #[test]
-    fn the_first_callback_has_no_previous_block() {
-        let (writable, readable) = new_platter();
-        let (_records_in, next_record) = rtrb::RingBuffer::new(1);
-        let (used_records, _records_out) = rtrb::RingBuffer::new(3);
-        drop(writable);
+    /// A 440Hz sine at -6dBFS, so a parked playhead lands on an arbitrary phase
+    /// rather than near a zero crossing.
+    fn sine_record(secs: f64) -> Record {
+        let n = (secs * SAMPLE_RATE as f64) as usize;
+        let samples = (0..n)
+            .map(|i| {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                let v = (0.5 * (std::f64::consts::TAU * 440.0 * t).sin()) as f32;
+                StereoFrame { l: v, r: v }
+            })
+            .collect();
+        Record::new(samples, Interpolator::linear())
+    }
 
-        let processor = PlatterAudioProcessor::new(AudioProcessorHandles {
+    /// A deck sitting still must not hold the sample it stopped on: that offset
+    /// is what the stream's close steps off, and it is a click the size of
+    /// whatever the playhead was parked on.
+    #[test]
+    fn a_parked_playhead_drains_to_silence() {
+        let (mut writable, readable) = new_platter();
+        let (mut records_in, next_record) = rtrb::RingBuffer::new(1);
+        let (used_records, _records_out) = rtrb::RingBuffer::new(3);
+
+        let mut processor = PlatterAudioProcessor::new(AudioProcessorHandles {
             next_record,
             used_records,
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
-        assert!(processor.last_played.is_none());
+        records_in.push(sine_record(5.0)).unwrap();
+
+        let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
+        let mut frames = vec![StereoFrame::default(); FRAMES];
+
+        // Play long enough for the sync loop to reach steady state.
+        for block in 0..200u64 {
+            let elapsed = block_nanos * block;
+            writable.update_playhead(INanos(elapsed as i64), UNanos(elapsed));
+            processor.write_frames(&mut frames);
+        }
+        let playing_peak = frames.iter().map(|f| f.l.abs()).fold(0., f32::max);
+        assert!(
+            playing_peak > 0.4,
+            "the filter ate the music: peak {playing_peak} of a -6dBFS sine"
+        );
+
+        // Park it: the platter clock keeps running while the position holds,
+        // which is what the driver does once the speed reaches zero.
+        //
+        // A second is generous: the playhead converges on the parked position
+        // within ~0.2s, and the high-pass has drained what that left by ~0.45s.
+        // The platter's own wind-down comes before any of this and is the
+        // audible part of a stop.
+        let parked_at = INanos((block_nanos * 200) as i64);
+        let drain_blocks =
+            (1.0 / PlatterAudioProcessor::frames_to_dur(FRAMES).as_secs_f64()).ceil() as u64;
+        for block in 200..200 + drain_blocks {
+            let elapsed = block_nanos * block;
+            writable.update_playhead(parked_at, UNanos(elapsed));
+            processor.write_frames(&mut frames);
+        }
+
+        let parked_peak = frames.iter().map(|f| f.l.abs()).fold(0., f32::max);
+        assert!(
+            parked_peak < 1e-6,
+            "parked deck still holds {parked_peak} on the output"
+        );
     }
 }
