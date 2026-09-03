@@ -32,9 +32,13 @@ static PLAYHEAD_LPF_TAU: f64 = 0.025;
 /// price of a slower drain.
 static DC_BLOCKER_HZ: f64 = 10.;
 
+/// How long a declick fades in for. declick is for seeking and record swapping.
+/// Capped at the block.
+static DECLICK: Duration = Duration::from_millis(3);
+
 /// How far the filtered lag is allowed to run before the correction saturates.
 /// Hitting it caps the catch-up rate; see
-/// [`DeckHealth::blocks_with_lag_correction_maxed`].
+/// [`DeckHealth::callbacks_with_lag_correction_maxed`].
 static LAG_CLAMP: INanos = INanos(5_000_000);
 
 /// Communication channels for audio processor
@@ -169,11 +173,33 @@ impl PlatterAudioProcessor {
         sample / SAMPLE_RATE as f64 * 1_000_000_000.
     }
 
+    /// The frame this deck last put out, read back off the record it came from.
+    fn last_emitted(&self) -> StereoFrame {
+        match (&self.cur_record, self.last_played) {
+            (Some(record), Some(played)) => record.get_sample(played.record_pos),
+            _ => StereoFrame::default(),
+        }
+    }
+
+    /// Samples a declick fades over: [`DECLICK`], capped at the block.
+    fn declick_frames(buffer_frames: usize) -> usize {
+        let wanted = (DECLICK.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+        wanted.min(buffer_frames)
+    }
+
     /// Warning: this function must be very fast, no allocation
     pub fn write_frames(&mut self, frames: &mut [StereoFrame]) {
         self.health.callback_rendered();
         let samples_n = frames.len() as i64;
-        if let Ok(record) = self.handles.next_record.pop() {
+
+        // Frame the block fades in from, once something has torn the stream.
+        // Read while the record it belongs to is still in hand, which for a swap
+        // means before the incoming one replaces it.
+        let mut declick_from = None;
+
+        let incoming = self.handles.next_record.pop().ok();
+        if let Some(record) = incoming {
+            declick_from = Some(self.last_emitted());
             self.set_record(record);
         }
 
@@ -187,6 +213,9 @@ impl PlatterAudioProcessor {
             INanos(self.second_measurement.record_pos.0 - self.first_measurement.record_pos.0);
 
         let jumped = observed_played_nanos.0.abs() > JUMP_THRESHOLD.0;
+        if jumped {
+            declick_from = declick_from.or_else(|| Some(self.last_emitted()));
+        }
 
         let (playhead_start, target_playhead) = match self.last_played {
             Some(last_played) if !jumped => {
@@ -306,6 +335,20 @@ impl PlatterAudioProcessor {
             }
         } else {
             frames.fill(StereoFrame::default());
+        }
+
+        // A jump or a swap leaves the block starting on a sample unrelated to
+        // the one the last block ended on, and a step edge is a click. Fading in
+        // from that last frame turns the step into a slope
+        if let Some(from) = declick_from {
+            let ramp = Self::declick_frames(frames.len());
+            for (i, frame) in frames[..ramp].iter_mut().enumerate() {
+                // (i + 1) / ramp, so the fade is complete at the end of the
+                // window and leaves no pedestal to step off
+                let new_share = (i + 1) as f32 / ramp as f32;
+                frame.l = from.l + (frame.l - from.l) * new_share;
+                frame.r = from.r + (frame.r - from.r) * new_share;
+            }
         }
 
         for frame in frames {
@@ -513,11 +556,11 @@ mod tests {
     /// [`PLAYHEAD_LPF_TAU`].
     const WARM_UP: u64 = 100;
 
-    /// Plays a deck up to speed, runs `disturb` between two callbacks - where a
+    /// Plays a deck up to speed, runs `disturb` between two blocks - where a
     /// jump or a load lands in the app - and returns the worst step between
     /// neighbouring output samples across that seam and the blocks after it.
     ///
-    /// A pop lives on the seam *between* two callbacks, which nothing looking at
+    /// A pop lives on the seam *between* two blocks, which nothing looking at
     /// one block at a time can see. `disturb` is handed the platter and the
     /// record ring, the two things the app can change under a running deck.
     fn worst_step_across(
@@ -588,7 +631,6 @@ mod tests {
     /// set the step's height - an arbitrary seek into real material lands where
     /// it lands. That the step is there at all is the defect.
     #[test]
-    #[ignore = "known pop: the jump branch reseats the playhead without a declick"]
     fn a_seek_does_not_tear_the_stream() {
         // well past JUMP_THRESHOLD, so the processor takes its re-anchor branch
         let by = Duration::from_secs(2) + Duration::from_secs_f64(0.5 / TONE_HZ);
@@ -614,7 +656,6 @@ mod tests {
     /// makes that repeatable - the position carries straight on across the swap,
     /// so the step is exactly twice whatever the waveform was worth there.
     #[test]
-    #[ignore = "known pop: set_record swaps mid-stream without a declick"]
     fn loading_a_track_mid_play_does_not_tear_the_stream() {
         let step = worst_step_across(tone(5., TONE_HZ, TONE_PEAK), |_, records| {
             records
