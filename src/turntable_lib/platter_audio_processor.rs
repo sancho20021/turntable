@@ -259,23 +259,31 @@ impl PlatterAudioProcessor {
                 if jumped {
                     self.health.playhead_jumped();
                 }
-                let playhead = INanos(
-                    self.second_measurement.record_pos.0
-                        - (self.last_speed * block_duration.as_nanos() as f64) as i64,
-                );
 
-                {
-                    // without this lag subtraction, filter will fallback to warm-up state, and produce playback ramping
-                    let speed_nanos_per_sec = self.last_speed * 1_000_000_000.0;
-                    let steady_state_lag_nanos = speed_nanos_per_sec * PLAYHEAD_LPF_TAU;
+                // Where the anchored block lands. An LPF tracking a ramp settles
+                // a `slope * tau` behind its input, so this is the offset the
+                // rendered playhead already runs at while a deck plays: landing
+                // on it is landing in steady state. Without the subtraction the
+                // filter would instead restart from a cold state and ramp the
+                // playback in.
+                let speed_nanos_per_sec = self.last_speed * 1_000_000_000.0;
+                let steady_state_lag_nanos = speed_nanos_per_sec * PLAYHEAD_LPF_TAU;
+                let anchor =
+                    INanos(self.second_measurement.record_pos.0 - steady_state_lag_nanos as i64);
 
-                    self.filtered_target_playhead.force_state(
-                        self.second_measurement.record_pos.0 as f64 - steady_state_lag_nanos,
-                    );
-                };
+                self.filtered_target_playhead.force_state(anchor.0 as f64);
                 self.filtered_lag = INanos(0);
 
-                (playhead, self.second_measurement)
+                let playhead =
+                    INanos(anchor.0 - (self.last_speed * block_duration.as_nanos() as f64) as i64);
+
+                (
+                    playhead,
+                    PlatterSample {
+                        timestamp_nanos: self.second_measurement.timestamp_nanos,
+                        record_pos: anchor,
+                    },
+                )
             }
         };
 
@@ -414,14 +422,17 @@ mod tests {
         }
     }
 
-    /// A 440Hz sine at -6dBFS, so a parked playhead lands on an arbitrary phase
-    /// rather than near a zero crossing.
-    fn sine_record(secs: f64) -> Record {
+    /// Peak of the test tones, -6dBFS, so a step off one is a known size.
+    const TONE_PEAK: f64 = 0.5;
+
+    /// A sine, both channels alike. Smooth by construction: the only steps in a
+    /// stream rendered from one are steps the deck put there.
+    fn tone(secs: f64, hz: f64, peak: f64) -> Record {
         let n = (secs * SAMPLE_RATE as f64) as usize;
         let samples = (0..n)
             .map(|i| {
                 let t = i as f64 / SAMPLE_RATE as f64;
-                let v = (0.5 * (std::f64::consts::TAU * 440.0 * t).sin()) as f32;
+                let v = (peak * (std::f64::consts::TAU * hz * t).sin()) as f32;
                 StereoFrame { l: v, r: v }
             })
             .collect();
@@ -443,7 +454,7 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
-        records_in.push(sine_record(5.0)).unwrap();
+        records_in.push(tone(5.0, 440., TONE_PEAK)).unwrap();
 
         let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
         let mut frames = vec![StereoFrame::default(); FRAMES];
@@ -480,6 +491,140 @@ mod tests {
         assert!(
             parked_peak < 1e-6,
             "parked deck still holds {parked_peak} on the output"
+        );
+    }
+
+    /// The probe these tests read: a 100Hz sine at -6dBFS. Slow and quiet
+    /// enough that a step the deck introduces stands out against it.
+    const TONE_HZ: f64 = 100.;
+
+    /// The most one output sample may differ from the last.
+    ///
+    /// Playing the probe undisturbed steps 0.0065 at most - that is simply how
+    /// far a 100Hz sine at -6dBFS can move in 1/48000 of a second - so this
+    /// allows four times that. A torn seam comes in 5x to 30x over, so the
+    /// exact figure is not load bearing. [`undisturbed_playback_is_smooth`] is
+    /// what keeps it honest.
+    const MAX_STEP: f32 = 0.026;
+
+    /// Blocks played before anything is measured, so no test reads the warm-up:
+    /// the first callback has no previous block to carry forward, and the
+    /// playhead filter needs settling time. At 64 frames this is 133ms, five
+    /// [`PLAYHEAD_LPF_TAU`].
+    const WARM_UP: u64 = 100;
+
+    /// Plays a deck up to speed, runs `disturb` between two callbacks - where a
+    /// jump or a load lands in the app - and returns the worst step between
+    /// neighbouring output samples across that seam and the blocks after it.
+    ///
+    /// A pop lives on the seam *between* two callbacks, which nothing looking at
+    /// one block at a time can see. `disturb` is handed the platter and the
+    /// record ring, the two things the app can change under a running deck.
+    fn worst_step_across(
+        record: Record,
+        disturb: impl FnOnce(&mut WritablePlatter, &mut Producer<Record>),
+    ) -> f32 {
+        let (mut platter, readable) = new_platter();
+        let (mut records, next_record) = rtrb::RingBuffer::new(2);
+        // the consumer is held so the processor's disposal ring is not abandoned
+        let (used_records, _used) = rtrb::RingBuffer::new(3);
+
+        let mut processor = PlatterAudioProcessor::new(AudioProcessorHandles {
+            next_record,
+            used_records,
+            platter: readable,
+            health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
+        });
+        records.push(record).expect("a fresh ring has room");
+
+        // Nominal speed is a block of record time for every block of clock time,
+        // integrated off whatever the platter currently holds, which is what
+        // `PlatterDriver::calculate_position` does while a deck plays. Nothing
+        // here remembers the position: the platter does, as in the app.
+        let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
+        let mut frames = [StereoFrame::default(); FRAMES];
+        let mut clock = UNanos(0);
+        let mut advance = |platter: &mut WritablePlatter, clock: &mut UNanos| {
+            let at = platter.get_playhead();
+            *clock = UNanos(clock.0 + block_nanos);
+            platter.update_playhead(INanos(at.record_pos.0 + block_nanos as i64), *clock);
+        };
+
+        for _ in 0..WARM_UP {
+            advance(&mut platter, &mut clock);
+            processor.write_frames(&mut frames);
+        }
+
+        let mut prev = frames[FRAMES - 1];
+        disturb(&mut platter, &mut records);
+
+        let mut worst = 0.;
+        for _ in 0..2 {
+            advance(&mut platter, &mut clock);
+            processor.write_frames(&mut frames);
+            for frame in frames {
+                // both channels carry the same tone, so the left speaks for both
+                worst = f32::max(worst, (frame.l - prev.l).abs());
+                prev = frame;
+            }
+        }
+        worst
+    }
+
+    /// The reference the other two are read against: left alone, the deck is as
+    /// smooth as the record it reads.
+    #[test]
+    fn undisturbed_playback_is_smooth() {
+        let step = worst_step_across(tone(5., TONE_HZ, TONE_PEAK), |_, _| {});
+
+        assert!(step <= MAX_STEP, "steady playback steps {step:.5}");
+    }
+
+    /// A seek reseats the playhead, and the block after it starts on a sample
+    /// unrelated to the one the last block ended on.
+    ///
+    /// The extra half cycle only keeps the landing off a whole number of them,
+    /// which would come back in phase and hide the seam completely. It does not
+    /// set the step's height - an arbitrary seek into real material lands where
+    /// it lands. That the step is there at all is the defect.
+    #[test]
+    #[ignore = "known pop: the jump branch reseats the playhead without a declick"]
+    fn a_seek_does_not_tear_the_stream() {
+        // well past JUMP_THRESHOLD, so the processor takes its re-anchor branch
+        let by = Duration::from_secs(2) + Duration::from_secs_f64(0.5 / TONE_HZ);
+
+        let step = worst_step_across(tone(5., TONE_HZ, TONE_PEAK), |platter, _| {
+            // what `PlatterEvent::MovePlayhead` does: the position moves, the
+            // clock does not
+            let at = platter.get_playhead();
+            platter.update_playhead(
+                INanos(at.record_pos.0 + by.as_nanos() as i64),
+                at.timestamp_nanos,
+            );
+        });
+
+        assert!(
+            step <= MAX_STEP,
+            "a seek steps {step:.5}. that step is the pop"
+        );
+    }
+
+    /// Loading a track onto a running deck swaps the record between one block
+    /// and the next. Two tracks are unrelated at that seam; inverting the tone
+    /// makes that repeatable - the position carries straight on across the swap,
+    /// so the step is exactly twice whatever the waveform was worth there.
+    #[test]
+    #[ignore = "known pop: set_record swaps mid-stream without a declick"]
+    fn loading_a_track_mid_play_does_not_tear_the_stream() {
+        let step = worst_step_across(tone(5., TONE_HZ, TONE_PEAK), |_, records| {
+            records
+                .push(tone(5., TONE_HZ, -TONE_PEAK))
+                .expect("the ring has room");
+        });
+
+        assert!(
+            step <= MAX_STEP,
+            "a record swap steps {step:.5}. that step is the pop"
         );
     }
 }
