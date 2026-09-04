@@ -5,7 +5,7 @@ use rtrb::{Consumer, Producer};
 use crate::{
     audio_health::DeckHealth,
     decoder::SAMPLE_RATE,
-    filters::{FirstOrderLPF, StereoDcBlocker},
+    filters::{FirstOrderLPF, StereoDcBlocker, exponential_decay_factor},
     record::{INanos, Record, UNanos, interpolation::Linear},
     stereo_frame::StereoFrame,
     virtual_platter::{PlatterSample, ReadablePlatter},
@@ -289,14 +289,16 @@ impl PlatterAudioProcessor {
                     self.health.playhead_jumped();
                 }
 
-                // Where the anchored block lands. An LPF tracking a ramp settles
-                // a `slope * tau` behind its input, so this is the offset the
-                // rendered playhead already runs at while a deck plays: landing
-                // on it is landing in steady state. Without the subtraction the
-                // filter would instead restart from a cold state and ramp the
-                // playback in.
-                let speed_nanos_per_sec = self.last_speed * 1_000_000_000.0;
-                let steady_state_lag_nanos = speed_nanos_per_sec * PLAYHEAD_LPF_TAU;
+                // Where the anchored block lands. A playing deck feeds the filter
+                // a straight line - position climbing at a steady speed - and a
+                // one-pole trails one forever, by its group delay at DC:
+                // `dt * r / (1 - r)` for a block `dt` and per-block decay `r`.
+                // https://en.wikipedia.org/wiki/Group_delay_and_phase_delay
+                // Landing on that trail is landing in steady state; without it
+                // the filter restarts cold and glides the playback in.
+                let decay = exponential_decay_factor(block_duration.as_secs_f64(), PLAYHEAD_LPF_TAU);
+                let steady_state_lag_nanos =
+                    self.last_speed * block_duration.as_nanos() as f64 * decay / (1. - decay);
                 let anchor =
                     INanos(self.second_measurement.record_pos.0 - steady_state_lag_nanos as i64);
 
@@ -649,6 +651,96 @@ mod tests {
             step <= MAX_STEP,
             "a seek steps {step:.5}. that step is the pop"
         );
+    }
+
+    /// Rendered playback speed, one entry per block, for the blocks that follow
+    /// a seek. `1.0` is nominal: a block of record time per block of clock time.
+    ///
+    /// Read off `last_played`, the position the render loop walked each block
+    /// to, which [`the_block_lands_on_the_position_it_records`] keeps honest
+    /// against the samples themselves. Reading it instead of the samples keeps
+    /// the measurement exact - a step of one sample off `f32` values in the tens
+    /// of thousands quantises to a fraction of a percent, which is the size of
+    /// the thing being measured.
+    fn speeds_after_seek(frames_n: usize, blocks: usize) -> Vec<f64> {
+        let (mut platter, readable) = new_platter();
+        let (mut records_in, next_record) = rtrb::RingBuffer::new(1);
+        let (used_records, _used) = rtrb::RingBuffer::new(3);
+
+        let mut processor = PlatterAudioProcessor::new(AudioProcessorHandles {
+            next_record,
+            used_records,
+            platter: readable,
+            health: AudioHealth::new(frames_n as u32, SAMPLE_RATE, 1).deck(0),
+        });
+        records_in.push(tone(30., TONE_HZ, TONE_PEAK)).unwrap();
+
+        let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(frames_n).0;
+        let mut frames = vec![StereoFrame::default(); frames_n];
+        let mut clock = UNanos(0);
+        let mut advance = |platter: &mut WritablePlatter, clock: &mut UNanos| {
+            let at = platter.get_playhead();
+            *clock = UNanos(clock.0 + block_nanos);
+            platter.update_playhead(INanos(at.record_pos.0 + block_nanos as i64), *clock);
+        };
+
+        // Eight `PLAYHEAD_LPF_TAU` of settling, however many blocks that is at
+        // this buffer size, so no buffer is measured mid warm-up.
+        let block_secs = PlatterAudioProcessor::frames_to_dur(frames_n).as_secs_f64();
+        let warm_up = (8. * PLAYHEAD_LPF_TAU / block_secs).ceil() as usize;
+        for _ in 0..warm_up.max(2) {
+            advance(&mut platter, &mut clock);
+            processor.write_frames(&mut frames);
+        }
+
+        // What `PlatterEvent::MovePlayhead` does: the position moves, the clock
+        // does not. Well past `JUMP_THRESHOLD`, so the re-anchor branch runs.
+        let at = platter.get_playhead();
+        platter.update_playhead(
+            INanos(at.record_pos.0 + Duration::from_secs(2).as_nanos() as i64),
+            at.timestamp_nanos,
+        );
+
+        let mut previous = processor.last_played.expect("warm-up played blocks");
+        (0..blocks)
+            .map(|_| {
+                advance(&mut platter, &mut clock);
+                processor.write_frames(&mut frames);
+                let now = processor.last_played.expect("a block has been played");
+                let speed =
+                    (now.record_pos.0 - previous.record_pos.0) as f64 / block_nanos as f64;
+                previous = now;
+                speed
+            })
+            .collect()
+    }
+
+    /// A seek moves the playhead; it must not bend the pitch on the way out.
+    ///
+    /// The landing block is exempt: it is the one the seek reseats, and its
+    /// speed is whatever the re-anchor chose. Every block after it is ordinary
+    /// playback and must run at nominal speed.
+    #[test]
+    fn a_seek_does_not_chirp_the_speed() {
+        let bent: Vec<String> = [256, 512, 1024, 2048]
+            .into_iter()
+            .filter_map(|frames_n| {
+                let speeds = speeds_after_seek(frames_n, 12);
+                let worst = speeds[1..]
+                    .iter()
+                    .fold(0f64, |worst, speed| worst.max((speed - 1.).abs()));
+
+                (worst >= 0.01).then(|| {
+                    format!(
+                        "{frames_n} frames: {:.1}% {:.3?}",
+                        worst * 100.,
+                        &speeds[1..6]
+                    )
+                })
+            })
+            .collect();
+
+        assert!(bent.is_empty(), "a seek bends the speed - {}", bent.join(" | "));
     }
 
     /// Loading a track onto a running deck swaps the record between one block
