@@ -17,8 +17,9 @@ use sdl2::{
 };
 
 use crate::{
-    deck_controller::{AppStatus, DeckId},
+    deck_controller::DeckId,
     input_event::{AppEvent, DeckCommand, DeckEvent, Direction, InputEvent},
+    notices::Notices,
 };
 
 pub struct SdlInputMapper<const DECKS: usize> {
@@ -26,14 +27,14 @@ pub struct SdlInputMapper<const DECKS: usize> {
     /// number keys. A keyboard concept: a MIDI controller names its deck in
     /// every message and has none, which is why the TUI takes it as an option.
     active_deck: Arc<AtomicUsize>,
-    app_status: AppStatus,
+    notices: Notices,
 }
 
 impl<const DECKS: usize> SdlInputMapper<DECKS> {
-    pub fn new(active_deck: Arc<AtomicUsize>, app_status: AppStatus) -> Self {
+    pub fn new(active_deck: Arc<AtomicUsize>, notices: Notices) -> Self {
         Self {
             active_deck,
-            app_status,
+            notices,
         }
     }
 
@@ -105,8 +106,7 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
                         self.active_deck.store(deck_idx, Ordering::Relaxed);
                         log::info!("Active Deck = {}", deck_idx + 1);
                     } else {
-                        // todo: change it from status to temporary warning
-                        self.app_status.set(format!(
+                        self.notices.warn(format!(
                             "deck {} doesn't exist (only {} decks are running)",
                             deck_idx + 1,
                             DECKS

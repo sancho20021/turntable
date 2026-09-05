@@ -32,8 +32,9 @@ use percent_encoding::percent_decode_str;
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
     card_reader::{CardReaderView, Outcome, Staged},
-    deck_controller::{AppStatus, DeckState},
+    deck_controller::DeckState,
     input_event::{AppEvent, InputEvent},
+    notices::{Level, Notice, Notices},
     record::{INanos, UNanos},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
@@ -55,7 +56,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     deck_states: [Arc<DeckState>; DECKS],
     platters: [ReadablePlatter; DECKS],
     tray_state: Arc<RwLock<TrayState>>,
-    app_status: AppStatus,
+    notices: Notices,
     health: Arc<AudioHealth>,
     card_reader: Option<CardReaderView>,
     events: Sender<InputEvent>,
@@ -80,7 +81,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
             let current_active = active_deck
                 .as_ref()
                 .map(|deck| deck.load(Ordering::Relaxed));
-            let status = app_status.get();
+            let notice = notices.current();
             let tray = tray_state.read().ok().map(|tray| tray.clone());
 
             terminal
@@ -91,7 +92,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                         &platters,
                         current_active,
                         tray,
-                        status,
+                        notice,
                         &health,
                         card_reader.as_ref(),
                     );
@@ -192,8 +193,21 @@ fn parse_dropped_path(paste: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-/// Just the file name, so a long path does not eat the whole row. The full path
-/// stays visible in the status bar.
+/// Enough of a card id to tell two apart, which is all anyone does with one.
+/// They are 64 hex characters, and the reason beside them is the part worth
+/// reading.
+fn short_card(payload: &str) -> String {
+    const SHOWN: usize = 12;
+
+    if payload.chars().count() <= SHOWN {
+        return payload.to_string();
+    }
+
+    let head: String = payload.chars().take(SHOWN).collect();
+    format!("{head}…")
+}
+
+/// Just the file name, so a long path does not eat the whole row.
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -221,11 +235,19 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
             Style::default().fg(Color::DarkGray),
         ),
 
-        TrayState::Preparing { path, since } => {
+        TrayState::Preparing {
+            path,
+            since,
+            queued,
+        } => {
             let elapsed = since.elapsed();
+            let next = match &queued {
+                Some(next) => format!("   then {}", file_name(next)),
+                None => String::new(),
+            };
             (
                 format!(
-                    "{}  preparing    {:<44} {:>6}",
+                    "{}  preparing    {:<44} {:>6}{next}",
                     spinner(elapsed),
                     file_name(&path),
                     format!("{:.1}s", elapsed.as_secs_f64()),
@@ -306,7 +328,7 @@ fn render_tui<const DECKS: usize>(
     platters: &[ReadablePlatter; DECKS],
     active_deck_idx: Option<usize>,
     tray: Option<TrayState>,
-    status: Option<String>,
+    notice: Option<Notice>,
     health: &AudioHealth,
     card_reader: Option<&CardReaderView>,
 ) {
@@ -316,11 +338,13 @@ fn render_tui<const DECKS: usize>(
         Constraint::Min(0),
         Constraint::Length(3),
         Constraint::Length(3),
-        Constraint::Length(3),
     ];
     if card_reader.is_some() {
         panels.push(Constraint::Length(3));
     }
+    // Kept even with nothing to report, so a warning arriving mid-set does not
+    // shift every panel above it.
+    panels.push(Constraint::Length(3));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -443,78 +467,113 @@ fn render_tui<const DECKS: usize>(
     );
     frame.render_widget(tray_widget, chunks[2]);
 
-    // 4. Handle status message rendering in bottom chunk
-    let (status_text, status_style) = match status {
-        Some(msg) => (msg, Style::default().fg(Color::Yellow)),
-        None => (
-            "status could not be retrieved, status lock potentially poisoned".to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-    };
-
-    let status_widget = Paragraph::new(status_text).style(status_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" System Status "),
-    );
-
-    // Render system status box in bottom chunk
-    frame.render_widget(status_widget, chunks[3]);
-
-    // 5. Whether cards can be scanned at all, when this run asked for them
+    // 4. Whether cards can be scanned at all, when this run asked for them
+    let mut next = 3;
     if let Some(reader) = card_reader {
         let (scanner_text, scanner_style) = scanner_line(reader);
         let scanner_widget = Paragraph::new(scanner_text)
             .style(scanner_style)
             .block(Block::default().borders(Borders::ALL).title(" QR Scanner "));
-        frame.render_widget(scanner_widget, chunks[4]);
+        frame.render_widget(scanner_widget, chunks[next]);
+        next += 1;
     }
+
+    // 5. Anything that went wrong, for as long as it is worth reading
+    let (title, message, style) = match notice {
+        Some(Notice {
+            message,
+            level: Level::Warning,
+        }) => (" Warning ", message, Style::default().fg(Color::Yellow)),
+
+        Some(Notice {
+            message,
+            level: Level::Error,
+        }) => (
+            " Problem ",
+            message,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+
+        None => (
+            " Notices ",
+            "".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+
+    let notice_widget = Paragraph::new(message)
+        .style(style)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(notice_widget, chunks[next]);
 }
 
 /// A dead gun is shown as dead and nothing else. Naming the card it last read
 /// would be naming a track the next press is not going to load.
+/// A health light for the gun, and nothing else. Whether a card reached the tray
+/// is the tray's line to say, and whether a scan just registered is answered by
+/// the tray changing - this panel can only tell you that once.
 fn scanner_line(reader: &CardReaderView) -> (String, Style) {
+    let ready = || ("●  ready".to_string(), Style::default().fg(Color::Green));
+    let problem = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+
     match reader.staged() {
+        // A gun that has read nothing and a gun whose last card reached the tray
+        // look the same on purpose: working, with nothing here to act on.
+        Staged::Empty => ready(),
+
         Staged::Card(card) => match &card.outcome {
+            Outcome::SentToTray => ready(),
+
             Outcome::Resolving => (
-                format!("card {} - looking up...", card.payload),
+                format!("●  looking up   {}", short_card(&card.payload)),
                 Style::default().fg(Color::Yellow),
             ),
 
-            Outcome::SentToTray => (
-                format!("card {} - see the tray", card.payload),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-
             Outcome::Unknown => (
-                format!("card {} - not in the library", card.payload),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                format!(
+                    "✗  unknown card  {}   not in the library",
+                    short_card(&card.payload)
+                ),
+                problem,
             ),
 
             Outcome::Failed(reason) => (
-                format!("card {} - {reason}", card.payload),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                format!("✗  {}   {reason}", short_card(&card.payload)),
+                problem,
             ),
         },
 
-        Staged::Empty => (
-            "ready - nothing scanned yet".to_string(),
-            Style::default().fg(Color::Gray),
-        ),
-
-        Staged::Unavailable(fault) => (
-            format!("{fault}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
+        Staged::Unavailable(fault) => (format!("✗  {fault}"), problem),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path};
+    use super::{format_duration, parse_dropped_path, short_card};
     use std::time::Duration;
+
+    /// A real card id, which has to leave room for the reason beside it.
+    #[test]
+    fn a_long_card_id_is_cut_short() {
+        let shortened =
+            short_card("003778873f9d0ca7c5c1a9519dafdd6eadec051f26aa0f7ab83e17eeba3032a4");
+
+        assert_eq!(shortened, "003778873f9d…");
+        assert!(shortened.chars().count() < 20, "{shortened} is still long");
+    }
+
+    /// Newer cards carry a bare track id, which is short enough to read whole.
+    #[test]
+    fn a_short_card_id_is_left_alone() {
+        assert_eq!(short_card("1701"), "1701");
+    }
+
+    /// Anything with a QR code on it can reach the gun, and a stray payload must
+    /// not be cut mid-character.
+    #[test]
+    fn a_multibyte_payload_is_cut_on_a_character() {
+        assert_eq!(short_card("ααααααααααααααα"), "αααααααααααα…");
+    }
 
     #[test]
     fn durations_read_the_way_you_say_them() {

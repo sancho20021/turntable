@@ -24,11 +24,12 @@ use turntable_lib::{
     audio_health::{self, AudioHealth, HealthRecorder},
     card_library::Library,
     card_reader::{self, CardReader},
-    deck_controller::{self, AppStatus, DeckController, DeckId},
+    deck_controller::{self, DeckController, DeckId},
     decoder::SAMPLE_RATE,
     input_event::{AppEvent, DeckEvent, InputEvent},
     input_profile::InputProfile,
     midi,
+    notices::Notices,
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
@@ -92,7 +93,7 @@ pub fn start(options: Options) {
 }
 
 fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) {
-    let app_status = AppStatus::new();
+    let notices = Notices::new();
 
     // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);
@@ -113,15 +114,18 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         QrMode::Auto if !localdeck_qr_scanner::is_connected() => {
             let message = "No QR scanner connected; running without it. Pass --qr to require one.";
             log::info!("{message}");
-            app_status.set(message);
+            notices.warn(message);
             None
         }
 
         // A gun on the bus is the intent to use it, so from here Auto is as
         // strict as Require: it is plugged in, it has to work.
-        QrMode::Auto | QrMode::Require => {
-            Some(start_card_reader(&shutdown, options, events_snd.clone()))
-        }
+        QrMode::Auto | QrMode::Require => Some(start_card_reader(
+            &shutdown,
+            options,
+            events_snd.clone(),
+            notices.clone(),
+        )),
     };
 
     // One input unit is a touchpad pixel or a jog wheel tick depending on what
@@ -180,7 +184,7 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         tray_rcv,
         deck_slots,
         Arc::clone(&tray_state),
-        app_status.clone(),
+        notices.clone(),
         Arc::clone(&shutdown),
     );
 
@@ -190,7 +194,7 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         array::from_fn(|i| controllers[i].get_state()),
         array::from_fn(|i| controllers[i].get_platter()),
         Arc::clone(&tray_state),
-        app_status.clone(),
+        notices.clone(),
         health,
         card_reader.as_ref().map(CardReader::view),
         events_snd.clone(),
@@ -208,7 +212,7 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     match options.input {
         InputKind::Touchpad => run_sdl_source::<DECKS>(
             active_deck.expect("touchpad input always has an active deck"),
-            app_status.clone(),
+            notices.clone(),
             &events_snd,
             &dispatcher,
         ),
@@ -271,10 +275,11 @@ fn start_card_reader(
     shutdown: &Arc<AtomicBool>,
     options: &Options,
     events: Sender<InputEvent>,
+    notices: Notices,
 ) -> CardReader {
     let library = open_library(options.cards_config);
 
-    match card_reader::start(Arc::clone(shutdown), Box::new(library), events) {
+    match card_reader::start(Arc::clone(shutdown), Box::new(library), events, notices) {
         Ok(reader) => reader,
         Err(e) => {
             eprintln!(
@@ -311,7 +316,7 @@ fn open_library(config_path: Option<&Path>) -> Library {
 /// SDL is only initialised here, so a MIDI-driven run opens no window at all.
 fn run_sdl_source<const DECKS: usize>(
     active_deck: Arc<AtomicUsize>,
-    app_status: AppStatus,
+    notices: Notices,
     events: &Sender<InputEvent>,
     dispatcher: &JoinHandle<[DeckController; DECKS]>,
 ) {
@@ -325,7 +330,7 @@ fn run_sdl_source<const DECKS: usize>(
         .unwrap();
 
     let mut pump = sdl.event_pump().unwrap();
-    let mut mapper = SdlInputMapper::<DECKS>::new(active_deck, app_status);
+    let mut mapper = SdlInputMapper::<DECKS>::new(active_deck, notices);
 
     // The wait has a timeout only so that a quit raised somewhere else - Ctrl-C
     // in the TUI - is noticed within it. Events arriving on the pump still wake

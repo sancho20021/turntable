@@ -25,6 +25,7 @@ use localdeck_qr_scanner::{
 };
 
 use crate::input_event::{AppEvent, InputEvent};
+use crate::notices::Notices;
 
 /// How long the staging thread blocks before checking whether the app is stopping.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -128,13 +129,14 @@ pub fn start(
     shutdown: Arc<AtomicBool>,
     resolver: Box<dyn CardResolver>,
     tracks: Sender<InputEvent>,
+    notices: Notices,
 ) -> Result<CardReader, PortOpenError> {
     let (events, scanner) = start_qr_scanner()?;
     let staged = Arc::new(RwLock::new(Staged::Empty));
 
     let staging = {
         let staged = Arc::clone(&staged);
-        std::thread::spawn(move || stage_scans(events, staged, shutdown, resolver, tracks))
+        std::thread::spawn(move || stage_scans(events, staged, shutdown, resolver, tracks, notices))
     };
 
     Ok(CardReader {
@@ -168,11 +170,12 @@ fn stage_scans(
     shutdown: Arc<AtomicBool>,
     mut resolver: Box<dyn CardResolver>,
     tracks: Sender<InputEvent>,
+    notices: Notices,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match events.recv_timeout(POLL_INTERVAL) {
             Ok(event) => {
-                if stage_scan(event, &staged, resolver.as_mut(), &tracks).is_break() {
+                if stage_scan(event, &staged, resolver.as_mut(), &tracks, &notices).is_break() {
                     break;
                 }
             }
@@ -182,8 +185,7 @@ fn stage_scans(
             Err(RecvTimeoutError::Disconnected) => {
                 if !shutdown.load(Ordering::Relaxed) {
                     let fault = ScannerFault::Faulted("scanner thread stopped".to_string());
-                    log::error!("qr scanner unusable: {fault}");
-                    publish(&staged, Staged::Unavailable(fault));
+                    raise(&staged, &notices, fault);
                 }
                 break;
             }
@@ -200,13 +202,12 @@ fn stage_scan(
     staged: &RwLock<Staged>,
     resolver: &mut dyn CardResolver,
     tracks: &Sender<InputEvent>,
+    notices: &Notices,
 ) -> ControlFlow<()> {
     let payload = match event {
         Ok(payload) => payload,
         Err(error) => {
-            let fault = fault_of(error);
-            log::error!("qr scanner unusable: {fault}");
-            publish(staged, Staged::Unavailable(fault));
+            raise(staged, notices, fault_of(error));
             return ControlFlow::Break(());
         }
     };
@@ -282,6 +283,19 @@ fn send_to_tray(tracks: &Sender<InputEvent>, path: PathBuf) -> Outcome {
     }
 }
 
+/// A dead gun is worth saying twice: the panel carries it for as long as it is
+/// true, and the notice catches the eye at the moment it happens.
+fn raise(staged: &RwLock<Staged>, notices: &Notices, fault: ScannerFault) {
+    log::error!("qr scanner unusable: {fault}");
+
+    notices.error(match &fault {
+        ScannerFault::Disconnected(reason) => format!("QR scanner disconnected: {reason}"),
+        ScannerFault::Faulted(reason) => format!("QR scanner stopped working: {reason}"),
+    });
+
+    publish(staged, Staged::Unavailable(fault));
+}
+
 fn publish(staged: &RwLock<Staged>, value: Staged) {
     match staged.write() {
         Ok(mut slot) => *slot = value,
@@ -344,9 +358,10 @@ mod tests {
     fn run(events: Vec<Result<String, ScannerStopped>>, mut library: Library) -> Run {
         let staged = Arc::new(RwLock::new(Staged::Empty));
         let (tracks, prepared) = bounded(16);
+        let notices = Notices::new();
 
         for event in events {
-            if stage_scan(event, &staged, &mut library, &tracks).is_break() {
+            if stage_scan(event, &staged, &mut library, &tracks, &notices).is_break() {
                 break;
             }
         }

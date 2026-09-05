@@ -29,8 +29,9 @@ use crossbeam::channel::{Receiver, Sender, select};
 use rtrb::{Consumer, Producer};
 
 use crate::{
-    deck_controller::{AppStatus, DeckId, DeckState, RecordInfo},
+    deck_controller::{DeckId, DeckState, RecordInfo},
     decoder::load_file,
+    notices::Notices,
     platter_audio_processor::PlatterAudioProcessor,
     platter_driver::{Jump, PlatterEvent},
     record::{Record, interpolation::Interpolator},
@@ -51,8 +52,13 @@ pub enum TrayCommand {
 pub enum TrayState {
     /// Nothing prepared.
     Empty,
-    /// Being decoded off disk. A `PrepareRecord` arriving now waits in `pending`.
-    Preparing { path: String, since: Instant },
+    /// Being decoded off disk. `queued` is the one waiting behind it, if a
+    /// scan or a drop arrived while this was running.
+    Preparing {
+        path: String,
+        since: Instant,
+        queued: Option<String>,
+    },
     /// Prepared, waiting for a `LoadRecord` to say which deck it goes on.
     Ready { info: RecordInfo },
     /// The last record could not be prepared. The tray holds nothing.
@@ -133,7 +139,7 @@ struct Tray<const DECKS: usize> {
     published: Arc<RwLock<TrayState>>,
     loader: Sender<String>,
     decks: [DeckSlot; DECKS],
-    app_status: AppStatus,
+    notices: Notices,
 }
 
 impl<const DECKS: usize> Tray<DECKS> {
@@ -168,11 +174,21 @@ impl<const DECKS: usize> Tray<DECKS> {
 
     /// Start decoding a track, or queue it if one is already being decoded.
     fn prepare_record(&mut self, path: String) {
-        if let TrayState::Preparing { path: current, .. } = &self.state {
-            let msg = format!("Queued {path}, still preparing {current}");
-            log::info!("{msg}");
-            self.app_status.set(msg);
+        if let TrayState::Preparing {
+            path: current,
+            since,
+            ..
+        } = &self.state
+        {
+            log::info!("queued {path}, still preparing {current}");
+
+            let waiting = TrayState::Preparing {
+                path: current.clone(),
+                since: *since,
+                queued: Some(path.clone()),
+            };
             self.pending = Some(path);
+            self.set_state(waiting);
             return;
         }
 
@@ -186,16 +202,14 @@ impl<const DECKS: usize> Tray<DECKS> {
         if let Err(e) = self.loader.try_send(path.clone()) {
             let error = format!("record loader unreachable: {e}");
             log::error!("cannot prepare {path}: {error}");
-            self.app_status
-                .set(format!("Failed to prepare {path}: {error}"));
             self.set_state(TrayState::Failed { path, error });
             return;
         }
 
-        self.app_status.set(format!("Preparing: {path}"));
         self.set_state(TrayState::Preparing {
             path,
             since: Instant::now(),
+            queued: None,
         });
     }
 
@@ -223,29 +237,21 @@ impl<const DECKS: usize> Tray<DECKS> {
                     Ok(()) => {
                         // The record is already on its way to the audio thread, so a
                         // lost reset cannot be retried here: it would start playing
-                        // from wherever the previous record's playhead was. Say so
-                        // instead of reporting a clean load.
-                        let msg = match slot
+                        // from wherever the previous record's playhead was. The deck's
+                        // playhead is on screen, so the log is where this belongs.
+                        match slot
                             .platter_events
                             .try_send(PlatterEvent::MovePlayhead(Jump::ToZero))
                         {
                             Ok(()) => {
-                                let msg =
-                                    format!("Record {} loaded on deck {}", info.path, deck_id + 1);
-                                log::info!("{msg}");
-                                msg
+                                log::info!("record {} loaded on deck {}", info.path, deck_id + 1)
                             }
-                            Err(e) => {
-                                let msg = format!(
-                                    "Record {} loaded on deck {} but its playhead did not reset: {e}",
-                                    info.path,
-                                    deck_id + 1
-                                );
-                                log::error!("{msg}");
-                                msg
-                            }
-                        };
-                        self.app_status.set(msg);
+                            Err(e) => log::error!(
+                                "record {} loaded on deck {} but its playhead did not reset: {e}",
+                                info.path,
+                                deck_id + 1
+                            ),
+                        }
 
                         match slot.state.cur_record.write() {
                             Ok(mut cur_record) => *cur_record = Some(info),
@@ -255,13 +261,15 @@ impl<const DECKS: usize> Tray<DECKS> {
                         }
                         self.set_state(TrayState::Empty);
                     }
+                    // The deck's hand-off slot holds one record and the audio
+                    // callback empties it every block, so a full one means the
+                    // audio thread has stopped running.
                     Err(rtrb::PushError::Full(rejected)) => {
-                        // keep it prepared so the press can simply be repeated
-                        log::error!(
-                            "Deck {deck_id} record queue is full, record stays in the tray"
-                        );
-                        self.app_status
-                            .set(format!("Deck {} is busy, try again", deck_id + 1));
+                        log::error!("deck {deck_id} never took the last record");
+                        self.notices.error(format!(
+                            "Deck {} has not taken the last record - is audio running?",
+                            deck_id + 1
+                        ));
                         self.prepared = Some((rejected, info));
                     }
                 }
@@ -270,22 +278,19 @@ impl<const DECKS: usize> Tray<DECKS> {
         };
 
         log::warn!("load on deck {deck_id} rejected: {msg}");
-        self.app_status.set(msg);
+        self.notices.warn(msg);
     }
 
     fn handle_loaded_record(&mut self, loaded: LoadedRecord) {
         let LoadedRecord { path, result } = loaded;
         match result {
             Ok((record, info)) => {
-                // the tray widget carries the hint; this keeps the full path
-                self.app_status.set(format!("Ready: {path}"));
+                log::info!("ready: {path}");
                 self.prepared = Some((record, info.clone()));
                 self.set_state(TrayState::Ready { info });
             }
             Err(error) => {
                 log::error!("failed to prepare track {path}: {error}");
-                self.app_status
-                    .set(format!("Failed to prepare {path}: {error}"));
                 self.set_state(TrayState::Failed { path, error });
             }
         }
@@ -329,7 +334,7 @@ pub fn start<const DECKS: usize>(
     commands: Receiver<TrayCommand>,
     decks: [DeckSlot; DECKS],
     tray_state: Arc<RwLock<TrayState>>,
-    app_status: AppStatus,
+    notices: Notices,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     // one decode at a time: the tray only ever sends a path when it is not
@@ -350,7 +355,7 @@ pub fn start<const DECKS: usize>(
         published: tray_state,
         loader: path_tx,
         decks,
-        app_status,
+        notices,
     };
 
     let loader_join = std::thread::spawn(move || loader.run());
@@ -384,7 +389,7 @@ mod tests {
             published: Arc::new(RwLock::new(TrayState::Empty)),
             loader,
             decks: [],
-            app_status: AppStatus::new(),
+            notices: Notices::new(),
         };
 
         (tray, decoding)

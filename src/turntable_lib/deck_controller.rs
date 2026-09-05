@@ -312,28 +312,3 @@ impl DeckController {
         self.platter.clone()
     }
 }
-
-#[derive(Clone)]
-pub struct AppStatus {
-    pub message: Arc<RwLock<String>>,
-}
-
-impl AppStatus {
-    pub fn new() -> Self {
-        Self {
-            message: Arc::new(RwLock::new(
-                "Drag and drop a music file to start".to_string(),
-            )),
-        }
-    }
-
-    pub fn set(&self, msg: impl Into<String>) {
-        if let Ok(mut lock) = self.message.write() {
-            *lock = msg.into();
-        }
-    }
-
-    pub fn get(&self) -> Option<String> {
-        self.message.read().ok().map(|m| m.clone())
-    }
-}
