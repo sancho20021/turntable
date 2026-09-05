@@ -5,7 +5,7 @@ use std::{fs::OpenOptions, path::PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
 
-use crate::app::start;
+use crate::app::{QrMode, start};
 
 /// Which device drives the decks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -78,6 +78,14 @@ enum Commands {
         /// Nudge / Pitch bend responsiveness
         #[arg(short('n'), long, default_value_t = 1., allow_negative_numbers = true)]
         nudge: f32,
+
+        /// Require the QR scanner; refuse to start without it
+        #[arg(long, conflicts_with = "no_qr")]
+        qr: bool,
+
+        /// Ignore the QR scanner even if one is connected
+        #[arg(long)]
+        no_qr: bool,
     },
 }
 
@@ -158,6 +166,8 @@ fn main() {
             sensitivity,
             motor_inertia,
             nudge,
+            qr,
+            no_qr,
         } => {
             log::info!("Starting Turntable: {:?}", args.command);
             start(app::Options {
@@ -170,6 +180,11 @@ fn main() {
                 sensitivity: *sensitivity,
                 buffer_frames_n: *buffer,
                 nudge_responsiveness: *nudge,
+                qr: match (*qr, *no_qr) {
+                    (true, _) => QrMode::Require,
+                    (_, true) => QrMode::Off,
+                    _ => QrMode::Auto,
+                },
             });
         }
     }

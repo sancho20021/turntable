@@ -770,7 +770,7 @@ fn report_session(health: &AudioHealth, elapsed: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioHealth, HealthLevel, MANY_LOST_CALLBACKS, new_recorder};
+    use super::{AudioHealth, HealthLevel, new_recorder};
     use std::sync::atomic::Ordering::Relaxed;
 
     /// 64 frames at 48kHz: a 1333us budget, as `--buffer 64` gives.

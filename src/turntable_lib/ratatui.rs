@@ -31,6 +31,7 @@ use percent_encoding::percent_decode_str;
 
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
+    card_reader::{CardReaderView, Staged},
     deck_controller::{AppStatus, DeckState},
     input_event::{AppEvent, InputEvent},
     record::{INanos, UNanos},
@@ -56,6 +57,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     tray_state: Arc<RwLock<TrayState>>,
     app_status: AppStatus,
     health: Arc<AudioHealth>,
+    card_reader: Option<CardReaderView>,
     events: Sender<InputEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
@@ -91,6 +93,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                         tray,
                         status,
                         &health,
+                        card_reader.as_ref(),
                     );
                 })
                 .expect("Failed to draw TUI frame");
@@ -305,17 +308,23 @@ fn render_tui<const DECKS: usize>(
     tray: Option<TrayState>,
     status: Option<String>,
     health: &AudioHealth,
+    card_reader: Option<&CardReaderView>,
 ) {
     // 1. Split layout vertically into deck table, audio health, record tray and
     //    status bar
+    let mut panels = vec![
+        Constraint::Min(0),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+    ];
+    if card_reader.is_some() {
+        panels.push(Constraint::Length(3));
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
+        .constraints(panels)
         .split(frame.area());
 
     let header_cells = [
@@ -451,6 +460,47 @@ fn render_tui<const DECKS: usize>(
 
     // Render system status box in bottom chunk
     frame.render_widget(status_widget, chunks[3]);
+
+    // 5. Whether cards can be scanned at all, when this run asked for them
+    if let Some(reader) = card_reader {
+        let (scanner_text, scanner_style) = scanner_line(reader);
+        let scanner_widget = Paragraph::new(scanner_text)
+            .style(scanner_style)
+            .block(Block::default().borders(Borders::ALL).title(" QR Scanner "));
+        frame.render_widget(scanner_widget, chunks[4]);
+    }
+}
+
+/// A dead gun is shown as dead and nothing else. Naming the card it last read
+/// would be naming a track the next press is not going to load.
+fn scanner_line(reader: &CardReaderView) -> (String, Style) {
+    match reader.staged() {
+        Staged::Card(card) if !card.loaded => (
+            format!(
+                "NEW CARD {} - ready to load (seen {:.1}s ago)",
+                card.payload,
+                card.at.elapsed().as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+
+        Staged::Card(card) => (
+            format!("{} loaded - scan a card to load another", card.payload),
+            Style::default().fg(Color::Gray),
+        ),
+
+        Staged::Empty => (
+            "ready - nothing scanned yet".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+
+        Staged::Unavailable(fault) => (
+            format!("{fault}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    }
 }
 
 #[cfg(test)]

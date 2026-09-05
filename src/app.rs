@@ -18,6 +18,7 @@ use crossbeam::channel::{Receiver, Sender, bounded};
 use crate::InputKind;
 use turntable_lib::{
     audio_health::{self, AudioHealth, HealthRecorder},
+    card_reader::{self, CardReader},
     deck_controller::{self, AppStatus, DeckController, DeckId},
     decoder::SAMPLE_RATE,
     input_event::{AppEvent, DeckEvent, InputEvent},
@@ -48,6 +49,17 @@ pub struct Options<'a> {
     pub buffer_frames_n: u32,
     /// nudge / pitch bend responsiveness factor, applied to whichever input is in use
     pub nudge_responsiveness: f32,
+    /// whether this run uses the QR scanner
+    pub qr: QrMode,
+}
+
+/// How hard this run insists on a QR scanner.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QrMode {
+    /// Follow the hardware: a connected gun is taken as the intent to use it.
+    Auto,
+    Require,
+    Off,
 }
 
 /// Turns the runtime deck count into the const generic the engine is built on.
@@ -79,6 +91,23 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     let (tray_snd, tray_rcv) = bounded(3);
     let tray_state = Arc::new(RwLock::new(TrayState::Empty));
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Opened before the decks and the stream, so a run that cannot have the
+    // scanner it needs fails with nothing yet to unwind.
+    let card_reader = match options.qr {
+        QrMode::Off => None,
+
+        QrMode::Auto if !localdeck_qr_scanner::is_connected() => {
+            let message = "No QR scanner connected; running without it. Pass --qr to require one.";
+            log::info!("{message}");
+            app_status.set(message);
+            None
+        }
+
+        // A gun on the bus is the intent to use it, so from here Auto is as
+        // strict as Require: it is plugged in, it has to work.
+        QrMode::Auto | QrMode::Require => Some(start_card_reader(&shutdown)),
+    };
 
     // One input unit is a touchpad pixel or a jog wheel tick depending on what
     // is driving the decks, which is the only thing the engine needs to be told
@@ -154,6 +183,7 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         Arc::clone(&tray_state),
         app_status.clone(),
         health,
+        card_reader.as_ref().map(CardReader::view),
         events_snd.clone(),
         Arc::clone(&shutdown),
     );
@@ -206,6 +236,11 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         log::error!("TUI thread panicked");
     }
 
+    // Late, because closing the port waits out the scanner's read timeout.
+    if let Some(card_reader) = card_reader {
+        card_reader.stop();
+    }
+
     // Joined last of the workers: it reports the session totals on the way out.
     if let Err(_) = health_monitor.join() {
         log::error!("Audio health monitor panicked");
@@ -221,6 +256,22 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     }
 
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
+}
+
+/// Exits rather than returning: every caller has already decided the run needs a
+/// scanner, so there is nothing sensible to carry on with.
+fn start_card_reader(shutdown: &Arc<AtomicBool>) -> CardReader {
+    match card_reader::start(Arc::clone(shutdown)) {
+        Ok(reader) => reader,
+        Err(e) => {
+            eprintln!(
+                "Cannot start the QR scanner on {}: {e}\n\
+                 Fix the scanner, or pass --no-qr to run without it.",
+                localdeck_qr_scanner::LINUX_PORT_NAME
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Runs the SDL window as the input source, returning when the app should stop.

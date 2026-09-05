@@ -1,4 +1,5 @@
 pub mod audio_health;
+pub mod card_reader;
 pub mod clock_sync;
 pub mod deck_controller;
 pub mod decoder;
