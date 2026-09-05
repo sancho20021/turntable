@@ -1,5 +1,6 @@
 use std::{
     array,
+    path::Path,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,9 +16,13 @@ use cpal::{
 };
 use crossbeam::channel::{Receiver, Sender, bounded};
 
+use localdeck_storage::operations::Storage;
+
 use crate::InputKind;
+use crate::cards_config::{self, CardsConfig};
 use turntable_lib::{
     audio_health::{self, AudioHealth, HealthRecorder},
+    card_library::Library,
     card_reader::{self, CardReader},
     deck_controller::{self, AppStatus, DeckController, DeckId},
     decoder::SAMPLE_RATE,
@@ -51,6 +56,8 @@ pub struct Options<'a> {
     pub nudge_responsiveness: f32,
     /// whether this run uses the QR scanner
     pub qr: QrMode,
+    /// localdeck config naming the card library, else `$LOCALDECK_CONFIG`
+    pub cards_config: Option<&'a Path>,
 }
 
 /// How hard this run insists on a QR scanner.
@@ -92,6 +99,12 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     let tray_state = Arc::new(RwLock::new(TrayState::Empty));
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Input sources produce events; the dispatcher applies them. Keeping those
+    // apart is what lets a source live on a thread it does not own - SDL's pump
+    // must stay on the thread that initialised video, the TUI is busy drawing,
+    // and a MIDI callback runs on a driver thread we are only handed.
+    let (events_snd, events_rcv) = bounded(EVENT_QUEUE_LEN);
+
     // Opened before the decks and the stream, so a run that cannot have the
     // scanner it needs fails with nothing yet to unwind.
     let card_reader = match options.qr {
@@ -106,7 +119,9 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
 
         // A gun on the bus is the intent to use it, so from here Auto is as
         // strict as Require: it is plugged in, it has to work.
-        QrMode::Auto | QrMode::Require => Some(start_card_reader(&shutdown)),
+        QrMode::Auto | QrMode::Require => {
+            Some(start_card_reader(&shutdown, options, events_snd.clone()))
+        }
     };
 
     // One input unit is a touchpad pixel or a jog wheel tick depending on what
@@ -168,12 +183,6 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
         app_status.clone(),
         Arc::clone(&shutdown),
     );
-
-    // Input sources produce events; the dispatcher applies them. Keeping those
-    // apart is what lets a source live on a thread it does not own - SDL's pump
-    // must stay on the thread that initialised video, the TUI is busy drawing,
-    // and a MIDI callback runs on a driver thread we are only handed.
-    let (events_snd, events_rcv) = bounded(EVENT_QUEUE_LEN);
 
     // Spawn polling TUI thread, which doubles as the drag and drop source
     let tui_handle = spawn_tui_thread::<DECKS>(
@@ -258,10 +267,14 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     telemetry::save_traces_to_file(tracers, "trace.csv").expect("Failed to save telemetry");
 }
 
-/// Exits rather than returning: every caller has already decided the run needs a
-/// scanner, so there is nothing sensible to carry on with.
-fn start_card_reader(shutdown: &Arc<AtomicBool>) -> CardReader {
-    match card_reader::start(Arc::clone(shutdown)) {
+fn start_card_reader(
+    shutdown: &Arc<AtomicBool>,
+    options: &Options,
+    events: Sender<InputEvent>,
+) -> CardReader {
+    let library = open_library(options.cards_config);
+
+    match card_reader::start(Arc::clone(shutdown), Box::new(library), events) {
         Ok(reader) => reader,
         Err(e) => {
             eprintln!(
@@ -271,6 +284,25 @@ fn start_card_reader(shutdown: &Arc<AtomicBool>) -> CardReader {
             );
             std::process::exit(1);
         }
+    }
+}
+
+fn open_library(config_path: Option<&Path>) -> Library {
+    let fail = |problem: String| -> ! {
+        eprintln!(
+            "{problem}\n\
+             Point --cards-config at localdeck's config.toml, set LOCALDECK_CONFIG, \
+             check the library's drive is mounted, or pass --no-qr to run without cards."
+        );
+        std::process::exit(1);
+    };
+
+    let path = cards_config::resolve_path(config_path).unwrap_or_else(|e| fail(format!("{e:#}")));
+    let config = CardsConfig::load(&path).unwrap_or_else(|e| fail(format!("{e:#}")));
+
+    match Storage::new(config.storage) {
+        Ok(storage) => Library::new(storage),
+        Err(e) => fail(format!("Cannot open the card library: {e}")),
     }
 }
 

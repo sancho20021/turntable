@@ -11,8 +11,8 @@
 //! the audio thread gives it back. Two threads:
 //!
 //! * **tray** — the state machine and the prepared record. Never blocks for
-//!   long, so a `PrepareRecord` arriving mid-decode can be rejected as busy
-//!   right away instead of after the decode it was supposed to be rejected by.
+//!   long, so a `PrepareRecord` arriving mid-decode is queued right away instead
+//!   of waiting out the decode it is queued behind.
 //! * **loader** — blocking `load_file` calls, nothing else.
 
 use std::{
@@ -51,8 +51,7 @@ pub enum TrayCommand {
 pub enum TrayState {
     /// Nothing prepared.
     Empty,
-    /// Being decoded off disk. Further `PrepareRecord`s are rejected until this
-    /// finishes.
+    /// Being decoded off disk. A `PrepareRecord` arriving now waits in `pending`.
     Preparing { path: String, since: Instant },
     /// Prepared, waiting for a `LoadRecord` to say which deck it goes on.
     Ready { info: RecordInfo },
@@ -124,6 +123,11 @@ struct Tray<const DECKS: usize> {
     /// The prepared record, present exactly while `state` is
     /// [`TrayState::Ready`].
     prepared: Option<(Record, RecordInfo)>,
+    /// The track to decode once the current one finishes. Scans arrive without
+    /// anyone pressing anything, so a request during a decode is held rather
+    /// than lost; a newer one displaces it, since the DJ is holding the newer
+    /// card.
+    pending: Option<String>,
     /// Authoritative state; mirrored into `published` on every change.
     state: TrayState,
     published: Arc<RwLock<TrayState>>,
@@ -162,12 +166,13 @@ impl<const DECKS: usize> Tray<DECKS> {
         }
     }
 
-    /// Start decoding a track, unless one is already being decoded.
+    /// Start decoding a track, or queue it if one is already being decoded.
     fn prepare_record(&mut self, path: String) {
         if let TrayState::Preparing { path: current, .. } = &self.state {
-            let msg = format!("Record loader busy, still preparing {current}");
-            log::warn!("rejected {path}: {msg}");
+            let msg = format!("Queued {path}, still preparing {current}");
+            log::info!("{msg}");
             self.app_status.set(msg);
+            self.pending = Some(path);
             return;
         }
 
@@ -201,7 +206,7 @@ impl<const DECKS: usize> Tray<DECKS> {
                 format!("Still preparing {path}, wait for it to be ready")
             }
             TrayState::Empty | TrayState::Failed { .. } => {
-                "Nothing prepared, drag and drop a music file first".to_string()
+                "Nothing prepared, scan a card or drag and drop a music file first".to_string()
             }
             TrayState::Ready { .. } => {
                 let Some(slot) = self.decks.get_mut(deck_id) else {
@@ -284,6 +289,13 @@ impl<const DECKS: usize> Tray<DECKS> {
                 self.set_state(TrayState::Failed { path, error });
             }
         }
+
+        // The loader is free again, so whatever arrived while it was busy runs
+        // now. Taken after the state is published, so `prepare_record` sees a
+        // tray that is no longer `Preparing`.
+        if let Some(next) = self.pending.take() {
+            self.prepare_record(next);
+        }
     }
 
     fn run(
@@ -333,6 +345,7 @@ pub fn start<const DECKS: usize>(
 
     let tray = Tray::<DECKS> {
         prepared: None,
+        pending: None,
         state: TrayState::Empty,
         published: tray_state,
         loader: path_tx,
@@ -352,4 +365,86 @@ pub fn start<const DECKS: usize>(
         loader_join.join().expect("record loader panicked");
         log::debug!("Record tray terminated cleanly");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam::channel::bounded;
+
+    /// A tray with no decks, which is all the queueing needs. The receiver is
+    /// what the record loader would be reading.
+    fn tray_and_loader() -> (Tray<0>, Receiver<String>) {
+        let (loader, decoding) = bounded(1);
+
+        let tray = Tray::<0> {
+            prepared: None,
+            pending: None,
+            state: TrayState::Empty,
+            published: Arc::new(RwLock::new(TrayState::Empty)),
+            loader,
+            decks: [],
+            app_status: AppStatus::new(),
+        };
+
+        (tray, decoding)
+    }
+
+    /// Whatever the loader was handed, if anything.
+    fn started(decoding: &Receiver<String>) -> Option<String> {
+        decoding.try_recv().ok()
+    }
+
+    /// Standing in for a decode that finished, without building a record.
+    fn finished(path: &str) -> LoadedRecord {
+        LoadedRecord {
+            path: path.to_string(),
+            result: Err("not a real decode".to_string()),
+        }
+    }
+
+    /// Scans arrive without anyone pressing anything, so a second one during a
+    /// decode has to wait rather than be dropped.
+    #[test]
+    fn a_request_during_a_decode_runs_after_it() {
+        let (mut tray, decoding) = tray_and_loader();
+
+        tray.prepare_record("first.flac".to_string());
+        assert_eq!(started(&decoding).as_deref(), Some("first.flac"));
+
+        tray.prepare_record("second.flac".to_string());
+        assert_eq!(started(&decoding), None, "two decodes were started at once");
+
+        tray.handle_loaded_record(finished("first.flac"));
+        assert_eq!(started(&decoding).as_deref(), Some("second.flac"));
+    }
+
+    /// The DJ is holding the newest card, so that is the one to end up with.
+    #[test]
+    fn the_newest_waiting_request_displaces_the_others() {
+        let (mut tray, decoding) = tray_and_loader();
+
+        tray.prepare_record("first.flac".to_string());
+        let _ = started(&decoding);
+
+        tray.prepare_record("second.flac".to_string());
+        tray.prepare_record("third.flac".to_string());
+
+        tray.handle_loaded_record(finished("first.flac"));
+        assert_eq!(started(&decoding).as_deref(), Some("third.flac"));
+
+        tray.handle_loaded_record(finished("third.flac"));
+        assert_eq!(started(&decoding), None, "a displaced request still ran");
+    }
+
+    #[test]
+    fn nothing_waits_when_the_loader_was_idle() {
+        let (mut tray, decoding) = tray_and_loader();
+
+        tray.prepare_record("only.flac".to_string());
+        assert_eq!(started(&decoding).as_deref(), Some("only.flac"));
+
+        tray.handle_loaded_record(finished("only.flac"));
+        assert_eq!(started(&decoding), None);
+    }
 }

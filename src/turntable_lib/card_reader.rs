@@ -10,6 +10,7 @@ use std::{
     fmt,
     io::ErrorKind,
     ops::ControlFlow,
+    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +19,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::channel::{Receiver, RecvTimeoutError};
-use localdeck_qr_scanner::{QrScanner, QrScannerError, start_qr_scanner};
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
+use localdeck_qr_scanner::{
+    PortOpenError, QrScanner, ScannerStopped, extract_cardid, start_qr_scanner,
+};
+
+use crate::input_event::{AppEvent, InputEvent};
 
 /// How long the staging thread blocks before checking whether the app is stopping.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -30,10 +35,34 @@ pub struct ScannedCard {
     pub payload: String,
     /// When the gun last read it.
     pub at: Instant,
-    /// Whether this card has already been put in the tray. Survives the gun
-    /// re-reading the same card, so the panel keeps offering it while the DJ
-    /// lines the next one up.
-    pub loaded: bool,
+    pub outcome: Outcome,
+}
+
+/// How far a scanned card got towards being playable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The lookup is running. Published before it starts, since it reads the
+    /// library off USB and can take seconds if the drive has spun down - without
+    /// this the panel would still be showing the previous card.
+    Resolving,
+    /// Handed to the tray. What happens to it from there is the tray's to report.
+    SentToTray,
+    /// The library has no such card.
+    Unknown,
+    Failed(String),
+}
+
+/// A card's file on disk, if the library has one.
+pub trait CardResolver: Send {
+    fn resolve(&mut self, card_id: &str) -> Result<PathBuf, ResolveError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolveError {
+    /// No such card in the library.
+    Unknown,
+    /// The card is known but its track could not be produced.
+    Failed(String),
 }
 
 /// Why the gun cannot be trusted right now.
@@ -95,13 +124,17 @@ impl CardReaderView {
 ///
 /// The port is opened before the thread starts, so a caller that cannot run
 /// without a scanner can refuse to start rather than discovering it later.
-pub fn start(shutdown: Arc<AtomicBool>) -> Result<CardReader, QrScannerError> {
+pub fn start(
+    shutdown: Arc<AtomicBool>,
+    resolver: Box<dyn CardResolver>,
+    tracks: Sender<InputEvent>,
+) -> Result<CardReader, PortOpenError> {
     let (events, scanner) = start_qr_scanner()?;
     let staged = Arc::new(RwLock::new(Staged::Empty));
 
     let staging = {
         let staged = Arc::clone(&staged);
-        std::thread::spawn(move || stage_scans(events, staged, shutdown))
+        std::thread::spawn(move || stage_scans(events, staged, shutdown, resolver, tracks))
     };
 
     Ok(CardReader {
@@ -130,14 +163,16 @@ impl CardReader {
 
 /// Keeps the newest scan, discarding everything the gun read before it.
 fn stage_scans(
-    events: Receiver<Result<String, QrScannerError>>,
+    events: Receiver<Result<String, ScannerStopped>>,
     staged: Arc<RwLock<Staged>>,
     shutdown: Arc<AtomicBool>,
+    mut resolver: Box<dyn CardResolver>,
+    tracks: Sender<InputEvent>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match events.recv_timeout(POLL_INTERVAL) {
             Ok(event) => {
-                if stage_scan(event, &staged).is_break() {
+                if stage_scan(event, &staged, resolver.as_mut(), &tracks).is_break() {
                     break;
                 }
             }
@@ -160,35 +195,89 @@ fn stage_scans(
 
 /// Applies one message from the gun and says whether to keep reading. A fault
 /// ends the loop, because the gun's own thread exits after reporting one.
-fn stage_scan(event: Result<String, QrScannerError>, staged: &RwLock<Staged>) -> ControlFlow<()> {
-    let Ok(mut slot) = staged.write() else {
-        log::error!("cannot update the staged card, lock poisoned");
-        return ControlFlow::Break(());
-    };
-
-    match event {
-        Ok(payload) => {
-            let loaded = match &*slot {
-                Staged::Card(previous) if previous.payload == payload => previous.loaded,
-                _ => {
-                    log::info!("qr scan staged: {payload}");
-                    false
-                }
-            };
-
-            *slot = Staged::Card(ScannedCard {
-                payload,
-                at: Instant::now(),
-                loaded,
-            });
-            ControlFlow::Continue(())
-        }
-
+fn stage_scan(
+    event: Result<String, ScannerStopped>,
+    staged: &RwLock<Staged>,
+    resolver: &mut dyn CardResolver,
+    tracks: &Sender<InputEvent>,
+) -> ControlFlow<()> {
+    let payload = match event {
+        Ok(payload) => payload,
         Err(error) => {
             let fault = fault_of(error);
             log::error!("qr scanner unusable: {fault}");
-            *slot = Staged::Unavailable(fault);
-            ControlFlow::Break(())
+            publish(staged, Staged::Unavailable(fault));
+            return ControlFlow::Break(());
+        }
+    };
+
+    let at = Instant::now();
+
+    if was_already_staged(staged, &payload, at) {
+        return ControlFlow::Continue(());
+    }
+
+    log::info!("qr scan staged: {payload}");
+    publish(
+        staged,
+        Staged::Card(ScannedCard {
+            payload: payload.clone(),
+            at,
+            outcome: Outcome::Resolving,
+        }),
+    );
+
+    // Reads the library off the USB drive, so it takes seconds if the drive has
+    // spun down.
+    let outcome = match resolver.resolve(&extract_cardid(&payload)) {
+        Ok(path) => send_to_tray(tracks, path),
+        Err(ResolveError::Unknown) => {
+            log::warn!("card not in the library: {payload}");
+            Outcome::Unknown
+        }
+        Err(ResolveError::Failed(reason)) => {
+            log::error!("cannot play card {payload}: {reason}");
+            Outcome::Failed(reason)
+        }
+    };
+
+    publish(
+        staged,
+        Staged::Card(ScannedCard {
+            payload,
+            at,
+            outcome,
+        }),
+    );
+    ControlFlow::Continue(())
+}
+
+/// Whether the gun re-read the card already staged, in which case its timestamp
+/// is moved to `at` and nothing else changes.
+fn was_already_staged(staged: &RwLock<Staged>, payload: &str, at: Instant) -> bool {
+    let Ok(mut slot) = staged.write() else {
+        log::error!("cannot update the staged card, lock poisoned");
+        return false;
+    };
+
+    match &mut *slot {
+        Staged::Card(card) if card.payload == payload => {
+            card.at = at;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn send_to_tray(tracks: &Sender<InputEvent>, path: PathBuf) -> Outcome {
+    let path = path.to_string_lossy().into_owned();
+    log::info!("card resolved to {path}");
+
+    match tracks.try_send(InputEvent::App(AppEvent::PrepareRecord(path))) {
+        Ok(()) => Outcome::SentToTray,
+        Err(e) => {
+            log::error!("cannot reach the record tray: {e}");
+            Outcome::Failed(format!("cannot reach the record tray: {e}"))
         }
     }
 }
@@ -202,41 +291,82 @@ fn publish(staged: &RwLock<Staged>, value: Staged) {
 
 /// Separates a gun that has left the bus from one that is still there and
 /// misbehaving, which are different things to tell the user.
-fn fault_of(error: QrScannerError) -> ScannerFault {
-    match error {
-        QrScannerError::PortOpen(message) => ScannerFault::Disconnected(message),
+fn fault_of(stopped: ScannerStopped) -> ScannerFault {
+    let ScannerStopped { kind, message } = stopped;
 
-        QrScannerError::ReadError { kind, message } => match kind {
-            ErrorKind::NotFound
-            | ErrorKind::NotConnected
-            | ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::UnexpectedEof => ScannerFault::Disconnected(message),
-            _ => ScannerFault::Faulted(message),
-        },
-
-        QrScannerError::SendError(message) => ScannerFault::Faulted(message),
+    match kind {
+        ErrorKind::NotFound
+        | ErrorKind::NotConnected
+        | ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::UnexpectedEof => ScannerFault::Disconnected(message),
+        _ => ScannerFault::Faulted(message),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam::channel::bounded;
 
-    /// Feeds the messages through the staging logic and reports what the gun
-    /// would serve afterwards. No port and no threads.
-    fn after(events: Vec<Result<String, QrScannerError>>) -> Staged {
+    /// Answers every card with the same path, and counts how often it was asked.
+    struct Library {
+        answer: Result<PathBuf, ResolveError>,
+        lookups: usize,
+    }
+
+    impl Library {
+        fn holding_everything() -> Self {
+            Self {
+                answer: Ok(PathBuf::from("/music/track.flac")),
+                lookups: 0,
+            }
+        }
+
+        fn holding_nothing() -> Self {
+            Self {
+                answer: Err(ResolveError::Unknown),
+                lookups: 0,
+            }
+        }
+    }
+
+    impl CardResolver for Library {
+        fn resolve(&mut self, _card_id: &str) -> Result<PathBuf, ResolveError> {
+            self.lookups += 1;
+            self.answer.clone()
+        }
+    }
+
+    /// One run of the staging logic: no port, no threads, no database. Reports
+    /// what the reader ends up serving, what reached the tray, and how many
+    /// lookups it took to get there.
+    fn run(events: Vec<Result<String, ScannerStopped>>, mut library: Library) -> Run {
         let staged = Arc::new(RwLock::new(Staged::Empty));
+        let (tracks, prepared) = bounded(16);
+
         for event in events {
-            if stage_scan(event, &staged).is_break() {
+            if stage_scan(event, &staged, &mut library, &tracks).is_break() {
                 break;
             }
         }
-        CardReaderView { staged }.staged()
+
+        Run {
+            staged: CardReaderView { staged }.staged(),
+            prepared: prepared.try_iter().count(),
+            lookups: library.lookups,
+        }
     }
 
-    fn read_error(kind: ErrorKind) -> QrScannerError {
-        QrScannerError::ReadError {
+    struct Run {
+        staged: Staged,
+        /// `PrepareRecord` events that reached the tray.
+        prepared: usize,
+        lookups: usize,
+    }
+
+    fn scanner_stopped(kind: ErrorKind) -> ScannerStopped {
+        ScannerStopped {
             kind,
             message: "device went away".to_string(),
         }
@@ -253,86 +383,91 @@ mod tests {
         card_of(staged).payload
     }
 
-    /// The whole point of the module: the gun re-reads a card it can see, and
-    /// all of those repeats have to collapse into the one thing on offer.
+    /// The whole point of the module: a card left in front of the gun is read
+    /// over and over, and must be looked up and sent to the tray exactly once.
     #[test]
-    fn repeated_scans_of_one_card_stage_it_once() {
+    fn a_card_read_fifty_times_is_prepared_once() {
         let scans = (0..50).map(|_| Ok("1701".to_string())).collect();
-        assert_eq!(payload_of(after(scans)), "1701");
+        let run = run(scans, Library::holding_everything());
+
+        assert_eq!(run.lookups, 1, "the library was asked more than once");
+        assert_eq!(
+            run.prepared, 1,
+            "the track was sent to the tray more than once"
+        );
+        assert_eq!(payload_of(run.staged), "1701");
     }
 
     #[test]
-    fn the_newest_scan_wins() {
+    fn a_different_card_is_looked_up_and_sent() {
         let scans = vec![
             Ok("1701".to_string()),
             Ok("1701".to_string()),
             Ok("42".to_string()),
         ];
-        assert_eq!(payload_of(after(scans)), "42");
+        let run = run(scans, Library::holding_everything());
+
+        assert_eq!(run.lookups, 2);
+        assert_eq!(run.prepared, 2);
+        assert_eq!(payload_of(run.staged), "42");
     }
 
-    /// A card put down that the gun never read must not load whatever was
-    /// scanned before it. Serving the older card is the one failure that plays
-    /// the wrong track.
+    /// Anything with a QR code on it can end up in front of the gun, so a card
+    /// the library does not have must leave the tray alone.
+    #[test]
+    fn an_unknown_card_reaches_the_tray_as_nothing() {
+        let run = run(
+            vec![Ok("a wifi code".to_string())],
+            Library::holding_nothing(),
+        );
+
+        assert_eq!(run.prepared, 0, "an unknown card was sent to the tray");
+        assert_eq!(card_of(run.staged).outcome, Outcome::Unknown);
+    }
+
+    #[test]
+    fn a_resolved_card_reports_reaching_the_tray() {
+        let run = run(vec![Ok("1701".to_string())], Library::holding_everything());
+        assert_eq!(card_of(run.staged).outcome, Outcome::SentToTray);
+    }
+
+    /// A card put down that the gun never read must not serve whatever was
+    /// scanned before it. Serving the older card is the failure that plays the
+    /// wrong track.
     #[test]
     fn a_fault_serves_nothing_rather_than_the_last_card() {
-        let staged = after(vec![
-            Ok("1701".to_string()),
-            Err(read_error(ErrorKind::BrokenPipe)),
-        ]);
+        let run = run(
+            vec![
+                Ok("1701".to_string()),
+                Err(scanner_stopped(ErrorKind::BrokenPipe)),
+            ],
+            Library::holding_everything(),
+        );
 
         assert!(
-            matches!(staged, Staged::Unavailable(_)),
-            "a broken scanner offered {staged:?}"
+            matches!(run.staged, Staged::Unavailable(_)),
+            "a broken scanner offered {:?}",
+            run.staged
         );
     }
 
     #[test]
     fn nothing_is_staged_before_the_first_scan() {
-        assert!(matches!(after(vec![]), Staged::Empty));
-    }
-
-    /// The DJ lines a card up while the gun re-reads it, and the panel has to
-    /// keep saying "ready to load" throughout rather than only on the first read.
-    #[test]
-    fn re_reading_a_loaded_card_does_not_offer_it_again() {
-        let staged = Arc::new(RwLock::new(Staged::Card(ScannedCard {
-            payload: "1701".to_string(),
-            at: Instant::now(),
-            loaded: true,
-        })));
-
-        let _ = stage_scan(Ok("1701".to_string()), &staged);
-
-        let card = card_of(CardReaderView { staged }.staged());
-        assert!(card.loaded, "a card already in the tray was offered again");
-    }
-
-    /// The signal the DJ waits for while adjusting the angle.
-    #[test]
-    fn a_different_card_is_offered_even_after_one_was_loaded() {
-        let staged = Arc::new(RwLock::new(Staged::Card(ScannedCard {
-            payload: "1701".to_string(),
-            at: Instant::now(),
-            loaded: true,
-        })));
-
-        let _ = stage_scan(Ok("42".to_string()), &staged);
-
-        let card = card_of(CardReaderView { staged }.staged());
-        assert_eq!(card.payload, "42");
-        assert!(!card.loaded, "a freshly scanned card was not offered");
+        assert!(matches!(
+            run(vec![], Library::holding_everything()).staged,
+            Staged::Empty
+        ));
     }
 
     /// The TUI says which of the two happened, so they must not collapse.
     #[test]
     fn a_vanished_gun_reads_differently_from_a_misbehaving_one() {
         assert!(matches!(
-            fault_of(read_error(ErrorKind::NotConnected)),
+            fault_of(scanner_stopped(ErrorKind::NotConnected)),
             ScannerFault::Disconnected(_)
         ));
         assert!(matches!(
-            fault_of(read_error(ErrorKind::InvalidData)),
+            fault_of(scanner_stopped(ErrorKind::InvalidData)),
             ScannerFault::Faulted(_)
         ));
     }

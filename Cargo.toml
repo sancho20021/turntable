@@ -27,6 +27,9 @@ log = "0.4"
 env_logger = "0.11"
 
 localdeck-qr-scanner = { path = "../localdeck/crates/qr-scanner" }
+localdeck-storage = { path = "../localdeck/crates/storage" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.7"
 
 midir = "0.11"
 itertools = "0.13"

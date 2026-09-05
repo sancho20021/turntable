@@ -1,4 +1,5 @@
 mod app;
+mod cards_config;
 
 use std::{fs::OpenOptions, path::PathBuf};
 
@@ -86,6 +87,10 @@ enum Commands {
         /// Ignore the QR scanner even if one is connected
         #[arg(long)]
         no_qr: bool,
+
+        /// localdeck config naming the card library. Defaults to $LOCALDECK_CONFIG
+        #[arg(long)]
+        cards_config: Option<PathBuf>,
     },
 }
 
@@ -168,6 +173,7 @@ fn main() {
             nudge,
             qr,
             no_qr,
+            cards_config,
         } => {
             log::info!("Starting Turntable: {:?}", args.command);
             start(app::Options {
@@ -180,6 +186,7 @@ fn main() {
                 sensitivity: *sensitivity,
                 buffer_frames_n: *buffer,
                 nudge_responsiveness: *nudge,
+                cards_config: cards_config.as_deref(),
                 qr: match (*qr, *no_qr) {
                     (true, _) => QrMode::Require,
                     (_, true) => QrMode::Off,

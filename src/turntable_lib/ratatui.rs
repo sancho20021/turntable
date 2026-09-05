@@ -31,7 +31,7 @@ use percent_encoding::percent_decode_str;
 
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
-    card_reader::{CardReaderView, Staged},
+    card_reader::{CardReaderView, Outcome, Staged},
     deck_controller::{AppStatus, DeckState},
     input_event::{AppEvent, InputEvent},
     record::{INanos, UNanos},
@@ -217,7 +217,7 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
 
     match tray {
         TrayState::Empty => (
-            "·  empty        drop a track onto this window".to_string(),
+            "·  empty        scan a card, or drop a track onto this window".to_string(),
             Style::default().fg(Color::DarkGray),
         ),
 
@@ -475,21 +475,29 @@ fn render_tui<const DECKS: usize>(
 /// would be naming a track the next press is not going to load.
 fn scanner_line(reader: &CardReaderView) -> (String, Style) {
     match reader.staged() {
-        Staged::Card(card) if !card.loaded => (
-            format!(
-                "NEW CARD {} - ready to load (seen {:.1}s ago)",
-                card.payload,
-                card.at.elapsed().as_secs_f64()
+        Staged::Card(card) => match &card.outcome {
+            Outcome::Resolving => (
+                format!("card {} - looking up...", card.payload),
+                Style::default().fg(Color::Yellow),
             ),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
 
-        Staged::Card(card) => (
-            format!("{} loaded - scan a card to load another", card.payload),
-            Style::default().fg(Color::Gray),
-        ),
+            Outcome::SentToTray => (
+                format!("card {} - see the tray", card.payload),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+
+            Outcome::Unknown => (
+                format!("card {} - not in the library", card.payload),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+
+            Outcome::Failed(reason) => (
+                format!("card {} - {reason}", card.payload),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        },
 
         Staged::Empty => (
             "ready - nothing scanned yet".to_string(),
