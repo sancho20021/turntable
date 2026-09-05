@@ -65,7 +65,7 @@ enum Commands {
         device: Option<String>,
 
         /// Audio callback buffer size
-        #[arg(short, long, default_value_t = 256)]
+        #[arg(short, long, default_value_t = app::DEFAULT_BUFFER_FRAMES)]
         buffer: u32,
 
         /// Scratch sensitivity factor, applied to whichever input is in use

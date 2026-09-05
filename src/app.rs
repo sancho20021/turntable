@@ -61,6 +61,12 @@ pub struct Options<'a> {
     pub cards_config: Option<&'a Path>,
 }
 
+/// Frames per audio callback unless the command line says otherwise.
+///
+/// Scheduling jitter does not shrink along with the buffer, so a smaller one
+/// spends a larger share of its budget on being woken up late.
+pub const DEFAULT_BUFFER_FRAMES: u32 = 512;
+
 /// How hard this run insists on a QR scanner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QrMode {
@@ -127,6 +133,16 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
             notices.clone(),
         )),
     };
+
+    if options.buffer_frames_n < DEFAULT_BUFFER_FRAMES {
+        let message = format!(
+            "Buffer {} is below the default {DEFAULT_BUFFER_FRAMES}: less headroom per \
+             callback, so dropouts are likelier",
+            options.buffer_frames_n
+        );
+        log::warn!("{message}");
+        notices.warn(message);
+    }
 
     // One input unit is a touchpad pixel or a jog wheel tick depending on what
     // is driving the decks, which is the only thing the engine needs to be told
