@@ -44,9 +44,9 @@ static LAG_CLAMP: INanos = INanos(5_000_000);
 /// Communication channels for audio processor
 pub struct AudioProcessorHandles {
     /// record sent to play instead of current record
-    pub next_record: Consumer<Record>,
+    pub next_record: Consumer<Arc<Record>>,
     /// sink for used records to avoid dropping in audio thread
-    pub used_records: Producer<Record>,
+    pub used_records: Producer<Arc<Record>>,
     /// source of platter position
     pub platter: ReadablePlatter,
     /// where this deck reports its own health, see [`crate::audio_health`]
@@ -56,7 +56,7 @@ pub struct AudioProcessorHandles {
 /// The self-contained logic unit that transforms platter ticks into audio samples.
 pub struct PlatterAudioProcessor {
     handles: AudioProcessorHandles,
-    cur_record: Option<Record>,
+    cur_record: Option<Arc<Record>>,
     /// clock and position of the last block played, `None` until the first one
     last_played: Option<PlatterSample>,
     //// Second newest measurement of virtual playhead
@@ -122,14 +122,14 @@ impl PlatterAudioProcessor {
         Self::frames_to_dur(buffer_frames_n)
     }
 
-    fn set_record(&mut self, record: Record) {
+    fn set_record(&mut self, record: Arc<Record>) {
         if let Some(old_record) = self.cur_record.replace(record) {
-            // in case of failure, we will drop it in audio thread which frees the
-            // whole decoded track here and stalls the callback
+            // This reference may be the last one, and freeing a whole decoded
+            // track inside the callback stalls it.
             match self.handles.used_records.push(old_record) {
                 Ok(()) => {}
                 Err(rtrb::PushError::Full(old_rec)) => {
-                    self.health.track_freed_on_audio_thread();
+                    self.health.record_dropped_on_audio_thread();
                     drop(old_rec);
                 }
             }
@@ -397,7 +397,7 @@ mod tests {
         // These tests read the playhead off the samples, which the output
         // high-pass would filter along with everything else.
         processor.dc_blocker = StereoDcBlocker::bypass();
-        records_in.push(ramp_record(200_000)).unwrap();
+        records_in.push(Arc::new(ramp_record(200_000))).unwrap();
         // the record is picked up on the next callback
         processor.write_frames(&mut [StereoFrame::default(); FRAMES]);
         (processor, writable)
@@ -499,7 +499,9 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
-        records_in.push(tone(5.0, 440., TONE_PEAK)).unwrap();
+        records_in
+            .push(Arc::new(tone(5.0, 440., TONE_PEAK)))
+            .unwrap();
 
         let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
         let mut frames = vec![StereoFrame::default(); FRAMES];
@@ -567,7 +569,7 @@ mod tests {
     /// record ring, the two things the app can change under a running deck.
     fn worst_step_across(
         record: Record,
-        disturb: impl FnOnce(&mut WritablePlatter, &mut Producer<Record>),
+        disturb: impl FnOnce(&mut WritablePlatter, &mut Producer<Arc<Record>>),
     ) -> f32 {
         let (mut platter, readable) = new_platter();
         let (mut records, next_record) = rtrb::RingBuffer::new(2);
@@ -580,7 +582,9 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
-        records.push(record).expect("a fresh ring has room");
+        records
+            .push(Arc::new(record))
+            .expect("a fresh ring has room");
 
         // Nominal speed is a block of record time for every block of clock time,
         // integrated off whatever the platter currently holds, which is what
@@ -673,7 +677,9 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(frames_n as u32, SAMPLE_RATE, 1).deck(0),
         });
-        records_in.push(tone(30., TONE_HZ, TONE_PEAK)).unwrap();
+        records_in
+            .push(Arc::new(tone(30., TONE_HZ, TONE_PEAK)))
+            .unwrap();
 
         let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(frames_n).0;
         let mut frames = vec![StereoFrame::default(); frames_n];
@@ -751,7 +757,7 @@ mod tests {
     fn loading_a_track_mid_play_does_not_tear_the_stream() {
         let step = worst_step_across(tone(5., TONE_HZ, TONE_PEAK), |_, records| {
             records
-                .push(tone(5., TONE_HZ, -TONE_PEAK))
+                .push(Arc::new(tone(5., TONE_HZ, -TONE_PEAK)))
                 .expect("the ring has room");
         });
 

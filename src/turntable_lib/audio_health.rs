@@ -123,9 +123,10 @@ pub struct DeckHealth {
     /// Callbacks that found no fresh platter sample and had to extrapolate from a
     /// stale slope. Zero while the platter thread outruns the audio one.
     pub callbacks_without_fresh_platter_sample: AtomicU64,
-    /// Times a whole decoded track was freed inside the callback because the
-    /// recycling ring was full. Always causes a stall. Expected value: 0.
-    pub tracks_freed_on_audio_thread: AtomicU64,
+    /// Times a record was dropped inside the callback because the recycling ring
+    /// was full. Frees the whole decoded track, and stalls, whenever that was its
+    /// last reference - and decks share one. Expected value: 0.
+    pub records_dropped_on_audio_thread: AtomicU64,
 
     /// Times the playhead was repositioned: a load, a rewind, a fast-forward.
     pub playhead_jumps: AtomicU64,
@@ -138,7 +139,7 @@ impl DeckHealth {
             playback_lag_nanos: AtomicI64::new(0),
             callbacks_with_lag_correction_maxed: AtomicU64::new(0),
             callbacks_without_fresh_platter_sample: AtomicU64::new(0),
-            tracks_freed_on_audio_thread: AtomicU64::new(0),
+            records_dropped_on_audio_thread: AtomicU64::new(0),
             playhead_jumps: AtomicU64::new(0),
         }
     }
@@ -170,8 +171,8 @@ impl DeckHealth {
     }
 
     #[inline]
-    pub fn track_freed_on_audio_thread(&self) {
-        self.tracks_freed_on_audio_thread.fetch_add(1, Relaxed);
+    pub fn record_dropped_on_audio_thread(&self) {
+        self.records_dropped_on_audio_thread.fetch_add(1, Relaxed);
     }
 
     #[inline]
@@ -489,7 +490,7 @@ struct DeckSnapshot {
     callbacks_rendered: u64,
     lag_correction_maxed: u64,
     stale_platter_samples: u64,
-    tracks_freed: u64,
+    records_dropped: u64,
     playhead_jumps: u64,
 }
 
@@ -527,7 +528,7 @@ impl Snapshot {
                     stale_platter_samples: deck
                         .callbacks_without_fresh_platter_sample
                         .load(Relaxed),
-                    tracks_freed: deck.tracks_freed_on_audio_thread.load(Relaxed),
+                    records_dropped: deck.records_dropped_on_audio_thread.load(Relaxed),
                     playhead_jumps: deck.playhead_jumps.load(Relaxed),
                 })
                 .collect(),
@@ -696,7 +697,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         let rendered = after.callbacks_rendered - before.callbacks_rendered;
         let maxed = after.lag_correction_maxed - before.lag_correction_maxed;
         let stale = after.stale_platter_samples - before.stale_platter_samples;
-        let freed = after.tracks_freed - before.tracks_freed;
+        let dropped = after.records_dropped - before.records_dropped;
         let jumps = after.playhead_jumps - before.playhead_jumps;
         let lag = deck.playback_lag();
 
@@ -706,11 +707,11 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
 
         let line = format!(
             "audio deck{deck_id}: lag {:.0}ms | correction maxed {maxed}/{rendered} callbacks | \
-             {stale} stale platter sample(s) | {freed} track(s) freed on audio thread",
+             {stale} stale platter sample(s) | {dropped} record(s) dropped on audio thread",
             lag as f64 / 1_000_000.0,
         );
 
-        if freed > 0 || stale > 0 || maxed > 0 || lag.abs() > LAG_WARN_NANOS {
+        if dropped > 0 || stale > 0 || maxed > 0 || lag.abs() > LAG_WARN_NANOS {
             log::warn!("{line}");
         } else {
             log::info!("{line}");
@@ -758,12 +759,12 @@ fn report_session(health: &AudioHealth, elapsed: Duration) {
         log::info!(
             "audio session deck{deck_id}: {} callbacks, lag {:.0}ms at exit, \
              correction maxed on {} callback(s), {} stale platter sample(s), \
-             {} track(s) freed on audio thread",
+             {} record(s) dropped on audio thread",
             deck.callbacks_rendered.load(Relaxed),
             deck.playback_lag_nanos.load(Relaxed) as f64 / 1_000_000.0,
             deck.callbacks_with_lag_correction_maxed.load(Relaxed),
             deck.callbacks_without_fresh_platter_sample.load(Relaxed),
-            deck.tracks_freed_on_audio_thread.load(Relaxed),
+            deck.records_dropped_on_audio_thread.load(Relaxed),
         );
     }
 }

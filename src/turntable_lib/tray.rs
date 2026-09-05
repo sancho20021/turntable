@@ -1,10 +1,13 @@
 //! The record tray: holds one prepared record until it is loaded onto a deck.
 //!
 //! Loading a track is two steps, because that is what both input devices want:
-//! dragging a file in only *prepares* the record, and a later `LoadRecord` says
-//! which deck it goes on. In keyboard mode that second step is a key press onto
-//! the active deck; a MIDI controller's LOAD buttons name the deck themselves.
-//! Nothing here knows which of those is driving it.
+//! scanning a card or dragging a file in only *prepares* the record, and a later
+//! `LoadRecord` says which deck it goes on. In keyboard mode that second step is
+//! a key press onto the active deck; a MIDI controller's LOAD buttons name the
+//! deck themselves. Nothing here knows which of those is driving it.
+//!
+//! The tray holds what it prepared until something replaces it, so one record
+//! reaches as many decks as it is asked to.
 //!
 //! This module owns the whole life of a [`Record`] outside the audio thread:
 //! decoding it off disk, holding it, handing it to a deck, and freeing it once
@@ -40,7 +43,8 @@ use crate::{
 pub enum TrayCommand {
     /// Decode a track off disk and hold it in the tray, ready to be loaded.
     PrepareRecord { path: String },
-    /// Put the prepared record on a deck. The tray is empty afterwards.
+    /// Put the prepared record on a deck. The tray keeps it, so it can go on
+    /// another deck too.
     LoadRecord { deck_id: DeckId },
 }
 
@@ -59,7 +63,8 @@ pub enum TrayState {
         since: Instant,
         queued: Option<String>,
     },
-    /// Prepared, waiting for a `LoadRecord` to say which deck it goes on.
+    /// Prepared. Stays here through any number of `LoadRecord`s, until another
+    /// track is scanned or dropped.
     Ready { info: RecordInfo },
     /// The last record could not be prepared. The tray holds nothing.
     Failed { path: String, error: String },
@@ -70,9 +75,9 @@ pub enum TrayState {
 /// Built by [`crate::deck_controller::new_deck`], which owns the other ends.
 pub struct DeckSlot {
     /// hands a record to the audio thread
-    pub records_in: Producer<Record>,
+    pub records_in: Producer<Arc<Record>>,
     /// takes back the record the audio thread stopped using
-    pub records_out: Consumer<Record>,
+    pub records_out: Consumer<Arc<Record>>,
     /// to publish what is playing on the deck
     pub state: Arc<DeckState>,
     /// to drop the needle at the start of a fresh record
@@ -82,7 +87,7 @@ pub struct DeckSlot {
 /// One decoded record, handed from the loader back to the tray.
 struct LoadedRecord {
     path: String,
-    result: Result<(Record, RecordInfo), String>,
+    result: Result<(Arc<Record>, RecordInfo), String>,
 }
 
 /// The blocking decode, and nothing else.
@@ -107,7 +112,7 @@ impl RecordLoader {
                 Ok(samples) => {
                     let samples_n = samples.len();
                     Ok((
-                        Record::new(samples, Interpolator::linear()),
+                        Arc::new(Record::new(samples, Interpolator::linear())),
                         RecordInfo {
                             path: path.clone(),
                             duration: PlatterAudioProcessor::frames_to_dur_nanos(samples_n),
@@ -128,7 +133,7 @@ impl RecordLoader {
 struct Tray<const DECKS: usize> {
     /// The prepared record, present exactly while `state` is
     /// [`TrayState::Ready`].
-    prepared: Option<(Record, RecordInfo)>,
+    prepared: Option<(Arc<Record>, RecordInfo)>,
     /// The track to decode once the current one finishes. Scans arrive without
     /// anyone pressing anything, so a request during a decode is held rather
     /// than lost; a newer one displaces it, since the DJ is holding the newer
@@ -213,7 +218,7 @@ impl<const DECKS: usize> Tray<DECKS> {
         });
     }
 
-    /// Put the prepared record on a deck, emptying the tray.
+    /// Put the prepared record on a deck, keeping it for the next one.
     fn load_record(&mut self, deck_id: DeckId) {
         let msg = match &self.state {
             TrayState::Preparing { path, .. } => {
@@ -227,7 +232,10 @@ impl<const DECKS: usize> Tray<DECKS> {
                     log::error!("cannot load on deck {deck_id}, only {DECKS} decks are available");
                     return;
                 };
-                let Some((record, info)) = self.prepared.take() else {
+                // Cloned, not taken: the tray goes on holding the record, so the
+                // same card can reach a second deck without being scanned again.
+                // Sharing the samples is what makes that free.
+                let Some((record, info)) = self.prepared.clone() else {
                     log::error!("tray is Ready but holds no record");
                     self.set_state(TrayState::Empty);
                     return;
@@ -259,18 +267,16 @@ impl<const DECKS: usize> Tray<DECKS> {
                                 "Cannot update current record info, lock poisoned (tui thread may be dead)"
                             ),
                         }
-                        self.set_state(TrayState::Empty);
                     }
                     // The deck's hand-off slot holds one record and the audio
                     // callback empties it every block, so a full one means the
                     // audio thread has stopped running.
-                    Err(rtrb::PushError::Full(rejected)) => {
+                    Err(rtrb::PushError::Full(_)) => {
                         log::error!("deck {deck_id} never took the last record");
                         self.notices.error(format!(
                             "Deck {} has not taken the last record - is audio running?",
                             deck_id + 1
                         ));
-                        self.prepared = Some((rejected, info));
                     }
                 }
                 return;
