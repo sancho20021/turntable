@@ -359,7 +359,12 @@ fn render_tui<const DECKS: usize>(
 
         // 3. Target pitch/speed
         let pitch = state.pitch.load(Ordering::Relaxed);
-        let pitch_str = format!("{pitch:.3}");
+        let pitch_str = {
+            // A pitch just under 1.0 rounds to -0.0, which prints as "-0.0%".
+            // Adding zero turns that back into a plain 0.0.
+            let percent = ((pitch - 1.) * 1000.).round() / 10. + 0.;
+            format!("{percent:+.1}%")
+        };
 
         // 4. Record Info & Playhead Position
         let (file_display, duration_nanos) = match state.cur_record.read() {
