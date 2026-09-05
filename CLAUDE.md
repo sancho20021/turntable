@@ -22,6 +22,8 @@ Before keeping any comment, apply these tests. Each one is a hard fail.
 - **No defending the choice.** Do not explain why some other approach was not
   taken, or what the code deliberately avoids doing. That belongs in the commit
   message. Document what the code guarantees and where that guarantee stops.
+  `would` is the tell: a sentence about what *would* happen is about code that
+  is not there. Delete it.
 - **Plain words.** Say what happens, concretely. No jargon, no clever phrasing,
   no compressed noun stacks. If a sentence needs to be reread to parse, rewrite
   it. Domain terms the code itself uses are fine; literary ones are not.

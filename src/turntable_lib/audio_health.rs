@@ -9,7 +9,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -190,11 +190,17 @@ impl DeckHealth {
 /// `_window` fields, which the monitor owns and clears each tick.
 pub struct AudioHealth {
     // ---- config: what we asked the device for, set once ---------------------
-    /// Time one callback has to finish: `frames_per_callback_expected / SAMPLE_RATE`.
-    pub callback_budget_nanos: u64,
-    /// Frames per callback we configured. The negotiated PipeWire quantum can
-    /// differ from this; that divergence is `callbacks_silenced_by_frame_mismatch`.
+    /// Time one callback has to finish, from the frame count the device is
+    /// actually delivering. PipeWire runs one quantum for the whole graph and
+    /// picks the smallest any client asks for, so it changes at runtime.
+    ///
+    /// Seeded from the request, corrected by the first callback.
+    pub callback_budget_nanos: AtomicU64,
+    /// Frames per callback we configured, kept for reporting what was asked for.
     pub frames_per_callback_expected: u32,
+    /// Frames the device last handed us.
+    pub frames_per_callback_observed: AtomicU32,
+    sample_rate: u32,
     /// Device clock at the first callback, so event timestamps can be reported
     /// relative to the start of the stream rather than to boot. Not a metric.
     stream_epoch_nanos: AtomicU64,
@@ -219,9 +225,9 @@ pub struct AudioHealth {
     pub longest_gap_between_callbacks_nanos_window: AtomicU64,
     /// Longest gap of the whole run, for the teardown summary.
     pub longest_gap_between_callbacks_nanos_session: AtomicU64,
-    /// Callbacks we filled with silence ourselves because the callback's frame count did
-    /// not match `frames_per_callback_expected`. On time, but silent, so the
-    /// device clock never sees these.
+    /// Callbacks we filled with silence ourselves because they carried more
+    /// frames than the buffers hold. On time, but silent, so the device clock
+    /// never sees these.
     pub callbacks_silenced_by_frame_mismatch: AtomicU64,
 
     // ---- cause: whose fault was it? ---------------------------------------
@@ -264,7 +270,9 @@ impl AudioHealth {
         };
 
         Arc::new(Self {
-            callback_budget_nanos,
+            callback_budget_nanos: AtomicU64::new(callback_budget_nanos),
+            frames_per_callback_observed: AtomicU32::new(frames_per_callback),
+            sample_rate,
             frames_per_callback_expected: frames_per_callback,
             stream_epoch_nanos: AtomicU64::new(0),
             callbacks_served: AtomicU64::new(0),
@@ -352,6 +360,10 @@ pub struct HealthRecorder {
     prev_callback_nanos: u64,
     /// device-clock stamp of the last event pushed, for rate limiting
     last_event_nanos: u64,
+    /// frames the last callback carried, to notice the quantum moving
+    observed_frames: u32,
+    /// whether the next gap straddles a quantum change
+    quantum_changed: bool,
 }
 
 /// Builds the audio-thread handle and the monitor's end of the event queue.
@@ -362,6 +374,8 @@ pub fn new_recorder(health: Arc<AudioHealth>) -> (HealthRecorder, Consumer<Audio
             health,
             events: producer,
             prev_callback_nanos: 0,
+            observed_frames: 0,
+            quantum_changed: false,
             last_event_nanos: 0,
         },
         consumer,
@@ -377,10 +391,11 @@ impl HealthRecorder {
     /// meantime. `callback_nanos` is the device clock, the only one that knows
     /// how many callbacks the graph made while we were away.
     #[inline]
-    pub fn on_callback_start(&mut self, callback_nanos: u64) {
+    pub fn on_callback_start(&mut self, callback_nanos: u64, frames: u32) {
         self.health.callbacks_served.fetch_add(1, Relaxed);
+        self.follow_quantum(frames);
 
-        let budget = self.health.callback_budget_nanos;
+        let budget = self.health.callback_budget_nanos.load(Relaxed);
         if callback_nanos == 0 || budget == 0 {
             // no usable device clock; counters that do not depend on it still work
             return;
@@ -407,6 +422,13 @@ impl HealthRecorder {
             self.health
                 .longest_gap_between_callbacks_nanos_session
                 .fetch_max(gap, Relaxed);
+
+            // One gap spans the old period and the new one, so it divides by
+            // neither.
+            if std::mem::take(&mut self.quantum_changed) {
+                self.prev_callback_nanos = callback_nanos;
+                return;
+            }
 
             // rounded, so ordinary jitter cannot be mistaken for a skip
             let cycles = ((gap + budget / 2) / budget).max(1);
@@ -440,6 +462,27 @@ impl HealthRecorder {
         });
     }
 
+    /// Keeps the budget on the quantum the graph is actually running, which
+    /// changes whenever another client joins asking for a smaller one.
+    #[inline]
+    fn follow_quantum(&mut self, frames: u32) {
+        if frames == 0 || frames == self.observed_frames {
+            return;
+        }
+
+        // Not on the first callback, which establishes the quantum rather than
+        // moving it.
+        self.quantum_changed = self.observed_frames != 0;
+        self.observed_frames = frames;
+        self.health
+            .frames_per_callback_observed
+            .store(frames, Relaxed);
+        self.health.callback_budget_nanos.store(
+            1_000_000_000u64 * frames as u64 / self.health.sample_rate.max(1) as u64,
+            Relaxed,
+        );
+    }
+
     /// Records how long the whole callback took against its budget.
     #[inline]
     pub fn on_callback_end(&mut self, callback_nanos: u64, elapsed_nanos: u64, frames: u32) {
@@ -450,7 +493,7 @@ impl HealthRecorder {
             .longest_callback_nanos_session
             .fetch_max(elapsed_nanos, Relaxed);
 
-        let budget = self.health.callback_budget_nanos;
+        let budget = self.health.callback_budget_nanos.load(Relaxed);
         if budget == 0 {
             return;
         }
@@ -563,7 +606,7 @@ pub fn spawn_monitor(
         log::info!(
             "audio health: {} frames per callback, {:.0}us budget",
             health.frames_per_callback_expected,
-            micros(health.callback_budget_nanos)
+            micros(health.callback_budget_nanos.load(Relaxed))
         );
 
         let session_start = Instant::now();
@@ -590,7 +633,7 @@ pub fn spawn_monitor(
 }
 
 fn drain_events(health: &AudioHealth, events: &mut Consumer<AudioEvent>) {
-    let budget = health.callback_budget_nanos;
+    let budget = health.callback_budget_nanos.load(Relaxed);
     while let Ok(event) = events.pop() {
         match event {
             AudioEvent::SlowCallback {
@@ -645,7 +688,7 @@ fn publish_digest(
 }
 
 fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) -> u64 {
-    let budget = health.callback_budget_nanos;
+    let budget = health.callback_budget_nanos.load(Relaxed);
 
     let served = current.callbacks_served - previous.callbacks_served;
     let skipped = current.callbacks_skipped - previous.callbacks_skipped;
@@ -686,6 +729,15 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         log::warn!("audio: {dropped} detail event(s) dropped, event log is incomplete");
     }
 
+    // The numbers above are measured against the quantum that arrived.
+    let observed = health.frames_per_callback_observed.load(Relaxed);
+    if observed != 0 && observed != health.frames_per_callback_expected {
+        log::warn!(
+            "audio: the graph is running {observed} frames per callback, not the {} asked for",
+            health.frames_per_callback_expected
+        );
+    }
+
     if clock_jumps > 0 {
         log::warn!(
             "audio: device clock jumped {clock_jumps} time(s); skips are unmeasured across those"
@@ -723,7 +775,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
 }
 
 fn report_session(health: &AudioHealth, elapsed: Duration) {
-    let budget = health.callback_budget_nanos;
+    let budget = health.callback_budget_nanos.load(Relaxed);
     let served = health.callbacks_served.load(Relaxed);
     let skipped = health.callbacks_skipped.load(Relaxed);
     let expected = served + skipped;
@@ -774,6 +826,38 @@ mod tests {
     use super::{AudioHealth, HealthLevel, new_recorder};
     use std::sync::atomic::Ordering::Relaxed;
 
+    /// Drives callbacks of `frames` at their natural spacing, starting from
+    /// device-clock `from`, and returns where the clock ended up.
+    fn play(recorder: &mut super::HealthRecorder, from: u64, frames: u32, count: usize) -> u64 {
+        let period = 1_000_000_000u64 * frames as u64 / 48_000;
+        let mut at = from;
+
+        for _ in 0..count {
+            at += period;
+            recorder.on_callback_start(at, frames);
+            recorder.on_callback_end(at, 100_000, frames);
+        }
+
+        at
+    }
+
+    /// Another client joining the graph moves the quantum under a running
+    /// stream. Nothing was lost, so nothing may be reported as lost.
+    #[test]
+    fn a_quantum_change_is_not_a_dropout() {
+        let health = AudioHealth::new(256, 48_000, 1);
+        let (mut recorder, _events) = new_recorder(health.clone());
+
+        let at = play(&mut recorder, 1_000_000_000, 256, 20);
+        play(&mut recorder, at, 512, 20);
+
+        assert_eq!(
+            health.callbacks_skipped.load(Relaxed),
+            0,
+            "a quantum change was counted as lost audio"
+        );
+    }
+
     /// 64 frames at 48kHz: a 1333us budget, as `--buffer 64` gives.
     fn recorder() -> super::HealthRecorder {
         new_recorder(AudioHealth::new(64, 48_000, 1)).0
@@ -782,8 +866,8 @@ mod tests {
     #[test]
     fn a_missed_callback_counts_as_skipped() {
         let mut r = recorder();
-        r.on_callback_start(1_000_000_000);
-        r.on_callback_start(1_000_000_000 + 4 * 1_333_333);
+        r.on_callback_start(1_000_000_000, 64);
+        r.on_callback_start(1_000_000_000 + 4 * 1_333_333, 64);
         assert_eq!(r.health().callbacks_skipped.load(Relaxed), 3);
         assert_eq!(r.health().clock_discontinuities.load(Relaxed), 0);
     }
@@ -791,10 +875,10 @@ mod tests {
     #[test]
     fn a_clock_jump_is_not_millions_of_dropouts() {
         let mut r = recorder();
-        r.on_callback_start(1_000_000_000);
+        r.on_callback_start(1_000_000_000, 64);
         // cpal falls back from PipeWire's graph clock to CLOCK_MONOTONIC, so the
         // stamp leaps epochs. It is not 7389 seconds of lost audio.
-        r.on_callback_start(1_000_000_000 + 7_389_843_500_000);
+        r.on_callback_start(1_000_000_000 + 7_389_843_500_000, 64);
         assert_eq!(r.health().callbacks_skipped.load(Relaxed), 0);
         assert_eq!(r.health().clock_discontinuities.load(Relaxed), 1);
     }
@@ -802,8 +886,8 @@ mod tests {
     #[test]
     fn ordinary_jitter_is_not_a_skip() {
         let mut r = recorder();
-        r.on_callback_start(1_000_000_000);
-        r.on_callback_start(1_000_000_000 + 1_700_000);
+        r.on_callback_start(1_000_000_000, 64);
+        r.on_callback_start(1_000_000_000 + 1_700_000, 64);
         assert_eq!(r.health().callbacks_skipped.load(Relaxed), 0);
     }
 

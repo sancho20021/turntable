@@ -36,12 +36,18 @@ impl<const DECKS: usize> SamplesPoller<DECKS> {
     /// See [`crate::audio_health::HealthRecorder::on_callback_start`].
     pub fn write_frames(&mut self, data: &mut [f32], callback_nanos: u64) {
         let started = Instant::now();
-        self.health.on_callback_start(callback_nanos);
 
         let channels = self.routing.channels();
         let total_samples = data.len() / channels;
 
-        if data.len() % channels != 0 || total_samples != self.buffers[0].len() {
+        self.health
+            .on_callback_start(callback_nanos, total_samples as u32);
+
+        // PipeWire runs one quantum for the whole graph and picks the smallest
+        // any client asks for, so blocks arrive shorter than requested. Those
+        // render into the front of the buffers; only an oversized one has
+        // nowhere to go.
+        if data.len() % channels != 0 || total_samples > self.buffers[0].len() {
             data.fill(0.0);
             self.health
                 .on_frame_mismatch(callback_nanos, total_samples as u32);

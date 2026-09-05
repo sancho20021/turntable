@@ -43,8 +43,7 @@ pub struct ScannedCard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The lookup is running. Published before it starts, since it reads the
-    /// library off USB and can take seconds if the drive has spun down - without
-    /// this the panel would still be showing the previous card.
+    /// library off USB and can take seconds if the drive has spun down.
     Resolving,
     /// Handed to the tray. What happens to it from there is the tray's to report.
     SentToTray,
