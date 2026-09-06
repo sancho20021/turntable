@@ -20,7 +20,7 @@ use std::{
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 use localdeck_qr_scanner::{
-    PortOpenError, QrScanner, ScannerStopped, extract_cardid, start_qr_scanner,
+    PortOpenError, QrScanner, ScanEvent, ScannerStopped, extract_cardid, start_qr_scanner,
 };
 
 use crate::input_event::{AppEvent, InputEvent};
@@ -164,7 +164,7 @@ impl CardReader {
 
 /// Keeps the newest scan, discarding everything the gun read before it.
 fn stage_scans(
-    events: Receiver<Result<String, ScannerStopped>>,
+    events: Receiver<ScanEvent>,
     staged: Arc<RwLock<Staged>>,
     shutdown: Arc<AtomicBool>,
     mut resolver: Box<dyn CardResolver>,
@@ -197,15 +197,19 @@ fn stage_scans(
 /// Applies one message from the gun and says whether to keep reading. A fault
 /// ends the loop, because the gun's own thread exits after reporting one.
 fn stage_scan(
-    event: Result<String, ScannerStopped>,
+    event: ScanEvent,
     staged: &RwLock<Staged>,
     resolver: &mut dyn CardResolver,
     tracks: &Sender<InputEvent>,
     notices: &Notices,
 ) -> ControlFlow<()> {
     let payload = match event {
-        Ok(payload) => payload,
-        Err(error) => {
+        ScanEvent::Scan(payload) => payload,
+        ScanEvent::Unreadable(why) => {
+            forget_the_card(staged, notices, &why);
+            return ControlFlow::Continue(());
+        }
+        ScanEvent::Stopped(error) => {
             raise(staged, notices, fault_of(error));
             return ControlFlow::Break(());
         }
@@ -279,6 +283,15 @@ fn send_to_tray(tracks: &Sender<InputEvent>, track: TrackRef) -> Outcome {
             Outcome::Failed(format!("cannot reach the record tray: {e}"))
         }
     }
+}
+
+/// Drops whatever is staged, because a card the gun could not read is still a
+/// card put down: what is staged is no longer known to be the one in the DJ's
+/// hand.
+fn forget_the_card(staged: &RwLock<Staged>, notices: &Notices, why: &str) {
+    log::warn!("unreadable scan: {why}");
+    notices.warn("Could not read that card, scan it again");
+    publish(staged, Staged::Empty);
 }
 
 /// A dead gun is worth saying twice: the panel carries it for as long as it is
@@ -356,7 +369,7 @@ mod tests {
     /// One run of the staging logic: no port, no threads, no database. Reports
     /// what the reader ends up serving, what reached the tray, and how many
     /// lookups it took to get there.
-    fn run(events: Vec<Result<String, ScannerStopped>>, mut library: Library) -> Run {
+    fn run(events: Vec<ScanEvent>, mut library: Library) -> Run {
         let staged = Arc::new(RwLock::new(Staged::Empty));
         let (tracks, prepared) = bounded(16);
         let notices = Notices::new();
@@ -381,6 +394,15 @@ mod tests {
         lookups: usize,
     }
 
+    fn scan(payload: &str) -> ScanEvent {
+        ScanEvent::Scan(payload.to_string())
+    }
+
+    /// A card the gun saw and could not make out.
+    fn unreadable() -> ScanEvent {
+        ScanEvent::Unreadable("stream did not contain valid UTF-8".to_string())
+    }
+
     fn scanner_stopped(kind: ErrorKind) -> ScannerStopped {
         ScannerStopped {
             kind,
@@ -403,7 +425,7 @@ mod tests {
     /// over and over, and must be looked up and sent to the tray exactly once.
     #[test]
     fn a_card_read_fifty_times_is_prepared_once() {
-        let scans = (0..50).map(|_| Ok("1701".to_string())).collect();
+        let scans = (0..50).map(|_| scan("1701")).collect();
         let run = run(scans, Library::holding_everything());
 
         assert_eq!(run.lookups, 1, "the library was asked more than once");
@@ -416,11 +438,7 @@ mod tests {
 
     #[test]
     fn a_different_card_is_looked_up_and_sent() {
-        let scans = vec![
-            Ok("1701".to_string()),
-            Ok("1701".to_string()),
-            Ok("42".to_string()),
-        ];
+        let scans = vec![scan("1701"), scan("1701"), scan("42")];
         let run = run(scans, Library::holding_everything());
 
         assert_eq!(run.lookups, 2);
@@ -432,10 +450,7 @@ mod tests {
     /// the library does not have must leave the tray alone.
     #[test]
     fn an_unknown_card_reaches_the_tray_as_nothing() {
-        let run = run(
-            vec![Ok("a wifi code".to_string())],
-            Library::holding_nothing(),
-        );
+        let run = run(vec![scan("a wifi code")], Library::holding_nothing());
 
         assert_eq!(run.prepared, 0, "an unknown card was sent to the tray");
         assert_eq!(card_of(run.staged).outcome, Outcome::Unknown);
@@ -443,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_resolved_card_reports_reaching_the_tray() {
-        let run = run(vec![Ok("1701".to_string())], Library::holding_everything());
+        let run = run(vec![scan("1701")], Library::holding_everything());
         assert_eq!(card_of(run.staged).outcome, Outcome::SentToTray);
     }
 
@@ -454,8 +469,8 @@ mod tests {
     fn a_fault_serves_nothing_rather_than_the_last_card() {
         let run = run(
             vec![
-                Ok("1701".to_string()),
-                Err(scanner_stopped(ErrorKind::BrokenPipe)),
+                scan("1701"),
+                ScanEvent::Stopped(scanner_stopped(ErrorKind::BrokenPipe)),
             ],
             Library::holding_everything(),
         );
@@ -475,6 +490,34 @@ mod tests {
         ));
     }
 
+    /// A card the gun could not make out was still a card put down. Serving the
+    /// one before it is how the wrong track gets played.
+    #[test]
+    fn an_unreadable_scan_clears_the_card_without_killing_the_gun() {
+        let run = run(
+            vec![scan("1701"), unreadable()],
+            Library::holding_everything(),
+        );
+
+        assert!(
+            matches!(run.staged, Staged::Empty),
+            "an unreadable scan left {:?} staged",
+            run.staged
+        );
+    }
+
+    /// The gun is still reading, so the next card must go through as normal.
+    #[test]
+    fn a_card_after_an_unreadable_scan_is_still_played() {
+        let run = run(
+            vec![unreadable(), scan("42")],
+            Library::holding_everything(),
+        );
+
+        assert_eq!(run.prepared, 1, "the card after a bad scan never played");
+        assert_eq!(payload_of(run.staged), "42");
+    }
+
     /// The TUI says which of the two happened, so they must not collapse.
     #[test]
     fn a_vanished_gun_reads_differently_from_a_misbehaving_one() {
@@ -483,7 +526,7 @@ mod tests {
             ScannerFault::Disconnected(_)
         ));
         assert!(matches!(
-            fault_of(scanner_stopped(ErrorKind::InvalidData)),
+            fault_of(scanner_stopped(ErrorKind::PermissionDenied)),
             ScannerFault::Faulted(_)
         ));
     }
