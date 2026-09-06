@@ -37,7 +37,7 @@ use crate::{
     notices::Notices,
     platter_audio_processor::PlatterAudioProcessor,
     platter_driver::{Jump, PlatterEvent},
-    record::{Record, TrackRef, interpolation::Interpolator},
+    record::{Record, TrackRef, envelope, interpolation::Interpolator},
 };
 
 pub enum TrayCommand {
@@ -111,11 +111,13 @@ impl RecordLoader {
             let result = match load_file(Path::new(&track.path)) {
                 Ok(samples) => {
                     let samples_n = samples.len();
+                    let envelope = Arc::new(envelope::rms(&samples));
                     Ok((
                         Arc::new(Record::new(samples, Interpolator::linear())),
                         RecordInfo {
                             track: track.clone(),
                             duration: PlatterAudioProcessor::frames_to_dur_nanos(samples_n),
+                            envelope,
                         },
                     ))
                 }

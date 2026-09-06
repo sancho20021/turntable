@@ -1,5 +1,7 @@
 use crate::{decoder::SAMPLE_RATE, record::interpolation::Interpolator, stereo_frame::StereoFrame};
 
+pub mod envelope;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub struct UNanos(pub u64);
 

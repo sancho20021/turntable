@@ -19,7 +19,7 @@ use crate::{
     input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
-    record::{INanos, TrackRef, UNanos},
+    record::{INanos, TrackRef, UNanos, envelope},
     record_input,
     telemetry::TelemetryTrace,
     tray::{DeckSlot, TrayCommand},
@@ -52,6 +52,9 @@ pub enum PlatterState {
 pub struct RecordInfo {
     pub track: TrackRef,
     pub duration: UNanos,
+    /// Shared because the TUI clones the whole tray state every frame, and each
+    /// deck holds a clone of its own.
+    pub envelope: Arc<[f32; envelope::BUCKETS]>,
 }
 
 #[derive(Debug)]

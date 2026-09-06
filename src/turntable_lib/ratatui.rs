@@ -16,9 +16,9 @@ use ratatui::{
             KeyModifiers,
         },
     },
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style, Stylize},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style, Stylize},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, SparklineBar, Table},
 };
 use std::io::stdout;
 use std::path::Path;
@@ -32,13 +32,49 @@ use percent_encoding::percent_decode_str;
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
     card_reader::{CardReaderView, Outcome, Staged},
-    deck_controller::DeckState,
+    deck_controller::{DeckState, RecordInfo},
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
     record::{INanos, TrackRef, UNanos},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
 };
+
+/// Green phosphor on a dark machine. One hue carries everything the engine is
+/// doing, at four brightnesses, and red appears only when audio is being lost.
+mod palette {
+    use ratatui::style::Color;
+
+    /// Borders, a stopped deck, an empty tray.
+    pub const CHROME: Color = Color::Rgb(74, 84, 76);
+    /// Panel names, table headers, a deck sitting there loaded.
+    pub const LABEL: Color = Color::Rgb(124, 136, 126);
+    /// Powered, with nothing to report.
+    pub const DIM: Color = Color::Rgb(44, 122, 60);
+    /// Running: a playing deck, a track ready, the part already heard.
+    pub const LIT: Color = Color::Rgb(51, 230, 71);
+    /// The playhead, the one thing on screen that moves.
+    pub const NEEDLE: Color = Color::Rgb(230, 255, 233);
+    /// The part of a track still ahead of the needle.
+    pub const SUBMERGED: Color = Color::Rgb(30, 42, 34);
+    /// Waiting on something, or losing a little audio.
+    pub const CAUTION: Color = Color::Rgb(200, 208, 196);
+    /// Audio is being lost, or a track will not load.
+    pub const ALARM: Color = Color::Rgb(224, 43, 24);
+    /// Behind the deck the keyboard is pointed at.
+    pub const SELECTED: Color = Color::Rgb(16, 26, 18);
+}
+
+use palette::*;
+
+/// A panel in the chassis grey, with its name stamped on the border.
+fn panel(title: &'static str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CHROME))
+        .title(title)
+        .title_style(Style::default().fg(LABEL))
+}
 
 /// Converts nanoseconds to a "mm:ss" string (e.g. 185_000_000_000 -> "03:05")
 fn format_nanos(nanos: INanos) -> String {
@@ -237,14 +273,14 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
     let Some(tray) = tray else {
         return (
             "tray state unavailable, lock poisoned (tray thread may be dead)".to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         );
     };
 
     match tray {
         TrayState::Empty => (
             "·  empty        scan a card, or drop a track onto this window".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(CHROME),
         ),
 
         TrayState::Preparing {
@@ -264,7 +300,7 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
                     track_label(&track),
                     format!("{:.1}s", elapsed.as_secs_f64()),
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(CAUTION),
             )
         }
 
@@ -279,15 +315,13 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
                     track_label(&info.track),
                     format_nanos(INanos(info.duration.0 as i64)),
                 ),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(LIT).add_modifier(Modifier::BOLD),
             )
         }
 
         TrayState::Failed { track, error } => (
             format!("✗  failed       {:<44} {error}", file_name(&track.path)),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         ),
     }
 }
@@ -312,7 +346,7 @@ fn health_line(health: &AudioHealth) -> (String, Style) {
                 "●  clean       nothing lost in {}",
                 format_duration(digest.clean_for())
             ),
-            Style::default().fg(Color::Green),
+            Style::default().fg(DIM),
         ),
 
         HealthLevel::Glitching => (
@@ -321,7 +355,7 @@ fn health_line(health: &AudioHealth) -> (String, Style) {
                 digest.lost,
                 if digest.lost == 1 { "" } else { "s" },
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(CAUTION),
         ),
 
         HealthLevel::Failing => (
@@ -329,8 +363,113 @@ fn health_line(health: &AudioHealth) -> (String, Style) {
                 "✗  LOSING AUDIO   {} dropouts in the last second - raise --buffer",
                 digest.lost,
             ),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         ),
+    }
+}
+
+/// 2 borders, a header and its bottom margin. The deck rows are added on top.
+const DECK_TABLE_ROWS: u16 = 4;
+
+/// Perceived loudness goes roughly as amplitude^0.6, so bending the envelope by
+/// this keeps a breakdown visibly taller than an intro.
+const LOUDNESS_GAMMA: f32 = 0.5;
+
+/// Full bar height. The envelope arrives as `0.0..=1.0`, and [`Sparkline`] wants
+/// integers.
+const WAVE_SCALE: u64 = 1000;
+
+/// One strip per deck: the whole track across the panel, played part filled in.
+fn render_waveforms<const DECKS: usize>(
+    frame: &mut Frame,
+    area: Rect,
+    deck_states: &[Arc<DeckState>; DECKS],
+    platters: &[ReadablePlatter; DECKS],
+) {
+    let block = panel(" Waveforms ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let strips = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Fill(1); DECKS])
+        .split(inner);
+
+    for (idx, strip) in strips.iter().enumerate() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(*strip);
+
+        frame.render_widget(
+            Paragraph::new(format!("{}", idx + 1)).fg(CHROME),
+            columns[0],
+        );
+
+        let record = deck_states[idx].cur_record.read().ok();
+        let record = record.as_deref().and_then(|record| record.as_ref());
+        let pos = platters[idx].get_playhead().record_pos;
+
+        frame.render_widget(waveform(record, pos, columns[1].width), columns[1]);
+    }
+}
+
+/// One deck's track drawn across `width` columns, filled in up to the playhead.
+///
+/// An empty deck draws absent bars, which [`Sparkline`] renders as its own
+/// blank symbol.
+fn waveform(record: Option<&RecordInfo>, pos: INanos, width: u16) -> Sparkline<'static> {
+    let playhead = record.and_then(|record| playhead_column(pos, record.duration, width));
+
+    let bars = (0..width).map(|x| match record {
+        Some(record) => {
+            let level = column_peak(record.envelope.as_slice(), x, width);
+            SparklineBar::from((level.powf(LOUDNESS_GAMMA) * WAVE_SCALE as f32) as u64)
+                .style(wave_colour(x, playhead))
+        }
+        None => SparklineBar::from(None),
+    });
+
+    Sparkline::default()
+        .data(bars)
+        .max(WAVE_SCALE)
+        .absent_value_style(Style::default().fg(CHROME))
+}
+
+/// The loudest point of the track under screen column `x`.
+///
+/// A whole track squeezed into a terminal puts dozens of points in one column,
+/// and the peak is what keeps a transient visible.
+fn column_peak(envelope: &[f32], x: u16, width: u16) -> f32 {
+    if width == 0 {
+        return 0.;
+    }
+
+    let lo = x as usize * envelope.len() / width as usize;
+    let hi = ((x as usize + 1) * envelope.len() / width as usize)
+        .max(lo + 1)
+        .min(envelope.len());
+
+    envelope[lo..hi].iter().copied().fold(0., f32::max)
+}
+
+/// Which column the playhead sits in, or `None` while it is off the record.
+fn playhead_column(pos: INanos, duration: UNanos, width: u16) -> Option<u16> {
+    if duration.0 == 0 || width == 0 || pos.0 < 0 {
+        return None;
+    }
+
+    let column = pos.0 as u128 * width as u128 / duration.0 as u128;
+    (column < width as u128).then(|| column as u16)
+}
+
+fn wave_colour(x: u16, playhead: Option<u16>) -> Style {
+    match playhead {
+        Some(head) if x == head => Style::default()
+            .fg(NEEDLE)
+            .add_modifier(Modifier::BOLD),
+        Some(head) if x < head => Style::default().fg(LIT),
+        _ => Style::default().fg(SUBMERGED),
     }
 }
 
@@ -344,10 +483,14 @@ fn render_tui<const DECKS: usize>(
     health: &AudioHealth,
     card_reader: Option<&CardReaderView>,
 ) {
-    // 1. Split layout vertically into deck table, audio health, record tray and
-    //    status bar
+    // 1. Split layout vertically into deck table, waveforms, audio health,
+    //    record tray and status bar
+    //
+    // The table has a natural size and the waveforms use every row they are
+    // given, so the waveforms are the panel that absorbs the leftover height.
     let mut panels = vec![
-        Constraint::Min(0),
+        Constraint::Length(DECK_TABLE_ROWS + DECKS as u16),
+        Constraint::Min(2 + DECKS as u16 * 2),
         Constraint::Length(3),
         Constraint::Length(3),
     ];
@@ -372,7 +515,7 @@ fn render_tui<const DECKS: usize>(
         "Position / Duration",
     ]
     .into_iter()
-    .map(|h| Cell::from(h).bold().fg(Color::Cyan));
+    .map(|h| Cell::from(h).bold().fg(LABEL));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows = (0..DECKS).map(|idx| {
@@ -386,20 +529,20 @@ fn render_tui<const DECKS: usize>(
             (
                 ">",
                 Style::default()
-                    .bg(Color::Rgb(20, 35, 20))
-                    .fg(Color::Green)
+                    .bg(SELECTED)
+                    .fg(LIT)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            (" ", Style::default().fg(Color::Gray))
+            (" ", Style::default().fg(LABEL))
         };
 
         // 2. Playback state
         let is_playing = state.playing.load(Ordering::Relaxed);
         let (play_str, play_style) = if is_playing {
-            ("▶ PLAYING", Style::default().fg(Color::Green))
+            ("▶ PLAYING", Style::default().fg(LIT))
         } else {
-            ("⏸ STOPPED", Style::default().fg(Color::DarkGray))
+            ("⏸ STOPPED", Style::default().fg(CHROME))
         };
 
         // 3. Target pitch/speed
@@ -452,50 +595,45 @@ fn render_tui<const DECKS: usize>(
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Turntable Engine Status "),
-    );
+    .block(panel(" Turntable Engine Status "));
 
     // Render deck status table in top chunk
     frame.render_widget(table, chunks[0]);
 
-    // 2. Is the engine actually delivering the audio it computed
+    // 2. Where each deck is in its track, and what is coming
+    render_waveforms(frame, chunks[1], deck_states, platters);
+
+    // 3. Is the engine actually delivering the audio it computed
     let (health_text, health_style) = health_line(health);
-    let health_widget = Paragraph::new(health_text).style(health_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Audio Health "),
-    );
-    frame.render_widget(health_widget, chunks[1]);
+    let health_widget = Paragraph::new(health_text)
+        .style(health_style)
+        .block(panel(" Audio Health "));
+    frame.render_widget(health_widget, chunks[2]);
 
-    // 3. What is waiting to be loaded
+    // 4. What is waiting to be loaded
     let (tray_text, tray_style) = tray_line(tray, active_deck_idx);
-    let tray_widget = Paragraph::new(tray_text).style(tray_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Record Tray "),
-    );
-    frame.render_widget(tray_widget, chunks[2]);
+    let tray_widget = Paragraph::new(tray_text)
+        .style(tray_style)
+        .block(panel(" Record Tray "));
+    frame.render_widget(tray_widget, chunks[3]);
 
-    // 4. Whether cards can be scanned at all, when this run asked for them
-    let mut next = 3;
+    // 5. Whether cards can be scanned at all, when this run asked for them
+    let mut next = 4;
     if let Some(reader) = card_reader {
         let (scanner_text, scanner_style) = scanner_line(reader);
         let scanner_widget = Paragraph::new(scanner_text)
             .style(scanner_style)
-            .block(Block::default().borders(Borders::ALL).title(" QR Scanner "));
+            .block(panel(" QR Scanner "));
         frame.render_widget(scanner_widget, chunks[next]);
         next += 1;
     }
 
-    // 5. Anything that went wrong, for as long as it is worth reading
+    // 6. Anything that went wrong, for as long as it is worth reading
     let (title, message, style) = match notice {
         Some(Notice {
             message,
             level: Level::Warning,
-        }) => (" Warning ", message, Style::default().fg(Color::Yellow)),
+        }) => (" Warning ", message, Style::default().fg(CAUTION)),
 
         Some(Notice {
             message,
@@ -503,19 +641,19 @@ fn render_tui<const DECKS: usize>(
         }) => (
             " Problem ",
             message,
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         ),
 
         None => (
             " Notices ",
             "".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(CHROME),
         ),
     };
 
     let notice_widget = Paragraph::new(message)
         .style(style)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(panel(title));
     frame.render_widget(notice_widget, chunks[next]);
 }
 
@@ -525,8 +663,8 @@ fn render_tui<const DECKS: usize>(
 /// is the tray's line to say, and whether a scan just registered is answered by
 /// the tray changing - this panel can only tell you that once.
 fn scanner_line(reader: &CardReaderView) -> (String, Style) {
-    let ready = || ("●  ready".to_string(), Style::default().fg(Color::Green));
-    let problem = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let ready = || ("●  ready".to_string(), Style::default().fg(DIM));
+    let problem = Style::default().fg(ALARM).add_modifier(Modifier::BOLD);
 
     match reader.staged() {
         // A gun that has read nothing and a gun whose last card reached the tray
@@ -538,7 +676,7 @@ fn scanner_line(reader: &CardReaderView) -> (String, Style) {
 
             Outcome::Resolving => (
                 format!("●  looking up   {}", short_card(&card.payload)),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(CAUTION),
             ),
 
             Outcome::Unknown => (
@@ -561,9 +699,57 @@ fn scanner_line(reader: &CardReaderView) -> (String, Style) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path, short_card, track_label};
-    use crate::record::{TrackMeta, TrackRef};
+    use super::{
+        column_peak, format_duration, parse_dropped_path, playhead_column, short_card, track_label,
+    };
+    use crate::record::{INanos, TrackMeta, TrackRef, UNanos};
     use std::time::Duration;
+
+    /// Five minutes, as the platter counts it.
+    const FIVE_MINUTES: UNanos = UNanos(300_000_000_000);
+
+    /// A whole track squeezed into a terminal covers dozens of points per
+    /// column, and the loud moment inside one must still be what gets drawn.
+    #[test]
+    fn a_transient_survives_a_narrow_terminal() {
+        let mut envelope = [0.; 2048];
+        envelope[1000] = 1.;
+
+        let columns: Vec<f32> = (0..80).map(|x| column_peak(&envelope, x, 80)).collect();
+        let tallest = columns.iter().copied().fold(0., f32::max);
+
+        assert_eq!(tallest, 1., "the transient was averaged away");
+        assert_eq!(
+            columns.iter().filter(|point| **point > 0.).count(),
+            1,
+            "the transient smeared across neighbouring columns"
+        );
+    }
+
+    #[test]
+    fn the_playhead_runs_from_the_first_column_to_the_last() {
+        assert_eq!(playhead_column(INanos(0), FIVE_MINUTES, 100), Some(0));
+        assert_eq!(
+            playhead_column(INanos(150_000_000_000), FIVE_MINUTES, 100),
+            Some(50)
+        );
+        assert_eq!(
+            playhead_column(INanos(299_999_999_999), FIVE_MINUTES, 100),
+            Some(99)
+        );
+    }
+
+    /// The playhead runs past the end of a record that finished, and sits behind
+    /// the start after a scratch back through zero.
+    #[test]
+    fn a_playhead_off_the_record_lands_in_no_column() {
+        assert_eq!(
+            playhead_column(INanos(300_000_000_000), FIVE_MINUTES, 100),
+            None
+        );
+        assert_eq!(playhead_column(INanos(-1), FIVE_MINUTES, 100), None);
+        assert_eq!(playhead_column(INanos(0), UNanos(0), 100), None);
+    }
 
     /// A real card id, which has to leave room for the reason beside it.
     #[test]
