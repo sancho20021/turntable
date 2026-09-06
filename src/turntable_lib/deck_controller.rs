@@ -19,7 +19,7 @@ use crate::{
     input_profile::InputProfile,
     platter_audio_processor::AudioProcessorHandles,
     platter_driver::{Jump, PlatterDriver, PlatterEvent},
-    record::{INanos, UNanos},
+    record::{INanos, TrackRef, UNanos},
     record_input,
     telemetry::TelemetryTrace,
     tray::{DeckSlot, TrayCommand},
@@ -50,7 +50,7 @@ pub enum PlatterState {
 
 #[derive(Debug, Clone)]
 pub struct RecordInfo {
-    pub path: String,
+    pub track: TrackRef,
     pub duration: UNanos,
 }
 

@@ -37,12 +37,12 @@ use crate::{
     notices::Notices,
     platter_audio_processor::PlatterAudioProcessor,
     platter_driver::{Jump, PlatterEvent},
-    record::{Record, interpolation::Interpolator},
+    record::{Record, TrackRef, interpolation::Interpolator},
 };
 
 pub enum TrayCommand {
     /// Decode a track off disk and hold it in the tray, ready to be loaded.
-    PrepareRecord { path: String },
+    PrepareRecord(TrackRef),
     /// Put the prepared record on a deck. The tray keeps it, so it can go on
     /// another deck too.
     LoadRecord { deck_id: DeckId },
@@ -59,15 +59,15 @@ pub enum TrayState {
     /// Being decoded off disk. `queued` is the one waiting behind it, if a
     /// scan or a drop arrived while this was running.
     Preparing {
-        path: String,
+        track: TrackRef,
         since: Instant,
-        queued: Option<String>,
+        queued: Option<TrackRef>,
     },
     /// Prepared. Stays here through any number of `LoadRecord`s, until another
     /// track is scanned or dropped.
     Ready { info: RecordInfo },
     /// The last record could not be prepared. The tray holds nothing.
-    Failed { path: String, error: String },
+    Failed { track: TrackRef, error: String },
 }
 
 /// Everything the tray needs to serve one deck.
@@ -86,7 +86,7 @@ pub struct DeckSlot {
 
 /// One decoded record, handed from the loader back to the tray.
 struct LoadedRecord {
-    path: String,
+    track: TrackRef,
     result: Result<(Arc<Record>, RecordInfo), String>,
 }
 
@@ -94,7 +94,7 @@ struct LoadedRecord {
 ///
 /// Deliberately dumb, which is what keeps the tray responsive during a decode.
 struct RecordLoader {
-    paths: Receiver<String>,
+    tracks: Receiver<TrackRef>,
     results: Sender<LoadedRecord>,
     shutdown: Arc<AtomicBool>,
 }
@@ -102,19 +102,19 @@ struct RecordLoader {
 impl RecordLoader {
     fn run(self) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            let path = match self.paths.recv_timeout(Duration::from_millis(100)) {
-                Ok(p) => p,
+            let track = match self.tracks.recv_timeout(Duration::from_millis(100)) {
+                Ok(t) => t,
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             };
 
-            let result = match load_file(Path::new(&path)) {
+            let result = match load_file(Path::new(&track.path)) {
                 Ok(samples) => {
                     let samples_n = samples.len();
                     Ok((
                         Arc::new(Record::new(samples, Interpolator::linear())),
                         RecordInfo {
-                            path: path.clone(),
+                            track: track.clone(),
                             duration: PlatterAudioProcessor::frames_to_dur_nanos(samples_n),
                         },
                     ))
@@ -122,7 +122,7 @@ impl RecordLoader {
                 Err(e) => Err(e.to_string()),
             };
 
-            if self.results.send(LoadedRecord { path, result }).is_err() {
+            if self.results.send(LoadedRecord { track, result }).is_err() {
                 break;
             }
         }
@@ -138,11 +138,11 @@ struct Tray<const DECKS: usize> {
     /// anyone pressing anything, so a request during a decode is held rather
     /// than lost; a newer one displaces it, since the DJ is holding the newer
     /// card.
-    pending: Option<String>,
+    pending: Option<TrackRef>,
     /// Authoritative state; mirrored into `published` on every change.
     state: TrayState,
     published: Arc<RwLock<TrayState>>,
-    loader: Sender<String>,
+    loader: Sender<TrackRef>,
     decks: [DeckSlot; DECKS],
     notices: Notices,
 }
@@ -172,27 +172,27 @@ impl<const DECKS: usize> Tray<DECKS> {
 
     fn handle_command(&mut self, command: TrayCommand) {
         match command {
-            TrayCommand::PrepareRecord { path } => self.prepare_record(path),
+            TrayCommand::PrepareRecord(track) => self.prepare_record(track),
             TrayCommand::LoadRecord { deck_id } => self.load_record(deck_id),
         }
     }
 
     /// Start decoding a track, or queue it if one is already being decoded.
-    fn prepare_record(&mut self, path: String) {
+    fn prepare_record(&mut self, track: TrackRef) {
         if let TrayState::Preparing {
-            path: current,
+            track: current,
             since,
             ..
         } = &self.state
         {
-            log::info!("queued {path}, still preparing {current}");
+            log::info!("queued {}, still preparing {}", track.path, current.path);
 
             let waiting = TrayState::Preparing {
-                path: current.clone(),
+                track: current.clone(),
                 since: *since,
-                queued: Some(path.clone()),
+                queued: Some(track.clone()),
             };
-            self.pending = Some(path);
+            self.pending = Some(track);
             self.set_state(waiting);
             return;
         }
@@ -204,15 +204,15 @@ impl<const DECKS: usize> Tray<DECKS> {
         // `Preparing`, so a request that never arrives would wedge the tray there
         // for good and reject every later record as busy. Never assume this one
         // was sent.
-        if let Err(e) = self.loader.try_send(path.clone()) {
+        if let Err(e) = self.loader.try_send(track.clone()) {
             let error = format!("record loader unreachable: {e}");
-            log::error!("cannot prepare {path}: {error}");
-            self.set_state(TrayState::Failed { path, error });
+            log::error!("cannot prepare {}: {error}", track.path);
+            self.set_state(TrayState::Failed { track, error });
             return;
         }
 
         self.set_state(TrayState::Preparing {
-            path,
+            track,
             since: Instant::now(),
             queued: None,
         });
@@ -221,8 +221,8 @@ impl<const DECKS: usize> Tray<DECKS> {
     /// Put the prepared record on a deck, keeping it for the next one.
     fn load_record(&mut self, deck_id: DeckId) {
         let msg = match &self.state {
-            TrayState::Preparing { path, .. } => {
-                format!("Still preparing {path}, wait for it to be ready")
+            TrayState::Preparing { track, .. } => {
+                format!("Still preparing {}, wait for it to be ready", track.path)
             }
             TrayState::Empty | TrayState::Failed { .. } => {
                 "Nothing prepared, scan a card or drag and drop a music file first".to_string()
@@ -251,12 +251,14 @@ impl<const DECKS: usize> Tray<DECKS> {
                             .platter_events
                             .try_send(PlatterEvent::MovePlayhead(Jump::ToZero))
                         {
-                            Ok(()) => {
-                                log::info!("record {} loaded on deck {}", info.path, deck_id + 1)
-                            }
+                            Ok(()) => log::info!(
+                                "record {} loaded on deck {}",
+                                info.track.path,
+                                deck_id + 1
+                            ),
                             Err(e) => log::error!(
                                 "record {} loaded on deck {} but its playhead did not reset: {e}",
-                                info.path,
+                                info.track.path,
                                 deck_id + 1
                             ),
                         }
@@ -288,16 +290,16 @@ impl<const DECKS: usize> Tray<DECKS> {
     }
 
     fn handle_loaded_record(&mut self, loaded: LoadedRecord) {
-        let LoadedRecord { path, result } = loaded;
+        let LoadedRecord { track, result } = loaded;
         match result {
             Ok((record, info)) => {
-                log::info!("ready: {path}");
+                log::info!("ready: {}", track.path);
                 self.prepared = Some((record, info.clone()));
                 self.set_state(TrayState::Ready { info });
             }
             Err(error) => {
-                log::error!("failed to prepare track {path}: {error}");
-                self.set_state(TrayState::Failed { path, error });
+                log::error!("failed to prepare track {}: {error}", track.path);
+                self.set_state(TrayState::Failed { track, error });
             }
         }
 
@@ -345,11 +347,11 @@ pub fn start<const DECKS: usize>(
 ) -> JoinHandle<()> {
     // one decode at a time: the tray only ever sends a path when it is not
     // already `Preparing`, so a full channel means that invariant broke
-    let (path_tx, path_rx) = crossbeam::channel::bounded::<String>(1);
+    let (track_tx, track_rx) = crossbeam::channel::bounded::<TrackRef>(1);
     let (loaded_tx, loaded_rx) = crossbeam::channel::bounded::<LoadedRecord>(1);
 
     let loader = RecordLoader {
-        paths: path_rx,
+        tracks: track_rx,
         results: loaded_tx,
         shutdown: Arc::clone(&shutdown),
     };
@@ -359,7 +361,7 @@ pub fn start<const DECKS: usize>(
         pending: None,
         state: TrayState::Empty,
         published: tray_state,
-        loader: path_tx,
+        loader: track_tx,
         decks,
         notices,
     };
@@ -383,9 +385,16 @@ mod tests {
     use super::*;
     use crossbeam::channel::bounded;
 
+    fn track(path: &str) -> TrackRef {
+        TrackRef {
+            path: path.to_string(),
+            meta: None,
+        }
+    }
+
     /// A tray with no decks, which is all the queueing needs. The receiver is
     /// what the record loader would be reading.
-    fn tray_and_loader() -> (Tray<0>, Receiver<String>) {
+    fn tray_and_loader() -> (Tray<0>, Receiver<TrackRef>) {
         let (loader, decoding) = bounded(1);
 
         let tray = Tray::<0> {
@@ -402,14 +411,14 @@ mod tests {
     }
 
     /// Whatever the loader was handed, if anything.
-    fn started(decoding: &Receiver<String>) -> Option<String> {
-        decoding.try_recv().ok()
+    fn started(decoding: &Receiver<TrackRef>) -> Option<String> {
+        decoding.try_recv().ok().map(|track| track.path)
     }
 
     /// Standing in for a decode that finished, without building a record.
     fn finished(path: &str) -> LoadedRecord {
         LoadedRecord {
-            path: path.to_string(),
+            track: track(path),
             result: Err("not a real decode".to_string()),
         }
     }
@@ -420,10 +429,10 @@ mod tests {
     fn a_request_during_a_decode_runs_after_it() {
         let (mut tray, decoding) = tray_and_loader();
 
-        tray.prepare_record("first.flac".to_string());
+        tray.prepare_record(track("first.flac"));
         assert_eq!(started(&decoding).as_deref(), Some("first.flac"));
 
-        tray.prepare_record("second.flac".to_string());
+        tray.prepare_record(track("second.flac"));
         assert_eq!(started(&decoding), None, "two decodes were started at once");
 
         tray.handle_loaded_record(finished("first.flac"));
@@ -435,11 +444,11 @@ mod tests {
     fn the_newest_waiting_request_displaces_the_others() {
         let (mut tray, decoding) = tray_and_loader();
 
-        tray.prepare_record("first.flac".to_string());
+        tray.prepare_record(track("first.flac"));
         let _ = started(&decoding);
 
-        tray.prepare_record("second.flac".to_string());
-        tray.prepare_record("third.flac".to_string());
+        tray.prepare_record(track("second.flac"));
+        tray.prepare_record(track("third.flac"));
 
         tray.handle_loaded_record(finished("first.flac"));
         assert_eq!(started(&decoding).as_deref(), Some("third.flac"));
@@ -452,7 +461,7 @@ mod tests {
     fn nothing_waits_when_the_loader_was_idle() {
         let (mut tray, decoding) = tray_and_loader();
 
-        tray.prepare_record("only.flac".to_string());
+        tray.prepare_record(track("only.flac"));
         assert_eq!(started(&decoding).as_deref(), Some("only.flac"));
 
         tray.handle_loaded_record(finished("only.flac"));

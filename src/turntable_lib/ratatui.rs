@@ -35,7 +35,7 @@ use crate::{
     deck_controller::DeckState,
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
-    record::{INanos, UNanos},
+    record::{INanos, TrackRef, UNanos},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
 };
@@ -151,7 +151,10 @@ fn to_input_event(event: TermEvent) -> Option<InputEvent> {
         TermEvent::Paste(text) => {
             let path = parse_dropped_path(&text)?;
             log::info!("Track dropped on the terminal: {path}");
-            Some(InputEvent::App(AppEvent::PrepareRecord(path)))
+            Some(InputEvent::App(AppEvent::PrepareRecord(TrackRef {
+                path,
+                meta: None,
+            })))
         }
 
         // Raw mode means the tty never turns this into SIGINT, so it is on us.
@@ -215,6 +218,15 @@ fn file_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// What to call a track on screen. Artists and titles come from the library, so
+/// a dropped file falls back to its file name.
+fn track_label(track: &TrackRef) -> String {
+    match &track.meta {
+        Some(meta) => format!("{} — {}", meta.artist, meta.title),
+        None => file_name(&track.path),
+    }
+}
+
 fn spinner(elapsed: Duration) -> char {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[(elapsed.as_millis() / 80) as usize % FRAMES.len()]
@@ -236,20 +248,20 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
         ),
 
         TrayState::Preparing {
-            path,
+            track,
             since,
             queued,
         } => {
             let elapsed = since.elapsed();
             let next = match &queued {
-                Some(next) => format!("   then {}", file_name(next)),
+                Some(next) => format!("   then {}", track_label(next)),
                 None => String::new(),
             };
             (
                 format!(
                     "{}  preparing    {:<44} {:>6}{next}",
                     spinner(elapsed),
-                    file_name(&path),
+                    track_label(&track),
                     format!("{:.1}s", elapsed.as_secs_f64()),
                 ),
                 Style::default().fg(Color::Yellow),
@@ -264,7 +276,7 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
             (
                 format!(
                     "●  ready        {:<44} {}   {hint}",
-                    file_name(&info.path),
+                    track_label(&info.track),
                     format_nanos(INanos(info.duration.0 as i64)),
                 ),
                 Style::default()
@@ -273,8 +285,8 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
             )
         }
 
-        TrayState::Failed { path, error } => (
-            format!("✗  failed       {:<44} {error}", file_name(&path)),
+        TrayState::Failed { track, error } => (
+            format!("✗  failed       {:<44} {error}", file_name(&track.path)),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     }
@@ -356,7 +368,7 @@ fn render_tui<const DECKS: usize>(
         "Deck",
         "State",
         "Pitch",
-        "Track File",
+        "Track",
         "Position / Duration",
     ]
     .into_iter()
@@ -402,7 +414,7 @@ fn render_tui<const DECKS: usize>(
         // 4. Record Info & Playhead Position
         let (file_display, duration_nanos) = match state.cur_record.read() {
             Ok(guard) => match guard.as_ref() {
-                Some(record) => (file_name(&record.path), record.duration),
+                Some(record) => (track_label(&record.track), record.duration),
                 None => ("[ No Record Loaded ]".to_string(), UNanos(0)),
             },
             Err(_) => (
@@ -435,7 +447,7 @@ fn render_tui<const DECKS: usize>(
             Constraint::Length(8),  // Deck label
             Constraint::Length(11), // Play state
             Constraint::Length(9),  // Pitch
-            Constraint::Min(24),    // Track file path
+            Constraint::Min(24),    // Track
             Constraint::Length(18), // Playhead / Duration
         ],
     )
@@ -549,7 +561,8 @@ fn scanner_line(reader: &CardReaderView) -> (String, Style) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path, short_card};
+    use super::{format_duration, parse_dropped_path, short_card, track_label};
+    use crate::record::{TrackMeta, TrackRef};
     use std::time::Duration;
 
     /// A real card id, which has to leave room for the reason beside it.
@@ -573,6 +586,30 @@ mod tests {
     #[test]
     fn a_multibyte_payload_is_cut_on_a_character() {
         assert_eq!(short_card("ααααααααααααααα"), "αααααααααααα…");
+    }
+
+    #[test]
+    fn a_track_from_the_library_is_named_by_its_artist_and_title() {
+        let track = TrackRef {
+            path: "/music/04 - untitled_master_v3.flac".to_string(),
+            meta: Some(TrackMeta {
+                artist: "Loraine James".to_string(),
+                title: "Glitch the System".to_string(),
+            }),
+        };
+
+        assert_eq!(track_label(&track), "Loraine James — Glitch the System");
+    }
+
+    /// A dropped file arrives as a bare path, so its file name is what shows.
+    #[test]
+    fn a_dropped_track_is_named_by_its_file() {
+        let track = TrackRef {
+            path: "/music/04 - untitled_master_v3.flac".to_string(),
+            meta: None,
+        };
+
+        assert_eq!(track_label(&track), "04 - untitled_master_v3.flac");
     }
 
     #[test]

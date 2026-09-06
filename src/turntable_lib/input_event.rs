@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::deck_controller::DeckId;
+use crate::{deck_controller::DeckId, record::TrackRef};
 
 /// Anything an input source can produce.
 ///
@@ -20,9 +20,9 @@ pub enum InputEvent {
 /// A command that belongs to no particular deck.
 #[derive(Debug)]
 pub enum AppEvent {
-    /// A track was handed to the app (drag & drop). It goes in the record tray,
-    /// not on a deck: nothing about this event says where it will end up.
-    PrepareRecord(String),
+    /// A track was handed to the app (drag & drop, or a scanned card). It goes
+    /// in the record tray, and a later `LoadRecord` picks the deck.
+    PrepareRecord(TrackRef),
     /// Shut the app down.
     Quit,
 }

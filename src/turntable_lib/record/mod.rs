@@ -22,6 +22,24 @@ impl INanos {
     }
 }
 
+/// What the library calls a track.
+#[derive(Debug, Clone)]
+pub struct TrackMeta {
+    pub artist: String,
+    pub title: String,
+}
+
+/// A track on its way to the tray: where its file is, and what the library calls
+/// it.
+///
+/// `meta` is present for a track reached by scanning a card. A file dropped on
+/// the terminal carries the path alone.
+#[derive(Debug, Clone)]
+pub struct TrackRef {
+    pub path: String,
+    pub meta: Option<TrackMeta>,
+}
+
 /// Virtual record
 #[derive(Debug)]
 pub struct Record {

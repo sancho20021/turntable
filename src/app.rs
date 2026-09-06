@@ -437,8 +437,8 @@ fn spawn_dispatcher<const DECKS: usize>(
 
                 // Only prepares the record. Which deck it ends up on is decided
                 // later, by whoever loads it: Enter here, a LOAD button on MIDI.
-                InputEvent::App(AppEvent::PrepareRecord(path)) => {
-                    log_try_send(&tray, TrayCommand::PrepareRecord { path }, "prepare record")
+                InputEvent::App(AppEvent::PrepareRecord(track)) => {
+                    log_try_send(&tray, TrayCommand::PrepareRecord(track), "prepare record")
                 }
 
                 InputEvent::Deck(deck_idx, event) => {

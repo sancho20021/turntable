@@ -10,7 +10,6 @@ use std::{
     fmt,
     io::ErrorKind,
     ops::ControlFlow,
-    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -26,6 +25,7 @@ use localdeck_qr_scanner::{
 
 use crate::input_event::{AppEvent, InputEvent};
 use crate::notices::Notices;
+use crate::record::TrackRef;
 
 /// How long the staging thread blocks before checking whether the app is stopping.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -52,9 +52,9 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// A card's file on disk, if the library has one.
+/// A card's track, if the library has one.
 pub trait CardResolver: Send {
-    fn resolve(&mut self, card_id: &str) -> Result<PathBuf, ResolveError>;
+    fn resolve(&mut self, card_id: &str) -> Result<TrackRef, ResolveError>;
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +230,7 @@ fn stage_scan(
     // Reads the library off the USB drive, so it takes seconds if the drive has
     // spun down.
     let outcome = match resolver.resolve(&extract_cardid(&payload)) {
-        Ok(path) => send_to_tray(tracks, path),
+        Ok(track) => send_to_tray(tracks, track),
         Err(ResolveError::Unknown) => {
             log::warn!("card not in the library: {payload}");
             Outcome::Unknown
@@ -269,11 +269,10 @@ fn was_already_staged(staged: &RwLock<Staged>, payload: &str, at: Instant) -> bo
     }
 }
 
-fn send_to_tray(tracks: &Sender<InputEvent>, path: PathBuf) -> Outcome {
-    let path = path.to_string_lossy().into_owned();
-    log::info!("card resolved to {path}");
+fn send_to_tray(tracks: &Sender<InputEvent>, track: TrackRef) -> Outcome {
+    log::info!("card resolved to {}", track.path);
 
-    match tracks.try_send(InputEvent::App(AppEvent::PrepareRecord(path))) {
+    match tracks.try_send(InputEvent::App(AppEvent::PrepareRecord(track))) {
         Ok(()) => Outcome::SentToTray,
         Err(e) => {
             log::error!("cannot reach the record tray: {e}");
@@ -322,16 +321,19 @@ mod tests {
     use super::*;
     use crossbeam::channel::bounded;
 
-    /// Answers every card with the same path, and counts how often it was asked.
+    /// Answers every card with the same track, and counts how often it was asked.
     struct Library {
-        answer: Result<PathBuf, ResolveError>,
+        answer: Result<TrackRef, ResolveError>,
         lookups: usize,
     }
 
     impl Library {
         fn holding_everything() -> Self {
             Self {
-                answer: Ok(PathBuf::from("/music/track.flac")),
+                answer: Ok(TrackRef {
+                    path: "/music/track.flac".to_string(),
+                    meta: None,
+                }),
                 lookups: 0,
             }
         }
@@ -345,7 +347,7 @@ mod tests {
     }
 
     impl CardResolver for Library {
-        fn resolve(&mut self, _card_id: &str) -> Result<PathBuf, ResolveError> {
+        fn resolve(&mut self, _card_id: &str) -> Result<TrackRef, ResolveError> {
             self.lookups += 1;
             self.answer.clone()
         }
