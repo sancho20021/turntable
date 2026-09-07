@@ -18,7 +18,8 @@ Before keeping any comment, apply these tests. Each one is a hard fail.
   this way.
 - **No labels.** Do not summarize or announce a block. `// load the record` over
   code that loads a record is noise.
-- **No restating.** If the sentence is the line below it in English, drop it.
+- **No restating.** If the comment is just the code beneath it written out in
+  English, drop it.
 - **No defending the choice.** Do not explain why some other approach was not
   taken, or what the code deliberately avoids doing. That belongs in the commit
   message. Document what the code guarantees and where that guarantee stops.
