@@ -35,6 +35,7 @@ use crate::{
     deck_controller::{DeckState, RecordInfo},
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
+    platter_dial::{DIAL_COLS, DIAL_ROWS, dial_area, platter_dial},
     record::{INanos, TrackRef, UNanos},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
@@ -398,7 +399,12 @@ fn render_waveforms<const DECKS: usize>(
     for (idx, strip) in strips.iter().enumerate() {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(DIAL_COLS),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
             .split(*strip);
 
         frame.render_widget(
@@ -410,7 +416,10 @@ fn render_waveforms<const DECKS: usize>(
         let record = record.as_deref().and_then(|record| record.as_ref());
         let pos = platters[idx].get_playhead().record_pos;
 
-        frame.render_widget(waveform(record, pos, columns[1].width), columns[1]);
+        let disk_color = if record.is_some() { LIT } else { CHROME };
+        frame.render_widget(platter_dial(pos, disk_color, NEEDLE), dial_area(columns[1]));
+
+        frame.render_widget(waveform(record, pos, columns[3].width), columns[3]);
     }
 }
 
@@ -490,7 +499,7 @@ fn render_tui<const DECKS: usize>(
     // given, so the waveforms are the panel that absorbs the leftover height.
     let mut panels = vec![
         Constraint::Length(DECK_TABLE_ROWS + DECKS as u16),
-        Constraint::Min(2 + DECKS as u16 * 2),
+        Constraint::Min(2 + DECKS as u16 * DIAL_ROWS),
         Constraint::Length(3),
         Constraint::Length(3),
     ];

@@ -11,6 +11,7 @@ pub mod midi;
 pub mod notices;
 pub mod physical_speed;
 pub mod platter_audio_processor;
+pub mod platter_dial;
 pub mod platter_driver;
 pub mod ratatui;
 pub mod record;
