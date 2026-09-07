@@ -18,7 +18,7 @@ use ratatui::{
     },
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style, Stylize},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, SparklineBar, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 use std::io::stdout;
 use std::path::Path;
@@ -32,14 +32,19 @@ use percent_encoding::percent_decode_str;
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
     card_reader::{CardReaderView, Outcome, Staged},
-    deck_controller::{DeckState, RecordInfo},
+    deck_controller::DeckState,
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
-    platter_dial::{DIAL_COLS, DIAL_ROWS, dial_area, platter_dial},
     record::{INanos, TrackRef, UNanos},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
 };
+
+pub mod platter_dial;
+mod waveform;
+
+use platter_dial::{DIAL_COLS, DIAL_ROWS, dial_area, platter_dial};
+use waveform::waveform;
 
 /// Green phosphor on a dark machine. One hue carries everything the engine is
 /// doing, at four brightnesses, and red appears only when audio is being lost.
@@ -372,14 +377,6 @@ fn health_line(health: &AudioHealth) -> (String, Style) {
 /// 2 borders, a header and its bottom margin. The deck rows are added on top.
 const DECK_TABLE_ROWS: u16 = 4;
 
-/// Perceived loudness goes roughly as amplitude^0.6, so bending the envelope by
-/// this keeps a breakdown visibly taller than an intro.
-const LOUDNESS_GAMMA: f32 = 0.5;
-
-/// Full bar height. The envelope arrives as `0.0..=1.0`, and [`Sparkline`] wants
-/// integers.
-const WAVE_SCALE: u64 = 1000;
-
 /// One strip per deck: the whole track across the panel, played part filled in.
 fn render_waveforms<const DECKS: usize>(
     frame: &mut Frame,
@@ -419,66 +416,7 @@ fn render_waveforms<const DECKS: usize>(
         let disk_color = if record.is_some() { LIT } else { CHROME };
         frame.render_widget(platter_dial(pos, disk_color, NEEDLE), dial_area(columns[1]));
 
-        frame.render_widget(waveform(record, pos, columns[3].width), columns[3]);
-    }
-}
-
-/// One deck's track drawn across `width` columns, filled in up to the playhead.
-///
-/// An empty deck draws absent bars, which [`Sparkline`] renders as its own
-/// blank symbol.
-fn waveform(record: Option<&RecordInfo>, pos: INanos, width: u16) -> Sparkline<'static> {
-    let playhead = record.and_then(|record| playhead_column(pos, record.duration, width));
-
-    let bars = (0..width).map(|x| match record {
-        Some(record) => {
-            let level = column_peak(record.envelope.as_slice(), x, width);
-            SparklineBar::from((level.powf(LOUDNESS_GAMMA) * WAVE_SCALE as f32) as u64)
-                .style(wave_colour(x, playhead))
-        }
-        None => SparklineBar::from(None),
-    });
-
-    Sparkline::default()
-        .data(bars)
-        .max(WAVE_SCALE)
-        .absent_value_style(Style::default().fg(CHROME))
-}
-
-/// The loudest point of the track under screen column `x`.
-///
-/// A whole track squeezed into a terminal puts dozens of points in one column,
-/// and the peak is what keeps a transient visible.
-fn column_peak(envelope: &[f32], x: u16, width: u16) -> f32 {
-    if width == 0 {
-        return 0.;
-    }
-
-    let lo = x as usize * envelope.len() / width as usize;
-    let hi = ((x as usize + 1) * envelope.len() / width as usize)
-        .max(lo + 1)
-        .min(envelope.len());
-
-    envelope[lo..hi].iter().copied().fold(0., f32::max)
-}
-
-/// Which column the playhead sits in, or `None` while it is off the record.
-fn playhead_column(pos: INanos, duration: UNanos, width: u16) -> Option<u16> {
-    if duration.0 == 0 || width == 0 || pos.0 < 0 {
-        return None;
-    }
-
-    let column = pos.0 as u128 * width as u128 / duration.0 as u128;
-    (column < width as u128).then(|| column as u16)
-}
-
-fn wave_colour(x: u16, playhead: Option<u16>) -> Style {
-    match playhead {
-        Some(head) if x == head => Style::default()
-            .fg(NEEDLE)
-            .add_modifier(Modifier::BOLD),
-        Some(head) if x < head => Style::default().fg(LIT),
-        _ => Style::default().fg(SUBMERGED),
+        frame.render_widget(waveform(record, pos, columns[3]), columns[3]);
     }
 }
 
@@ -515,16 +453,9 @@ fn render_tui<const DECKS: usize>(
         .constraints(panels)
         .split(frame.area());
 
-    let header_cells = [
-        "",
-        "Deck",
-        "State",
-        "Pitch",
-        "Track",
-        "Position / Duration",
-    ]
-    .into_iter()
-    .map(|h| Cell::from(h).bold().fg(LABEL));
+    let header_cells = ["", "Deck", "State", "Pitch", "Track", "Position / Duration"]
+        .into_iter()
+        .map(|h| Cell::from(h).bold().fg(LABEL));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows = (0..DECKS).map(|idx| {
@@ -653,16 +584,10 @@ fn render_tui<const DECKS: usize>(
             Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         ),
 
-        None => (
-            " Notices ",
-            "".to_string(),
-            Style::default().fg(CHROME),
-        ),
+        None => (" Notices ", "".to_string(), Style::default().fg(CHROME)),
     };
 
-    let notice_widget = Paragraph::new(message)
-        .style(style)
-        .block(panel(title));
+    let notice_widget = Paragraph::new(message).style(style).block(panel(title));
     frame.render_widget(notice_widget, chunks[next]);
 }
 
@@ -708,57 +633,9 @@ fn scanner_line(reader: &CardReaderView) -> (String, Style) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        column_peak, format_duration, parse_dropped_path, playhead_column, short_card, track_label,
-    };
-    use crate::record::{INanos, TrackMeta, TrackRef, UNanos};
+    use super::{format_duration, parse_dropped_path, short_card, track_label};
+    use crate::record::{TrackMeta, TrackRef};
     use std::time::Duration;
-
-    /// Five minutes, as the platter counts it.
-    const FIVE_MINUTES: UNanos = UNanos(300_000_000_000);
-
-    /// A whole track squeezed into a terminal covers dozens of points per
-    /// column, and the loud moment inside one must still be what gets drawn.
-    #[test]
-    fn a_transient_survives_a_narrow_terminal() {
-        let mut envelope = [0.; 2048];
-        envelope[1000] = 1.;
-
-        let columns: Vec<f32> = (0..80).map(|x| column_peak(&envelope, x, 80)).collect();
-        let tallest = columns.iter().copied().fold(0., f32::max);
-
-        assert_eq!(tallest, 1., "the transient was averaged away");
-        assert_eq!(
-            columns.iter().filter(|point| **point > 0.).count(),
-            1,
-            "the transient smeared across neighbouring columns"
-        );
-    }
-
-    #[test]
-    fn the_playhead_runs_from_the_first_column_to_the_last() {
-        assert_eq!(playhead_column(INanos(0), FIVE_MINUTES, 100), Some(0));
-        assert_eq!(
-            playhead_column(INanos(150_000_000_000), FIVE_MINUTES, 100),
-            Some(50)
-        );
-        assert_eq!(
-            playhead_column(INanos(299_999_999_999), FIVE_MINUTES, 100),
-            Some(99)
-        );
-    }
-
-    /// The playhead runs past the end of a record that finished, and sits behind
-    /// the start after a scratch back through zero.
-    #[test]
-    fn a_playhead_off_the_record_lands_in_no_column() {
-        assert_eq!(
-            playhead_column(INanos(300_000_000_000), FIVE_MINUTES, 100),
-            None
-        );
-        assert_eq!(playhead_column(INanos(-1), FIVE_MINUTES, 100), None);
-        assert_eq!(playhead_column(INanos(0), UNanos(0), 100), None);
-    }
 
     /// A real card id, which has to leave room for the reason beside it.
     #[test]
