@@ -53,14 +53,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.08)]
         pitch_range: f64,
 
-        /// Stereo pair assignments for each deck (e.g., "0" for 1 deck, "0,1" for 2 decks, "1,0" for 2 decks with swapped order, etc)
-        #[arg(
-            short('r'),
-            long = "routing",
-            value_delimiter = ',',
-            default_value = "0"
-        )]
-        routing: Vec<usize>,
+        /// Stereo pair per deck (e.g. "0" for 1 deck, "0,1" for 2, "1,0" for 2 swapped).
+        /// Defaults to one pair per deck the input source drives
+        #[arg(short('r'), long = "routing", value_delimiter = ',')]
+        routing: Option<Vec<usize>>,
 
         /// Audio output device name or substring query
         #[arg(short('D'), long)]
@@ -182,7 +178,7 @@ fn main() {
                 input: *input,
                 midi_port: midi_port.as_deref(),
                 pitch_range: *pitch_range,
-                deck_routing: routing,
+                deck_routing: routing.as_deref(),
                 device_query: device.as_deref(),
                 motor_inertia_secs: *motor_inertia,
                 sensitivity: *sensitivity,

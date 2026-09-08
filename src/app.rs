@@ -46,7 +46,8 @@ pub struct Options<'a> {
     pub midi_port: Option<&'a str>,
     /// tempo fader range as a fraction, 0.08 = +/-8%
     pub pitch_range: f64,
-    pub deck_routing: &'a [usize],
+    /// stereo pair per deck, used verbatim; `None` takes it from the input source
+    pub deck_routing: Option<&'a [usize]>,
     pub device_query: Option<&'a str>,
     pub motor_inertia_secs: f64,
     /// scratch sensitivity factor, applied to whichever input is in use
@@ -95,6 +96,17 @@ fn resolve_input(options: &Options, notices: &Notices) -> InputSource {
     }
 }
 
+/// One stereo pair per deck the source drives, in order.
+///
+/// Which pair is which is a fact about the cables, so a rig patched the other
+/// way says so with `--routing 1,0`.
+fn default_routing(input: InputSource) -> Vec<usize> {
+    match input {
+        InputSource::Touchpad => vec![0],
+        InputSource::Midi => (0..midi::flx4::DECKS).collect(),
+    }
+}
+
 /// How hard this run insists on a QR scanner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QrMode {
@@ -106,30 +118,41 @@ pub enum QrMode {
 
 /// Turns the runtime deck count into the const generic the engine is built on.
 macro_rules! dispatch_app {
-    ($decks:expr, $options:expr) => {{
-        let routing: [usize; $decks] = $options
-            .deck_routing
+    ($decks:expr, $routing:expr, $input:expr, $notices:expr, $options:expr) => {{
+        let routing: [usize; $decks] = $routing[..]
             .try_into()
             .expect("Routing slice length does not match deck count");
-        run_app::<$decks>(routing, &$options);
+        run_app::<$decks>(routing, $input, $notices, &$options);
     }};
 }
 
 /// Main app loop entrypoint.
 pub fn start(options: Options) {
-    match options.deck_routing.len() {
-        1 => dispatch_app!(1, options),
-        2 => dispatch_app!(2, options),
-        3 => dispatch_app!(3, options),
-        4 => dispatch_app!(4, options),
+    let notices = Notices::new();
+    let input = resolve_input(&options, &notices);
+
+    let routing = match options.deck_routing {
+        Some(routing) => routing.to_vec(),
+        None => default_routing(input),
+    };
+
+    log::info!("Deck routing: stereo pairs {routing:?}");
+
+    match routing.len() {
+        1 => dispatch_app!(1, routing, input, notices, options),
+        2 => dispatch_app!(2, routing, input, notices, options),
+        3 => dispatch_app!(3, routing, input, notices, options),
+        4 => dispatch_app!(4, routing, input, notices, options),
         _ => panic!("Maximum 4 decks supported"),
     }
 }
 
-fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) {
-    let notices = Notices::new();
-
-    let input = resolve_input(options, &notices);
+fn run_app<const DECKS: usize>(
+    deck_routing: [usize; DECKS],
+    input: InputSource,
+    notices: Notices,
+    options: &Options,
+) {
 
     // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);

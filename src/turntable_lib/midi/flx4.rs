@@ -34,6 +34,10 @@ use crate::{
 /// Only used to document [`crate::input_profile::InputProfile::jog_wheel`].
 pub const JOG_TICKS_PER_REVOLUTION: i64 = 720;
 
+/// Decks an FLX4 can address: the channel nibble names deck 1 and deck 2, and
+/// there is no third.
+pub const DECKS: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deck {
     One,
