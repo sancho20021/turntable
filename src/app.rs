@@ -96,6 +96,15 @@ fn resolve_input(options: &Options, notices: &Notices) -> InputSource {
     }
 }
 
+impl InputSource {
+    fn name(self) -> &'static str {
+        match self {
+            InputSource::Touchpad => "touchpad",
+            InputSource::Midi => "MIDI controller",
+        }
+    }
+}
+
 /// One stereo pair per deck the source drives, in order.
 ///
 /// Which pair is which is a fact about the cables, so a rig patched the other
@@ -153,7 +162,6 @@ fn run_app<const DECKS: usize>(
     notices: Notices,
     options: &Options,
 ) {
-
     // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);
     let tray_state = Arc::new(RwLock::new(TrayState::Empty));
@@ -237,14 +245,21 @@ fn run_app<const DECKS: usize>(
 
     let started_drivers = drivers.map(PlatterDriver::start);
 
-    let stream = start_deck(
+    let stream = match start_deck(
         options.buffer_frames_n,
         audio_processor_handles,
         deck_routing,
         options.device_query,
+        input,
         health_recorder,
-    )
-    .unwrap();
+    ) {
+        Ok(stream) => stream,
+        Err(e) => {
+            log::error!("Cannot start audio output: {e:#}");
+            eprintln!("Cannot start audio output: {e:#}");
+            std::process::exit(1);
+        }
+    };
 
     let health_monitor =
         audio_health::spawn_monitor(Arc::clone(&health), health_events, Arc::clone(&shutdown));
@@ -517,6 +532,202 @@ fn dispatch_to_deck<const DECKS: usize>(
     }
 }
 
+/// Every output device cpal offers, for `turntable list-devices`.
+///
+/// The names are cpal's own, which on PipeWire are node descriptions rather
+/// than ALSA names: this is the only place they can be read before a run.
+pub fn list_output_devices() -> anyhow::Result<Vec<String>> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .map(|device| device.to_string());
+
+    let devices = host
+        .output_devices()
+        .context("Failed to query output devices")?;
+
+    Ok(devices
+        .map(|device| {
+            let name = device.to_string();
+            let marker = if Some(&name) == default_name.as_ref() {
+                "  [default]"
+            } else {
+                ""
+            };
+
+            format!("{name} ({} ch){marker}", max_channels(&device))
+        })
+        .collect())
+}
+
+/// Holds the interfaces that take over from the system default once connected:
+/// a comma separated list of substrings, matched against the device name
+/// exactly as `-D` matches it. Unset, every run takes the system default.
+const INTERFACES_VAR: &str = "TURNTABLE_INTERFACES";
+
+fn known_interfaces() -> Vec<String> {
+    let Ok(list) = std::env::var(INTERFACES_VAR) else {
+        return Vec::new();
+    };
+
+    let interfaces: Vec<String> = list
+        .split(',')
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    log::info!("{INTERFACES_VAR} names the interfaces to look for: {interfaces:?}");
+    interfaces
+}
+
+fn resolve_device(
+    host: &cpal::Host,
+    device_query: Option<&str>,
+    buffer_frames_n: u32,
+) -> anyhow::Result<cpal::Device> {
+    let devices = usable_output_devices(host, buffer_frames_n)?;
+
+    if let Some(query) = device_query.map(str::trim).filter(|q| !q.is_empty()) {
+        let query = query.to_lowercase();
+
+        return find_device(&devices, &query)?.with_context(|| {
+            format!(
+                "No usable audio output device matching {query:?}. \
+                 Run `turntable list-devices` to see what is connected."
+            )
+        });
+    }
+
+    for interface in known_interfaces() {
+        // An ambiguous match propagates. Something is plugged in and the name
+        // does not say which one, so the fallback below would send the set to
+        // the built-in speakers with nothing said.
+        if let Some(device) = find_device(&devices, &interface)? {
+            log::info!("Using connected interface \"{device}\", matched by {interface:?}");
+            return Ok(device);
+        }
+    }
+
+    log::info!("Using the default output device.");
+    host.default_output_device()
+        .context("No default output device found on system")
+}
+
+/// Output devices that can carry the engine's stream.
+///
+/// Channel count is left out: a device with too few channels for the routing is
+/// [`start_deck`]'s to report, and dropping it here would silently move the set
+/// to another device instead.
+fn usable_output_devices(
+    host: &cpal::Host,
+    buffer_frames_n: u32,
+) -> anyhow::Result<Vec<cpal::Device>> {
+    let all: Vec<_> = host
+        .output_devices()
+        .context("Failed to query output devices")?
+        .collect();
+
+    let (usable, rejected): (Vec<_>, Vec<_>) =
+        all.into_iter()
+            .partition(|device| match device.supported_output_configs() {
+                Ok(mut configs) => configs.any(|config| config_fits(&config, buffer_frames_n)),
+                Err(e) => {
+                    log::warn!("Cannot read configs of output device \"{device}\": {e}");
+                    false
+                }
+            });
+
+    for device in &rejected {
+        log::info!(
+            "Skipping output device \"{device}\": no F32 config at {SAMPLE_RATE:?} with a \
+             {buffer_frames_n} frame buffer"
+        );
+    }
+
+    if usable.is_empty() {
+        bail!(
+            "No output device supports F32 at {SAMPLE_RATE:?} with a {buffer_frames_n} frame \
+             buffer. Run `turntable list-devices` to see what is connected."
+        );
+    }
+
+    log::info!(
+        "Usable output devices: {:?}",
+        usable.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+    );
+
+    Ok(usable)
+}
+
+/// Whether a config can carry the stream, channel count aside.
+fn config_fits(config: &cpal::SupportedStreamConfigRange, buffer_frames_n: u32) -> bool {
+    if config.sample_format() != SampleFormat::F32 {
+        return false;
+    }
+
+    if config.channels() < 2 || config.channels() % 2 != 0 {
+        return false;
+    }
+
+    if !(config.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= config.max_sample_rate()) {
+        return false;
+    }
+
+    match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            buffer_frames_n >= *min && buffer_frames_n <= *max
+        }
+        cpal::SupportedBufferSize::Unknown => true,
+    }
+}
+
+/// The output device whose name contains `query`, which must be lowercase.
+///
+/// `Ok(None)` is nothing by that name. Devices with different names matching
+/// one query is an error: the query does not say which, and neither caller has
+/// anything to break the tie with.
+fn find_device(devices: &[cpal::Device], query: &str) -> anyhow::Result<Option<cpal::Device>> {
+    let matches: Vec<&cpal::Device> = devices
+        .iter()
+        .filter(|device| device.to_string().to_lowercase().contains(query))
+        .collect();
+
+    let Some((first, rest)) = matches.split_first() else {
+        return Ok(None);
+    };
+
+    let name = first.to_string();
+
+    if rest.iter().any(|device| device.to_string() != name) {
+        let matched_list = matches
+            .iter()
+            .map(|device| format!("  - \"{device}\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        bail!(
+            "Ambiguous audio device query {query:?}: matches {} distinct devices:\n{matched_list}\n\
+             Narrow it with -D.",
+            matches.len()
+        );
+    }
+
+    if !rest.is_empty() {
+        log::warn!(
+            "{} endpoints share the name \"{name}\"; taking Output over Duplex, then the widest.",
+            matches.len()
+        );
+    }
+
+    let best = matches
+        .into_iter()
+        .max_by_key(|device| device_rank(device))
+        .expect("the match list is not empty");
+
+    log::info!("Query {query:?} selected output device \"{best}\"");
+    Ok(Some(best.clone()))
+}
+
 fn direction_score(device: &cpal::Device) -> u8 {
     match device.description().map(|d| d.direction()).ok() {
         Some(cpal::DeviceDirection::Output) => 2, // Highest priority
@@ -538,72 +749,6 @@ fn device_rank(device: &cpal::Device) -> (u8, u16) {
     (direction_score(device), max_channels(device))
 }
 
-fn resolve_device(host: &cpal::Host, device_query: Option<&str>) -> anyhow::Result<cpal::Device> {
-    let query = match device_query.map(str::trim).filter(|q| !q.is_empty()) {
-        Some(q) => q.to_lowercase(),
-        None => {
-            log::info!("No device query specified; using default output device.");
-            return host
-                .default_output_device()
-                .context("No default output device found on system");
-        }
-    };
-
-    let all_devices: Vec<_> = host
-        .output_devices()
-        .context("Failed to query output devices")?
-        .collect();
-
-    let matches: Vec<_> = all_devices
-        .into_iter()
-        .filter(|dev| dev.to_string().to_lowercase().contains(&query))
-        .collect();
-
-    if matches.is_empty() {
-        log::error!("Available output devices:");
-        for dev in host.output_devices()? {
-            log::error!("  - \"{dev}\"");
-        }
-        bail!("No audio output device found matching query: \"{query}\"");
-    }
-
-    if matches.len() == 1 {
-        let device = matches.into_iter().next().unwrap();
-        log::info!("Selected unique output device: \"{device}\"");
-        return Ok(device);
-    }
-
-    let first_name = matches[0].to_string();
-    let all_same_name = matches.iter().all(|dev| dev.to_string() == first_name);
-
-    if !all_same_name {
-        let matched_list = matches
-            .iter()
-            .map(|dev| format!("  - \"{dev}\""))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        bail!(
-            "Ambiguous audio device query \"{query}\": matches {} distinct devices:\n{matched_list}",
-            matches.len()
-        );
-    }
-
-    for device in &matches {
-        log::info!("supported config of {device}:");
-        for config in device.supported_output_configs()? {
-            log::info!("- {config:?}");
-        }
-    }
-    let best_match = matches.into_iter().max_by_key(device_rank).unwrap();
-
-    log::warn!(
-        "Multiple endpoints found sharing identical name \"{first_name}\". Disambiguated best endpoint (Output > Duplex, Max Channels)."
-    );
-
-    Ok(best_match)
-}
-
 /// Start audio thread
 fn start_deck<const DECKS: usize>(
     // buffer size in frames
@@ -611,12 +756,14 @@ fn start_deck<const DECKS: usize>(
     audio_processor_handles: [AudioProcessorHandles; DECKS],
     deck_routing: [usize; DECKS],
     device_query: Option<&str>,
+    // names the deck count's origin when the device cannot carry it
+    input: InputSource,
     health: HealthRecorder,
 ) -> anyhow::Result<Stream> {
     let host = cpal::default_host();
     log::info!("CPAL Host API: {:?}", host.id());
 
-    let device = resolve_device(&host, device_query)?;
+    let device = resolve_device(&host, device_query, buffer_frames_n)?;
 
     log::info!("Chosen device: {:?}", device);
 
@@ -628,67 +775,38 @@ fn start_deck<const DECKS: usize>(
         .context("Failed to query device supported output configs")?
         .collect();
 
-    let mut valid_configs: Vec<_> = all_configs
-        .iter()
-        .cloned()
-        .filter(|config| {
-            // Must support F32 sample format
-            if config.sample_format() != SampleFormat::F32 {
-                return false;
-            }
-
-            // Must have enough channels and be an even pair count
-            let channels = config.channels();
-            if channels < min_channels_required || channels % 2 != 0 {
-                return false;
-            }
-
-            // Target SAMPLE_RATE must fall within supported range
-            if !(config.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= config.max_sample_rate())
-            {
-                return false;
-            }
-
-            // Requested buffer frame size must fall within supported range
-            match config.buffer_size() {
-                cpal::SupportedBufferSize::Range { min, max } => {
-                    buffer_frames_n >= *min && buffer_frames_n <= *max
-                }
-                cpal::SupportedBufferSize::Unknown => true,
-            }
-        })
+    let fitting: Vec<_> = all_configs
+        .into_iter()
+        .filter(|config| config_fits(config, buffer_frames_n))
         .collect();
 
-    if valid_configs.is_empty() {
-        let available_str = if all_configs.is_empty() {
-            "  (none reported by driver)".to_string()
+    let offered = fitting
+        .iter()
+        .map(|config| config.channels())
+        .max()
+        .unwrap_or(0);
+
+    if offered < min_channels_required {
+        let source = if deck_routing.as_slice() == default_routing(input) {
+            format!(" from the {}", input.name())
         } else {
-            all_configs
-                .iter()
-                .map(|c| {
-                    format!(
-                        "  - channels: {}, format: {:?}, sample_rate: {}-{} Hz, buffer: {:?}",
-                        c.channels(),
-                        c.sample_format(),
-                        c.min_sample_rate(),
-                        c.max_sample_rate(),
-                        c.buffer_size()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            String::new()
         };
 
         bail!(
-            "Device \"{device}\" does not support required config:\n\
-        \x20 Required: >= {min_channels_required} channels (even, covering stereo pair {max_pair_idx}), F32 format, rate {SAMPLE_RATE:?}, buffer {buffer_frames_n} frames\n\n\
-        Available device configurations:\n{available_str}"
+            "\"{device}\" offers {offered} usable output channels; routing \
+             {deck_routing:?}{source} needs {min_channels_required}. Connect the interface, or \
+             use --routing 0."
         );
     }
 
-    // 2. Select the optimal configuration (e.g. smallest suitable channel count >= min_channels_required)
-    valid_configs.sort_by_key(|config| config.channels());
-    let chosen_range = valid_configs.remove(0);
+    // Channels the routing does not name stay silent, so a wider config only
+    // costs work in the callback.
+    let chosen_range = fitting
+        .into_iter()
+        .filter(|config| config.channels() >= min_channels_required)
+        .min_by_key(|config| config.channels())
+        .expect("offered >= min_channels_required, so some config is wide enough");
 
     let device_channels = chosen_range.channels() as usize;
 

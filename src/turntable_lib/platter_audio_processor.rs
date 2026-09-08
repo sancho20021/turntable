@@ -296,7 +296,8 @@ impl PlatterAudioProcessor {
                 // https://en.wikipedia.org/wiki/Group_delay_and_phase_delay
                 // Landing on that trail is landing in steady state; without it
                 // the filter restarts cold and glides the playback in.
-                let decay = exponential_decay_factor(block_duration.as_secs_f64(), PLAYHEAD_LPF_TAU);
+                let decay =
+                    exponential_decay_factor(block_duration.as_secs_f64(), PLAYHEAD_LPF_TAU);
                 let steady_state_lag_nanos =
                     self.last_speed * block_duration.as_nanos() as f64 * decay / (1. - decay);
                 let anchor =
@@ -713,8 +714,7 @@ mod tests {
                 advance(&mut platter, &mut clock);
                 processor.write_frames(&mut frames);
                 let now = processor.last_played.expect("a block has been played");
-                let speed =
-                    (now.record_pos.0 - previous.record_pos.0) as f64 / block_nanos as f64;
+                let speed = (now.record_pos.0 - previous.record_pos.0) as f64 / block_nanos as f64;
                 previous = now;
                 speed
             })
@@ -746,7 +746,11 @@ mod tests {
             })
             .collect();
 
-        assert!(bent.is_empty(), "a seek bends the speed - {}", bent.join(" | "));
+        assert!(
+            bent.is_empty(),
+            "a seek bends the speed - {}",
+            bent.join(" | ")
+        );
     }
 
     /// Loading a track onto a running deck swaps the record between one block

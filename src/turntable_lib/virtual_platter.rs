@@ -2,9 +2,7 @@ use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use crossbeam::atomic::AtomicCell;
 
-use crate::{
-    record::{INanos, UNanos},
-};
+use crate::record::{INanos, UNanos};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PlatterSample {

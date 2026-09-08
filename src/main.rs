@@ -39,6 +39,9 @@ enum Commands {
     /// List MIDI input ports and exit
     ListMidi,
 
+    /// List audio output devices and exit
+    ListDevices,
+
     /// Run the turntable application
     Run {
         /// Input device driving the decks
@@ -58,7 +61,8 @@ enum Commands {
         #[arg(short('r'), long = "routing", value_delimiter = ',')]
         routing: Option<Vec<usize>>,
 
-        /// Audio output device name or substring query
+        /// Audio output device name or substring query. Unset, the first device named by
+        /// TURNTABLE_INTERFACES ("xone,motu": substrings, in order) wins, else the system default
         #[arg(short('D'), long)]
         device: Option<String>,
 
@@ -155,6 +159,20 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("Cannot list MIDI ports: {e}");
+                std::process::exit(1);
+            }
+        },
+
+        Commands::ListDevices => match app::list_output_devices() {
+            Ok(devices) if devices.is_empty() => println!("No audio output devices found"),
+            Ok(devices) => {
+                println!("Audio output devices:");
+                for (i, name) in devices.iter().enumerate() {
+                    println!("  [{i}] {name}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Cannot list audio output devices: {e:#}");
                 std::process::exit(1);
             }
         },

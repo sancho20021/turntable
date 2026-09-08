@@ -49,7 +49,18 @@ fn find_port(input: &MidiInput, query: Option<&str>) -> anyhow::Result<midir::Mi
                     .with_context(|| format!("No MIDI port matching {query:?}"))?
             }
         },
-        None => find_ddj_port(input).unwrap_or_else(|| ports[0].clone()),
+        None => find_ddj_port(input).with_context(|| {
+            let names = ports
+                .iter()
+                .filter_map(|port| input.port_name(port).ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            format!(
+                "No DDJ controller among the MIDI ports ({names}). Name one with \
+                 --midi-port, or see them all with `turntable list-midi`."
+            )
+        })?,
     };
 
     Ok(port)
