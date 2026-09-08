@@ -11,6 +11,8 @@ use crate::app::{QrMode, start};
 /// Which device drives the decks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum InputKind {
+    /// Follow the hardware: the controller if one is plugged in, else the touchpad
+    Auto,
     /// SDL window: mouse scratching plus the keyboard bindings
     Touchpad,
     /// MIDI controller (DDJ-FLX4): jog wheels, transport, tempo faders
@@ -40,7 +42,7 @@ enum Commands {
     /// Run the turntable application
     Run {
         /// Input device driving the decks
-        #[arg(short('I'), long, value_enum, default_value_t = InputKind::Touchpad)]
+        #[arg(short('I'), long, value_enum, default_value_t = InputKind::Auto)]
         input: InputKind,
 
         /// MIDI port index or name substring (default: the first DDJ port)

@@ -49,19 +49,40 @@ fn find_port(input: &MidiInput, query: Option<&str>) -> anyhow::Result<midir::Mi
                     .with_context(|| format!("No MIDI port matching {query:?}"))?
             }
         },
-        None => ports
-            .iter()
-            .find(|port| {
-                input.port_name(port).is_ok_and(|name| {
-                    let name = name.to_lowercase();
-                    name.contains("ddj") || name.contains("flx")
-                })
-            })
-            .cloned()
-            .unwrap_or_else(|| ports[0].clone()),
+        None => find_ddj_port(input).unwrap_or_else(|| ports[0].clone()),
     };
 
     Ok(port)
+}
+
+/// The first port whose name looks like a Pioneer DDJ.
+fn find_ddj_port(input: &MidiInput) -> Option<midir::MidiInputPort> {
+    input
+        .ports()
+        .iter()
+        .find(|port| {
+            input.port_name(port).is_ok_and(|name| {
+                let name = name.to_lowercase();
+                name.contains("ddj") || name.contains("flx")
+            })
+        })
+        .cloned()
+}
+
+/// Whether a controller [`start`] could drive the decks with is plugged in.
+///
+/// `query` names it exactly as it does there. Without one, only a DDJ counts:
+/// ALSA always offers a "Midi Through" port, so the first port `start` settles
+/// for is no evidence of a controller.
+pub fn is_connected(query: Option<&str>) -> bool {
+    let Ok(input) = MidiInput::new("turntable-probe") else {
+        return false;
+    };
+
+    match query {
+        Some(_) => find_port(&input, query).is_ok(),
+        None => find_ddj_port(&input).is_some(),
+    }
 }
 
 /// Logs every MIDI input port, for `turntable list-midi`.

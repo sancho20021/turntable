@@ -67,6 +67,34 @@ pub struct Options<'a> {
 /// spends a larger share of its budget on being woken up late.
 pub const DEFAULT_BUFFER_FRAMES: u32 = 512;
 
+/// Which device drives the decks, once [`InputKind::Auto`] has been settled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InputSource {
+    Touchpad,
+    Midi,
+}
+
+/// Picks the source [`InputKind::Auto`] leaves open, and says so in the TUI
+/// when there is no controller to pick.
+fn resolve_input(options: &Options, notices: &Notices) -> InputSource {
+    match options.input {
+        InputKind::Touchpad => InputSource::Touchpad,
+        InputKind::Midi => InputSource::Midi,
+
+        // A controller on the bus is the intent to use it, so from here Auto is
+        // as strict as `-I midi`: it is plugged in, it has to work.
+        InputKind::Auto if midi::is_connected(options.midi_port) => InputSource::Midi,
+
+        InputKind::Auto => {
+            let message =
+                "No MIDI controller connected; using the touchpad. Pass -I midi to require one.";
+            log::info!("{message}");
+            notices.warn(message);
+            InputSource::Touchpad
+        }
+    }
+}
+
 /// How hard this run insists on a QR scanner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QrMode {
@@ -100,6 +128,8 @@ pub fn start(options: Options) {
 
 fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) {
     let notices = Notices::new();
+
+    let input = resolve_input(options, &notices);
 
     // preparing records and loading them onto decks
     let (tray_snd, tray_rcv) = bounded(3);
@@ -147,20 +177,20 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     // One input unit is a touchpad pixel or a jog wheel tick depending on what
     // is driving the decks, which is the only thing the engine needs to be told
     // about the difference.
-    let input_profile = match options.input {
-        InputKind::Touchpad => {
+    let input_profile = match input {
+        InputSource::Touchpad => {
             InputProfile::touchpad(options.sensitivity, options.nudge_responsiveness)
         }
-        InputKind::Midi => {
+        InputSource::Midi => {
             InputProfile::jog_wheel(options.sensitivity, options.nudge_responsiveness)
         }
     };
 
     // Only the keyboard has a notion of an active deck; a MIDI controller names
     // its deck in every message.
-    let active_deck = match options.input {
-        InputKind::Touchpad => Some(Arc::new(AtomicUsize::new(0))),
-        InputKind::Midi => None,
+    let active_deck = match input {
+        InputSource::Touchpad => Some(Arc::new(AtomicUsize::new(0))),
+        InputSource::Midi => None,
     };
 
     // One health struct for the whole stream, with a slot per deck. The audio
@@ -225,14 +255,14 @@ fn run_app<const DECKS: usize>(deck_routing: [usize; DECKS], options: &Options) 
     );
 
     // Whichever source owns the main thread blocks here until the app stops.
-    match options.input {
-        InputKind::Touchpad => run_sdl_source::<DECKS>(
+    match input {
+        InputSource::Touchpad => run_sdl_source::<DECKS>(
             active_deck.expect("touchpad input always has an active deck"),
             notices.clone(),
             &events_snd,
             &dispatcher,
         ),
-        InputKind::Midi => run_midi_source(options, &events_snd, &dispatcher),
+        InputSource::Midi => run_midi_source(options, &events_snd, &dispatcher),
     }
 
     // 4. Teardown & Thread Joining
