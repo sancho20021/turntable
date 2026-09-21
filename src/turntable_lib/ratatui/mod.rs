@@ -591,11 +591,7 @@ fn render_tui<const DECKS: usize>(
     frame.render_widget(notice_widget, chunks[next]);
 }
 
-/// A dead gun is shown as dead and nothing else. Naming the card it last read
-/// would be naming a track the next press is not going to load.
-/// A health light for the gun, and nothing else. Whether a card reached the tray
-/// is the tray's line to say, and whether a scan just registered is answered by
-/// the tray changing - this panel can only tell you that once.
+/// A health light for the gun, and nothing else.
 fn scanner_line(reader: &CardReaderView) -> (String, Style) {
     let ready = || ("●  ready".to_string(), Style::default().fg(DIM));
     let problem = Style::default().fg(ALARM).add_modifier(Modifier::BOLD);

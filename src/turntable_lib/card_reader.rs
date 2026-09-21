@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
@@ -34,8 +34,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct ScannedCard {
     /// exactly what the gun read, unparsed
     pub payload: String,
-    /// When the gun last read it.
-    pub at: Instant,
     pub outcome: Outcome,
 }
 
@@ -215,9 +213,7 @@ fn stage_scan(
         }
     };
 
-    let at = Instant::now();
-
-    if was_already_staged(staged, &payload, at) {
+    if already_handled(staged, &payload) {
         return ControlFlow::Continue(());
     }
 
@@ -226,7 +222,6 @@ fn stage_scan(
         staged,
         Staged::Card(ScannedCard {
             payload: payload.clone(),
-            at,
             outcome: Outcome::Resolving,
         }),
     );
@@ -245,29 +240,24 @@ fn stage_scan(
         }
     };
 
-    publish(
-        staged,
-        Staged::Card(ScannedCard {
-            payload,
-            at,
-            outcome,
-        }),
-    );
+    publish(staged, Staged::Card(ScannedCard { payload, outcome }));
     ControlFlow::Continue(())
 }
 
-/// Whether the gun re-read the card already staged, in which case its timestamp
-/// is moved to `at` and nothing else changes.
-fn was_already_staged(staged: &RwLock<Staged>, payload: &str, at: Instant) -> bool {
-    let Ok(mut slot) = staged.write() else {
-        log::error!("cannot update the staged card, lock poisoned");
+/// Whether the gun re-read a card whose lookup already reached the tray or is
+/// still running.
+///
+/// A card the library could not answer for is looked up again, so repairing the
+/// library and scanning the card again plays it.
+fn already_handled(staged: &RwLock<Staged>, payload: &str) -> bool {
+    let Ok(slot) = staged.read() else {
+        log::error!("cannot read the staged card, lock poisoned");
         return false;
     };
 
-    match &mut *slot {
+    match &*slot {
         Staged::Card(card) if card.payload == payload => {
-            card.at = at;
-            true
+            matches!(card.outcome, Outcome::Resolving | Outcome::SentToTray)
         }
         _ => false,
     }
@@ -337,16 +327,16 @@ mod tests {
     /// Answers every card with the same track, and counts how often it was asked.
     struct Library {
         answer: Result<TrackRef, ResolveError>,
+        /// Answers the second lookup onwards.
+        then: Option<Result<TrackRef, ResolveError>>,
         lookups: usize,
     }
 
     impl Library {
         fn holding_everything() -> Self {
             Self {
-                answer: Ok(TrackRef {
-                    path: "/music/track.flac".to_string(),
-                    meta: None,
-                }),
+                answer: Ok(track()),
+                then: None,
                 lookups: 0,
             }
         }
@@ -354,6 +344,19 @@ mod tests {
         fn holding_nothing() -> Self {
             Self {
                 answer: Err(ResolveError::Unknown),
+                then: None,
+                lookups: 0,
+            }
+        }
+
+        /// A card the library knows, whose track has no file until someone adds
+        /// one between two scans.
+        fn missing_a_file_until_repaired() -> Self {
+            Self {
+                answer: Err(ResolveError::Failed(
+                    "no file recorded for this track".to_string(),
+                )),
+                then: Some(Ok(track())),
                 lookups: 0,
             }
         }
@@ -362,7 +365,18 @@ mod tests {
     impl CardResolver for Library {
         fn resolve(&mut self, _card_id: &str) -> Result<TrackRef, ResolveError> {
             self.lookups += 1;
-            self.answer.clone()
+
+            match &self.then {
+                Some(answer) if self.lookups > 1 => answer.clone(),
+                _ => self.answer.clone(),
+            }
+        }
+    }
+
+    fn track() -> TrackRef {
+        TrackRef {
+            path: "/music/track.flac".to_string(),
+            meta: None,
         }
     }
 
@@ -454,6 +468,30 @@ mod tests {
 
         assert_eq!(run.prepared, 0, "an unknown card was sent to the tray");
         assert_eq!(card_of(run.staged).outcome, Outcome::Unknown);
+    }
+
+    /// The card is put in front of the gun again once its file is in the
+    /// library, and the gun re-reads it on a shift in lighting or angle.
+    #[test]
+    fn a_card_repaired_between_scans_reaches_the_tray() {
+        let run = run(
+            vec![scan("1701"), scan("1701")],
+            Library::missing_a_file_until_repaired(),
+        );
+
+        assert_eq!(run.lookups, 2, "the library was never asked again");
+        assert_eq!(run.prepared, 1, "the repaired track never reached the tray");
+        assert_eq!(card_of(run.staged).outcome, Outcome::SentToTray);
+    }
+
+    #[test]
+    fn an_unknown_card_is_looked_up_again_on_the_next_scan() {
+        let run = run(
+            vec![scan("a wifi code"), scan("a wifi code")],
+            Library::holding_nothing(),
+        );
+
+        assert_eq!(run.lookups, 2);
     }
 
     #[test]
