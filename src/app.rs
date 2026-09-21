@@ -3,10 +3,10 @@ use std::{
     path::Path,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -34,11 +34,14 @@ use turntable_lib::{
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
     samples_poller::{DeckRouting, SamplesPoller},
-    sdl_input::SdlInputMapper,
     telemetry,
     tray::{self, TrayCommand, TrayState},
     utils::{log_try_send, unzip_array4},
 };
+#[cfg(feature = "sdl")]
+use std::{sync::atomic::AtomicUsize, time::Instant};
+#[cfg(feature = "sdl")]
+use turntable_lib::sdl_input::SdlInputMapper;
 
 /// Everything the app was asked to do, as parsed from the command line.
 pub struct Options<'a> {
@@ -71,6 +74,7 @@ pub const DEFAULT_BUFFER_FRAMES: u32 = 512;
 /// Which device drives the decks, once [`InputKind::Auto`] has been settled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum InputSource {
+    #[cfg(feature = "sdl")]
     Touchpad,
     Midi,
 }
@@ -79,6 +83,7 @@ enum InputSource {
 /// when there is no controller to pick.
 fn resolve_input(options: &Options, notices: &Notices) -> InputSource {
     match options.input {
+        #[cfg(feature = "sdl")]
         InputKind::Touchpad => InputSource::Touchpad,
         InputKind::Midi => InputSource::Midi,
 
@@ -86,19 +91,33 @@ fn resolve_input(options: &Options, notices: &Notices) -> InputSource {
         // as strict as `-I midi`: it is plugged in, it has to work.
         InputKind::Auto if midi::is_connected(options.midi_port) => InputSource::Midi,
 
-        InputKind::Auto => {
-            let message =
-                "No MIDI controller connected; using the touchpad. Pass -I midi to require one.";
-            log::info!("{message}");
-            notices.warn(message);
-            InputSource::Touchpad
-        }
+        InputKind::Auto => no_controller(notices),
     }
+}
+
+/// What [`InputKind::Auto`] settles on when no controller is connected.
+#[cfg(feature = "sdl")]
+fn no_controller(notices: &Notices) -> InputSource {
+    let message = "No MIDI controller connected; using the touchpad. Pass -I midi to require one.";
+    log::info!("{message}");
+    notices.warn(message);
+    InputSource::Touchpad
+}
+
+/// Runs before any thread or device is opened, so nothing has to unwind.
+#[cfg(not(feature = "sdl"))]
+fn no_controller(_notices: &Notices) -> InputSource {
+    eprintln!(
+        "No MIDI controller connected, and this build has no touchpad input.\n\
+         Connect the controller, or rebuild with --features sdl."
+    );
+    std::process::exit(1);
 }
 
 impl InputSource {
     fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "sdl")]
             InputSource::Touchpad => "touchpad",
             InputSource::Midi => "MIDI controller",
         }
@@ -111,6 +130,7 @@ impl InputSource {
 /// way says so with `--routing 1,0`.
 fn default_routing(input: InputSource) -> Vec<usize> {
     match input {
+        #[cfg(feature = "sdl")]
         InputSource::Touchpad => vec![0],
         InputSource::Midi => (0..midi::flx4::DECKS).collect(),
     }
@@ -209,6 +229,7 @@ fn run_app<const DECKS: usize>(
     // is driving the decks, which is the only thing the engine needs to be told
     // about the difference.
     let input_profile = match input {
+        #[cfg(feature = "sdl")]
         InputSource::Touchpad => {
             InputProfile::touchpad(options.sensitivity, options.nudge_responsiveness)
         }
@@ -220,6 +241,7 @@ fn run_app<const DECKS: usize>(
     // Only the keyboard has a notion of an active deck; a MIDI controller names
     // its deck in every message.
     let active_deck = match input {
+        #[cfg(feature = "sdl")]
         InputSource::Touchpad => Some(Arc::new(AtomicUsize::new(0))),
         InputSource::Midi => None,
     };
@@ -294,6 +316,7 @@ fn run_app<const DECKS: usize>(
 
     // Whichever source owns the main thread blocks here until the app stops.
     match input {
+        #[cfg(feature = "sdl")]
         InputSource::Touchpad => run_sdl_source::<DECKS>(
             active_deck.expect("touchpad input always has an active deck"),
             notices.clone(),
@@ -398,6 +421,7 @@ fn open_library(config_path: Option<&Path>) -> Library {
 /// Runs the SDL window as the input source, returning when the app should stop.
 ///
 /// SDL is only initialised here, so a MIDI-driven run opens no window at all.
+#[cfg(feature = "sdl")]
 fn run_sdl_source<const DECKS: usize>(
     active_deck: Arc<AtomicUsize>,
     notices: Notices,

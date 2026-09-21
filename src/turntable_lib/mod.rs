@@ -15,6 +15,7 @@ pub mod platter_driver;
 pub mod ratatui;
 pub mod record;
 pub mod samples_poller;
+#[cfg(feature = "sdl")]
 pub mod sdl_input;
 pub mod stereo_frame;
 pub mod telemetry;

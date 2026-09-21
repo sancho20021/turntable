@@ -11,9 +11,17 @@ use crate::app::{QrMode, start};
 /// Which device drives the decks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum InputKind {
-    /// Follow the hardware: the controller if one is plugged in, else the touchpad
+    #[cfg_attr(
+        feature = "sdl",
+        doc = "Follow the hardware: the controller if one is plugged in, else the touchpad"
+    )]
+    #[cfg_attr(
+        not(feature = "sdl"),
+        doc = "Follow the hardware: the controller, which this build cannot do without"
+    )]
     Auto,
     /// SDL window: mouse scratching plus the keyboard bindings
+    #[cfg(feature = "sdl")]
     Touchpad,
     /// MIDI controller (DDJ-FLX4): jog wheels, transport, tempo faders
     Midi,
