@@ -4,6 +4,7 @@ mod cards_config;
 use std::{fs::OpenOptions, path::PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use env_logger::Env;
 use log::info;
 
 use crate::app::{QrMode, start};
@@ -133,6 +134,10 @@ fn install_panic_logger() {
     }));
 }
 
+/// `symphonia` warns about junk bytes ahead of the audio in most files, which
+/// says nothing about whether the track plays.
+const DEFAULT_LOG_FILTER: &str = "info,symphonia=error";
+
 fn main() {
     let args = Cli::parse();
 
@@ -140,15 +145,14 @@ fn main() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // 3. Open or create the target log file
     let log_file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&args.log_file)
         .unwrap_or_else(|err| panic!("Failed to open log file at {:?}: {}", args.log_file, err));
 
-    // 4. Initialize env_logger with target pipe
-    env_logger::builder()
+    env_logger::Builder::from_env(Env::default().default_filter_or(DEFAULT_LOG_FILTER))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
 

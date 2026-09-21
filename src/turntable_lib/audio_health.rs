@@ -722,7 +722,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
     if damaged {
         log::warn!("{summary}");
     } else {
-        log::info!("{summary}");
+        log::debug!("{summary}");
     }
 
     if dropped > 0 {
@@ -766,7 +766,7 @@ fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) 
         if dropped > 0 || stale > 0 || maxed > 0 || lag.abs() > LAG_WARN_NANOS {
             log::warn!("{line}");
         } else {
-            log::info!("{line}");
+            log::debug!("{line}");
         }
     }
 
