@@ -89,7 +89,7 @@ enum Commands {
 
         /// Nudge / Pitch bend responsiveness
         #[arg(short('n'), long, default_value_t = 1., allow_negative_numbers = true)]
-        nudge: f32,
+        nudge: f64,
 
         /// Require the QR scanner; refuse to start without it
         #[arg(long, conflicts_with = "no_qr")]

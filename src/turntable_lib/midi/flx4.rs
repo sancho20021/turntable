@@ -26,7 +26,7 @@ use std::{fmt, time::Instant};
 
 use crate::{
     deck_controller::DeckId,
-    input_event::{DeckCommand, DeckEvent, Direction, InputEvent},
+    input_event::{DeckCommand, DeckEvent, InputEvent},
     midi::message::MidiMessage,
 };
 
@@ -339,13 +339,8 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
                 // Absolute wheel position, straight through.
                 JogMode::Scratch => DeckCommand::ScratchMove(total),
 
-                // Turned by the side without touching the top: pitch bend. One
-                // nudge per message, like one detent of a mouse wheel.
-                JogMode::Bend => DeckCommand::Nudge(if ticks >= 0 {
-                    Direction::Forward
-                } else {
-                    Direction::Backward
-                }),
+                // Turned by the side without touching the top: pitch bend.
+                JogMode::Bend => DeckCommand::Nudge(ticks),
 
                 // Would need a playhead jump proportional to the ticks; reusing
                 // the fixed fast-forward would skip minutes per flick.

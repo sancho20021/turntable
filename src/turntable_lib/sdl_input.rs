@@ -18,7 +18,7 @@ use sdl2::{
 
 use crate::{
     deck_controller::DeckId,
-    input_event::{AppEvent, DeckCommand, DeckEvent, Direction, InputEvent},
+    input_event::{AppEvent, DeckCommand, DeckEvent, InputEvent},
     notices::Notices,
 };
 
@@ -57,14 +57,8 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
                 ..
             } => DeckCommand::ScratchEnd,
 
-            Event::MouseWheel { x, .. } => {
-                let direction = if x < 0 {
-                    Direction::Forward
-                } else {
-                    Direction::Backward
-                };
-                DeckCommand::Nudge(direction)
-            }
+            // Scrolling left is forward, matching a record pushed away.
+            Event::MouseWheel { x, .. } => DeckCommand::Nudge(-x as i16),
 
             Event::KeyDown {
                 keycode: Some(key),

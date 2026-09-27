@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,7 +10,7 @@ use crossbeam::channel::Receiver;
 
 use crate::{
     deck_controller::{DeckState, PlatterState},
-    input_event::Direction,
+    filters::exponential_decay_factor,
     input_profile::InputProfile,
     physical_speed::Speed,
     platter_audio_processor::PlatterAudioProcessor,
@@ -26,6 +25,9 @@ static FF_TIME: UNanos = UNanos(15 * 1_000_000_000);
 
 /// Most input events one platter update will absorb.
 const MAX_EVENTS_PER_UPDATE: usize = 1000;
+
+/// Furthest a nudge will bend the pitch, as a fraction of nominal speed.
+const MAX_BEND: f64 = 0.16;
 
 /// Platter updates per audio callback. One is the floor - below it a callback
 /// finds no fresh sample and extrapolates from a stale slope - and the loop
@@ -46,51 +48,50 @@ pub enum Jump {
 pub enum PlatterEvent {
     /// move playhead
     MovePlayhead(Jump),
-    /// pitch bend / nudge
-    Nudge(Direction),
+    /// pitch bend: input units moved since the last report, + being forward
+    Nudge(i16),
 }
 
-struct NudgeQueue {
-    /// nudge responsiveness
-    responsiveness: f32,
-    /// forward nudges, sorted from oldest to newest
-    forward: VecDeque<Instant>,
-    /// backward nudges, sorted from oldest to newest
-    backward: VecDeque<Instant>,
+/// Speed of a bend gesture, estimated from the nudge events it emits.
+///
+/// [`Self::ticks`] is a leaky sum: each event adds its input units, and the sum
+/// decays with `tau_secs`. A steady `f` units per second settles it at
+/// `f * tau_secs`, so dividing by `tau_secs` recovers `f` whatever the time
+/// constant is - it shapes the attack and the release without touching how
+/// deep a held bend goes.
+struct NudgeVelocity {
+    ticks: f64,
+    tau_secs: f64,
+    /// pitch bend per input unit per second
+    responsiveness: f64,
+    decayed_at: Instant,
 }
 
-impl NudgeQueue {
-    pub fn new(responsiveness: f32) -> Self {
+impl NudgeVelocity {
+    fn new(input: &InputProfile) -> Self {
         Self {
-            responsiveness,
-            forward: Default::default(),
-            backward: Default::default(),
+            ticks: 0.,
+            tau_secs: input.nudge_release_tau_secs,
+            responsiveness: input.nudge_responsiveness,
+            decayed_at: Instant::now(),
         }
     }
 
-    fn current_nudge(&mut self) -> f32 {
-        let now = Instant::now();
-        let lifetime = Duration::from_millis(100);
+    fn decay_to(&mut self, now: Instant) {
+        let dt = now.duration_since(self.decayed_at).as_secs_f64();
+        self.ticks *= exponential_decay_factor(dt, self.tau_secs);
+        self.decayed_at = now;
+    }
 
-        // 1. Drain expired forward nudges one-by-one from the front
-        while let Some(oldest_time) = self.forward.front() {
-            if now.duration_since(*oldest_time) >= lifetime {
-                self.forward.pop_front(); // Cleanly pop index 0
-            } else {
-                break;
-            }
-        }
+    fn push(&mut self, ticks: i16, now: Instant) {
+        self.decay_to(now);
+        self.ticks += f64::from(ticks);
+    }
 
-        // 2. Drain expired backward nudges one-by-one from the front
-        while let Some(oldest_time) = self.backward.front() {
-            if now.duration_since(*oldest_time) >= lifetime {
-                self.backward.pop_front(); // Cleanly pop index 0
-            } else {
-                break;
-            }
-        }
-
-        self.responsiveness * (self.forward.len() as f32 - self.backward.len() as f32)
+    /// Pitch offset, 0.01 being one percent fast.
+    fn bend(&mut self, now: Instant) -> f64 {
+        self.decay_to(now);
+        (self.ticks / self.tau_secs * self.responsiveness).clamp(-MAX_BEND, MAX_BEND)
     }
 }
 
@@ -102,7 +103,7 @@ pub struct PlatterDriver {
     input: InputProfile,
     platter: WritablePlatter,
     events: Receiver<PlatterEvent>,
-    nudges: NudgeQueue,
+    nudges: NudgeVelocity,
     /// for recording metrics
     pub tracer: TelemetryTrace,
     shutdown: Arc<AtomicBool>,
@@ -128,7 +129,7 @@ impl PlatterDriver {
             deck_id,
             state,
             record_speed,
-            nudges: NudgeQueue::new(input.nudge_responsiveness),
+            nudges: NudgeVelocity::new(&input),
             input,
             platter,
             events,
@@ -153,15 +154,12 @@ impl PlatterDriver {
         let cur_playhead = self.platter.get_playhead();
         let elapsed_nanos: f64 = (now.0 as f64 - cur_playhead.timestamp_nanos.0 as f64).max(0.);
 
-        let target_speed = {
-            let nudge_raw = self.nudges.current_nudge() as f64;
-            let nudge_modifier = nudge_raw.clamp(-16., 16.) / 100.;
-            self.state.target_speed() + nudge_modifier
-        };
-
+        // The pitch fader drives a motor and picks up its inertia; a hand on
+        // the wheel does not, so the bend lands past the filter.
         let speed = self
             .record_speed
-            .advance(elapsed_nanos / 1_000_000_000., target_speed);
+            .advance(elapsed_nanos / 1_000_000_000., self.state.target_speed())
+            + self.nudges.bend(Instant::now());
 
         let sample = match state {
             PlatterState::Playing => {
@@ -253,10 +251,7 @@ impl PlatterDriver {
                 self.platter
                     .update_playhead(new_pos, self.platter.timestamp(now));
             }
-            PlatterEvent::Nudge(direction) => match direction {
-                Direction::Forward => self.nudges.forward.push_back(now),
-                Direction::Backward => self.nudges.backward.push_back(now),
-            },
+            PlatterEvent::Nudge(ticks) => self.nudges.push(ticks, now),
         }
     }
 
@@ -291,5 +286,72 @@ impl PlatterDriver {
             log::info!("Platter stopped");
             self
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ticks a second an FLX4 jog reports when turned at 33 1/3 rpm.
+    const RECORD_SPEED_TICKS_PER_SEC: f64 = 400.;
+
+    /// Bend after turning the jog at record speed for `secs`.
+    fn turn_at_record_speed(tau_secs: f64, secs: f64) -> (NudgeVelocity, Instant, f64) {
+        let mut nudges = NudgeVelocity {
+            tau_secs,
+            ..NudgeVelocity::new(&InputProfile::jog_wheel(1., 1.))
+        };
+        let start = nudges.decayed_at;
+        let step = Duration::from_secs_f64(1. / RECORD_SPEED_TICKS_PER_SEC);
+        let ticks = (secs * RECORD_SPEED_TICKS_PER_SEC) as u32;
+        for i in 0..ticks {
+            nudges.push(1, start + step * i);
+        }
+        let end = start + step * ticks;
+        let bend = nudges.bend(end);
+        (nudges, end, bend)
+    }
+
+    /// A bend held at a steady speed settles at the same depth for any tau.
+    /// The shortfall is the sum sitting in the trough between two ticks, worth
+    /// `0.5 / tau` ticks a second.
+    #[test]
+    fn a_held_bend_ignores_the_release_tau() {
+        for tau in [0.02, 0.05, 0.2] {
+            let (_, _, bend) = turn_at_record_speed(tau, 1.);
+            assert!((bend - 0.10).abs() < 0.01, "tau {tau} held {bend}");
+        }
+    }
+
+    /// A flick shorter than tau reaches part of the depth, less of it the
+    /// longer tau is.
+    #[test]
+    fn a_flick_shorter_than_tau_bends_less() {
+        let (_, _, brief) = turn_at_record_speed(0.1, 0.03);
+        let (_, _, tight) = turn_at_record_speed(0.03, 0.03);
+        assert!(brief < 0.04, "slow tau flicked to {brief}");
+        assert!(tight > 0.06, "tight tau only flicked to {tight}");
+    }
+
+    #[test]
+    fn the_bend_falls_away_over_one_tau() {
+        let tau = 0.03;
+        let (mut nudges, end, held) = turn_at_record_speed(tau, 1.);
+        let after = |taus: f64| end + Duration::from_secs_f64(tau * taus);
+        assert!((nudges.bend(after(1.)) / held - 0.368).abs() < 0.01);
+        assert!(nudges.bend(after(3.)) / held < 0.06);
+    }
+
+    /// Forward and backward share one sum, so a reversal cancels within a few
+    /// ticks.
+    #[test]
+    fn a_reversal_cancels_the_bend() {
+        let (mut nudges, end, held) = turn_at_record_speed(0.03, 1.);
+        assert!(held > 0.);
+        for i in 0..12 {
+            nudges.push(-1, end + Duration::from_secs_f64(i as f64 / 400.));
+        }
+        assert!(nudges.bend(end) < held / 2., "reversal left {}", nudges.bend(end));
     }
 }

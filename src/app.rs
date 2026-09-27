@@ -58,7 +58,7 @@ pub struct Options<'a> {
     /// audio buffer in frames
     pub buffer_frames_n: u32,
     /// nudge / pitch bend responsiveness factor, applied to whichever input is in use
-    pub nudge_responsiveness: f32,
+    pub nudge_responsiveness: f64,
     /// whether this run uses the QR scanner
     pub qr: QrMode,
     /// localdeck config naming the card library, else `$LOCALDECK_CONFIG`

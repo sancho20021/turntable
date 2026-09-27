@@ -36,12 +36,6 @@ pub struct DeckEvent {
     pub timestamp: Instant,
 }
 
-#[derive(Debug)]
-pub enum Direction {
-    Forward,
-    Backward,
-}
-
 /// What one deck was told to do, independent of the device that said so.
 ///
 /// The scratch variants carry an absolute **input position** in *input units*,
@@ -58,8 +52,9 @@ pub enum DeckCommand {
     ScratchMove(i64),
     /// The user let go of the platter (mouse up / hand off the jog wheel).
     ScratchEnd,
-    // pitch nudge
-    Nudge(Direction),
+    /// Pitch bend: input units moved since the last report, signed, + being
+    /// forward.
+    Nudge(i16),
     StartStop,
     ResetPitch,
     PitchUp,
