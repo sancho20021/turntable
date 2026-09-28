@@ -79,6 +79,10 @@ enum Commands {
         #[arg(short, long, default_value_t = app::DEFAULT_BUFFER_FRAMES)]
         buffer: u32,
 
+        /// Start with a buffer below the safe minimum anyway
+        #[arg(long)]
+        force_buffer: bool,
+
         /// Scratch sensitivity factor, applied to whichever input is in use
         #[arg(short('t'), long, default_value_t = 1.)]
         sensitivity: f64,
@@ -196,6 +200,7 @@ fn main() {
             routing,
             device,
             buffer,
+            force_buffer,
             sensitivity,
             motor_inertia,
             nudge,
@@ -203,6 +208,16 @@ fn main() {
             no_qr,
             cards_config,
         } => {
+            if *buffer < app::MIN_SAFE_BUFFER_FRAMES && !*force_buffer {
+                eprintln!(
+                    "Buffer {buffer} is below the safe minimum of {}: the callback budget \
+                     gets too short to absorb scheduling jitter, so expect dropouts.\n\
+                     Pass --force-buffer to run it anyway.",
+                    app::MIN_SAFE_BUFFER_FRAMES
+                );
+                std::process::exit(1);
+            }
+
             log::info!("Starting Turntable: {:?}", args.command);
             start(app::Options {
                 input: *input,

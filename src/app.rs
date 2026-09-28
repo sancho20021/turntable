@@ -71,6 +71,9 @@ pub struct Options<'a> {
 /// spends a larger share of its budget on being woken up late.
 pub const DEFAULT_BUFFER_FRAMES: u32 = 512;
 
+/// Smallest buffer the command line takes without `--force-buffer`.
+pub const MIN_SAFE_BUFFER_FRAMES: u32 = 256;
+
 /// Which device drives the decks, once [`InputKind::Auto`] has been settled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum InputSource {
