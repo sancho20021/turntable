@@ -73,6 +73,8 @@ pub struct PlatterAudioProcessor {
     dc_blocker: StereoDcBlocker,
     /// this deck's health metrics
     health: Arc<DeckHealth>,
+    /// last frame put on the output, the frame a declick fades from
+    last_output: StereoFrame,
 }
 
 /// Hands the decoded track to the tray rather than freeing it here.
@@ -154,6 +156,7 @@ impl PlatterAudioProcessor {
             last_speed: 0., // one of sources of slow startup
             dc_blocker: StereoDcBlocker::new(DC_BLOCKER_HZ, SAMPLE_RATE),
             health,
+            last_output: StereoFrame::default(),
         };
         processor
     }
@@ -173,14 +176,6 @@ impl PlatterAudioProcessor {
         sample / SAMPLE_RATE as f64 * 1_000_000_000.
     }
 
-    /// The frame this deck last put out, read back off the record it came from.
-    fn last_emitted(&self) -> StereoFrame {
-        match (&self.cur_record, self.last_played) {
-            (Some(record), Some(played)) => record.get_sample(played.record_pos),
-            _ => StereoFrame::default(),
-        }
-    }
-
     /// Samples a declick fades over: [`DECLICK`], capped at the block.
     fn declick_frames(buffer_frames: usize) -> usize {
         let wanted = (DECLICK.as_secs_f64() * SAMPLE_RATE as f64) as usize;
@@ -193,13 +188,11 @@ impl PlatterAudioProcessor {
         let samples_n = frames.len() as i64;
 
         // Frame the block fades in from, once something has torn the stream.
-        // Read while the record it belongs to is still in hand, which for a swap
-        // means before the incoming one replaces it.
         let mut declick_from = None;
 
         let incoming = self.handles.next_record.pop().ok();
         if let Some(record) = incoming {
-            declick_from = Some(self.last_emitted());
+            declick_from = Some(self.last_output);
             self.set_record(record);
         }
 
@@ -214,7 +207,7 @@ impl PlatterAudioProcessor {
 
         let jumped = observed_played_nanos.0.abs() > JUMP_THRESHOLD.0;
         if jumped {
-            declick_from = declick_from.or_else(|| Some(self.last_emitted()));
+            declick_from = declick_from.or(Some(self.last_output));
         }
 
         let (playhead_start, target_playhead) = match self.last_played {
@@ -340,6 +333,21 @@ impl PlatterAudioProcessor {
             frames.fill(StereoFrame::default());
         }
 
+        // A paused deck holds one sample. The high-pass drains it from the
+        // output while going on holding it as its previous input, and the
+        // first sample here belongs to a different record, so the difference
+        // between the two is not movement. Left in, it is worth up to full
+        // scale on the output.
+        if declick_from.is_some()
+            && let Some(first) = frames.first()
+        {
+            self.dc_blocker.reseat(*first);
+        }
+
+        for frame in &mut *frames {
+            *frame = self.dc_blocker.advance(*frame);
+        }
+
         // A jump or a swap leaves the block starting on a sample unrelated to
         // the one the last block ended on, and a step edge is a click. Fading in
         // from that last frame turns the step into a slope
@@ -354,8 +362,8 @@ impl PlatterAudioProcessor {
             }
         }
 
-        for frame in frames {
-            *frame = self.dc_blocker.advance(*frame);
+        if let Some(last) = frames.last() {
+            self.last_output = *last;
         }
     }
 }
@@ -750,6 +758,67 @@ mod tests {
             bent.is_empty(),
             "a seek bends the speed - {}",
             bent.join(" | ")
+        );
+    }
+
+    /// Pausing parks the playhead on whatever sample it stopped on, and the
+    /// high-pass drains that offset from the output while its memory goes on
+    /// holding it. Loading then steps the offset the memory holds, and a
+    /// one-pole high-pass answers a step with the whole of it - a pop the size
+    /// of the sample the deck was paused on.
+    #[test]
+    fn loading_onto_a_parked_deck_stays_silent() {
+        let (mut platter, readable) = new_platter();
+        let (mut records_in, next_record) = rtrb::RingBuffer::new(2);
+        let (used_records, _used) = rtrb::RingBuffer::new(3);
+
+        let mut processor = PlatterAudioProcessor::new(AudioProcessorHandles {
+            next_record,
+            used_records,
+            platter: readable,
+            health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
+        });
+        records_in.push(Arc::new(tone(20., TONE_HZ, TONE_PEAK))).unwrap();
+
+        let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
+        let mut frames = vec![StereoFrame::default(); FRAMES];
+        let mut clock = 0u64;
+        for _ in 0..400 {
+            clock += block_nanos;
+            platter.update_playhead(INanos(clock as i64), UNanos(clock));
+            processor.write_frames(&mut frames);
+        }
+
+        // Park a quarter of a cycle in, where the tone is at its peak: the
+        // offset left behind is the whole of TONE_PEAK.
+        let period_nanos = (1e9 / TONE_HZ) as i64;
+        let parked_at =
+            INanos(clock as i64 / period_nanos * period_nanos + period_nanos / 4);
+        let drain_blocks =
+            (1.0 / PlatterAudioProcessor::frames_to_dur(FRAMES).as_secs_f64()).ceil() as u64;
+        for _ in 0..drain_blocks {
+            clock += block_nanos;
+            platter.update_playhead(parked_at, UNanos(clock));
+            processor.write_frames(&mut frames);
+        }
+        let parked_peak = frames.iter().map(|f| f.l.abs()).fold(0., f32::max);
+        assert!(parked_peak < 1e-6, "the deck is not parked: {parked_peak}");
+
+        // What the tray does: the record onto the ring, the playhead to zero.
+        // The incoming track opens in silence, as a mastered track does, so
+        // every sample from here belongs to the deck.
+        records_in.push(Arc::new(tone(5., TONE_HZ, 0.))).unwrap();
+        let mut worst = 0f32;
+        for _ in 0..drain_blocks {
+            clock += block_nanos;
+            platter.update_playhead(INanos(0), UNanos(clock));
+            processor.write_frames(&mut frames);
+            worst = frames.iter().map(|f| f.l.abs()).fold(worst, f32::max);
+        }
+
+        assert!(
+            worst < 1e-6,
+            "loading onto a deck parked on {TONE_PEAK} popped {worst:.4}"
         );
     }
 

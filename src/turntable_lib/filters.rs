@@ -87,6 +87,22 @@ impl DcBlocker {
         1. / (std::f64::consts::TAU * corner_hz)
     }
 
+    /// Sets the previous input to `input`, so the next difference the filter
+    /// takes is zero and the output carries on from where it was.
+    ///
+    /// The difference across a record swap or a seek is taken between two
+    /// unrelated records, and a difference between records is not movement.
+    ///
+    /// A bypassed blocker keeps its own memory: it passes samples through by
+    /// cancelling each subtracted sample against the next one added, which
+    /// holds only while the two match.
+    pub fn reseat(&mut self, input: f64) {
+        if self.r == 1. {
+            return;
+        }
+        self.last_input = input;
+    }
+
     #[inline]
     pub fn advance(&mut self, input: f64) -> f64 {
         // f64 state throughout: the pole sits within 2e-3 of the unit circle, so
@@ -118,6 +134,11 @@ impl StereoDcBlocker {
             l: DcBlocker::bypass(),
             r: DcBlocker::bypass(),
         }
+    }
+
+    pub fn reseat(&mut self, frame: StereoFrame) {
+        self.l.reseat(frame.l as f64);
+        self.r.reseat(frame.r as f64);
     }
 
     #[inline]
