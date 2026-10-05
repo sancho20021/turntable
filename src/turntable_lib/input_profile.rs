@@ -30,7 +30,7 @@ const TOUCHPAD_FLICK_DETENTS_PER_SEC: f64 = 20.;
 const TOUCHPAD_BEND_AT_FLICK: f64 = 0.04;
 
 /// Pitch bend from turning the jog at 33 1/3 rpm, at `nudge = 1.0`.
-const JOG_BEND_AT_RECORD_SPEED: f64 = 0.10;
+const JOG_BEND_AT_RECORD_SPEED: f64 = 0.4;
 
 /// Tuning constants of one scratch input device.
 ///
