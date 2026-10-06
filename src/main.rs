@@ -32,11 +32,7 @@ pub enum InputKind {
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
 struct Cli {
     /// Path to log file
-    #[arg(
-        long,
-        global = true,
-        default_value = "/home/sancho20021/spw/localdeck/turntable.log"
-    )]
+    #[arg(long, global = true, default_value_os_t = std::env::temp_dir().join("turntable.log"))]
     log_file: PathBuf,
 
     #[command(subcommand)]
