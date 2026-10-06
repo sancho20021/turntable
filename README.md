@@ -2,15 +2,21 @@
 
 ## building
 
-`sdl2` is built from C source and is only needed for the touchpad input, so a
-machine without a C toolchain builds without it:
+Install the required system dependencies:
 
-```
-cargo build --no-default-features
+```bash
+sudo apt install -y \
+    libpipewire-0.3-dev \
+    libclang-dev \
+    libudev-dev \
+    libasound2-dev
 ```
 
-Such a build drives the decks from the MIDI controller only; `-I touchpad` is
-not offered, and `-I auto` fails when no controller is connected.
+`sdl2` for working with touchpad is built with default features. To disable:
+```
+cargo install --path . --no-default-features
+```
+
 
 ## useful commands
 
