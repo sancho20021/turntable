@@ -285,48 +285,39 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
 
     match tray {
         TrayState::Empty => (
-            "·  empty        scan a card, or drop a track onto this window".to_string(),
+            "·  empty      scan a card, or drop a track onto this window".to_string(),
             Style::default().fg(CHROME),
         ),
 
-        TrayState::Preparing {
-            track,
-            since,
-            queued,
-        } => {
+        TrayState::Preparing { since, queued, .. } => {
             let elapsed = since.elapsed();
             let next = match &queued {
-                Some(next) => format!("   then {}", track_label(next)),
-                None => String::new(),
+                Some(_) => "   +1 queued",
+                None => "",
             };
             (
                 format!(
-                    "{}  preparing    {:<44} {:>6}{next}",
+                    "{}  preparing  {:.1}s{next}",
                     spinner(elapsed),
-                    track_label(&track),
-                    format!("{:.1}s", elapsed.as_secs_f64()),
+                    elapsed.as_secs_f64(),
                 ),
                 Style::default().fg(CAUTION),
             )
         }
 
-        TrayState::Ready { info } => {
+        TrayState::Ready { .. } => {
             let hint = match active_deck_idx {
                 Some(idx) => format!("Enter → load on Deck {}", idx + 1),
                 None => "press LOAD on a deck".to_string(),
             };
             (
-                format!(
-                    "●  ready        {:<44} {}   {hint}",
-                    track_label(&info.track),
-                    format_nanos(INanos(info.duration.0 as i64)),
-                ),
+                format!("●  ready      {hint}"),
                 Style::default().fg(LIT).add_modifier(Modifier::BOLD),
             )
         }
 
-        TrayState::Failed { track, error } => (
-            format!("✗  failed       {:<44} {error}", file_name(&track.path)),
+        TrayState::Failed { error, .. } => (
+            format!("✗  failed     {error}"),
             Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
         ),
     }
@@ -430,15 +421,14 @@ fn render_tui<const DECKS: usize>(
     health: &AudioHealth,
     card_reader: Option<&CardReaderView>,
 ) {
-    // 1. Split layout vertically into deck table, waveforms, audio health,
-    //    record tray and status bar
+    // 1. Split layout vertically into deck table, waveforms, the tray and
+    //    health row, and the status bar
     //
     // The table has a natural size and the waveforms use every row they are
     // given, so the waveforms are the panel that absorbs the leftover height.
     let mut panels = vec![
         Constraint::Length(DECK_TABLE_ROWS + DECKS as u16),
         Constraint::Min(2 + DECKS as u16 * DIAL_ROWS),
-        Constraint::Length(3),
         Constraint::Length(3),
     ];
     if card_reader.is_some() {
@@ -543,22 +533,27 @@ fn render_tui<const DECKS: usize>(
     // 2. Where each deck is in its track, and what is coming
     render_waveforms(frame, chunks[1], deck_states, platters);
 
-    // 3. Is the engine actually delivering the audio it computed
-    let (health_text, health_style) = health_line(health);
-    let health_widget = Paragraph::new(health_text)
-        .style(health_style)
-        .block(panel(" Audio Health "));
-    frame.render_widget(health_widget, chunks[2]);
+    // 3. What is waiting to be loaded, and whether the engine is actually
+    //    delivering the audio it computed
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+        .split(chunks[2]);
 
-    // 4. What is waiting to be loaded
     let (tray_text, tray_style) = tray_line(tray, active_deck_idx);
     let tray_widget = Paragraph::new(tray_text)
         .style(tray_style)
         .block(panel(" Record Tray "));
-    frame.render_widget(tray_widget, chunks[3]);
+    frame.render_widget(tray_widget, row[0]);
 
-    // 5. Whether cards can be scanned at all, when this run asked for them
-    let mut next = 4;
+    let (health_text, health_style) = health_line(health);
+    let health_widget = Paragraph::new(health_text)
+        .style(health_style)
+        .block(panel(" Audio Health "));
+    frame.render_widget(health_widget, row[1]);
+
+    // 4. Whether cards can be scanned at all, when this run asked for them
+    let mut next = 3;
     if let Some(reader) = card_reader {
         let (scanner_text, scanner_style) = scanner_line(reader);
         let scanner_widget = Paragraph::new(scanner_text)
@@ -568,7 +563,7 @@ fn render_tui<const DECKS: usize>(
         next += 1;
     }
 
-    // 6. Anything that went wrong, for as long as it is worth reading
+    // 5. Anything that went wrong, for as long as it is worth reading
     let (title, message, style) = match notice {
         Some(Notice {
             message,
