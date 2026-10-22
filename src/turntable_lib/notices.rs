@@ -1,8 +1,9 @@
-//! Passing warnings for the TUI.
+//! Warnings for the TUI, and the conditions that outlast them.
 //!
-//! Carries only what is not a state: an action that was refused, a problem that
-//! has already happened. Anything with a lasting state has a panel of its own,
-//! and a notice fades once it has been read.
+//! A notice is a moment - an action refused, a problem that has happened - and
+//! fades once it has been read. A standing notice is a condition that is still
+//! true, such as a dead scanner, and holds the panel whenever no fresh notice
+//! covers it.
 
 use std::{
     sync::{Arc, RwLock},
@@ -27,16 +28,19 @@ pub struct Notice {
     pub level: Level,
 }
 
-/// Holds at most one notice: whichever happened last is the one worth showing.
+/// Holds one notice of each kind: whichever happened last, and whatever is
+/// still wrong.
 #[derive(Clone)]
 pub struct Notices {
     latest: Arc<RwLock<Option<(Notice, Instant)>>>,
+    standing: Arc<RwLock<Option<Notice>>>,
 }
 
 impl Notices {
     pub fn new() -> Self {
         Self {
             latest: Arc::new(RwLock::new(None)),
+            standing: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -46,6 +50,21 @@ impl Notices {
 
     pub fn error(&self, message: impl Into<String>) {
         self.raise(Level::Error, message);
+    }
+
+    /// Something that stays broken, shown for the rest of the run.
+    pub fn standing(&self, message: impl Into<String>) {
+        let notice = Notice {
+            message: message.into(),
+            level: Level::Error,
+        };
+
+        match self.standing.write() {
+            Ok(mut standing) => *standing = Some(notice),
+            Err(_) => {
+                log::error!("cannot raise a standing notice, lock poisoned (tui may be dead)")
+            }
+        }
     }
 
     fn raise(&self, level: Level, message: impl Into<String>) {
@@ -60,7 +79,7 @@ impl Notices {
         }
     }
 
-    /// What to show, if anything.
+    /// What to show, if anything. A fresh notice covers a standing one.
     pub fn current(&self) -> Option<Notice> {
         let Ok(latest) = self.latest.read() else {
             return Some(Notice {
@@ -73,6 +92,12 @@ impl Notices {
             .as_ref()
             .filter(|(_, raised)| raised.elapsed() < LIFETIME)
             .map(|(notice, _)| notice.clone())
+            .or_else(|| {
+                self.standing
+                    .read()
+                    .ok()
+                    .and_then(|standing| standing.clone())
+            })
     }
 }
 
@@ -110,5 +135,43 @@ mod tests {
         }
 
         assert!(notices.current().is_none());
+    }
+
+    #[test]
+    fn a_standing_notice_is_shown_when_nothing_else_is() {
+        let notices = Notices::new();
+        notices.standing("QR scanner disconnected");
+
+        let current = notices.current().expect("the condition is still true");
+        assert_eq!(current.message, "QR scanner disconnected");
+        assert_eq!(current.level, Level::Error);
+    }
+
+    /// The condition is still true once the notice covering it has gone, so it
+    /// has to come back.
+    #[test]
+    fn a_fresh_notice_covers_a_standing_one_until_it_expires() {
+        let notices = Notices::new();
+        notices.standing("QR scanner disconnected");
+        notices.warn("Could not read that card, scan it again");
+
+        assert_eq!(
+            notices.current().expect("the warning is fresh").message,
+            "Could not read that card, scan it again"
+        );
+
+        if let Ok(mut latest) = notices.latest.write() {
+            if let Some((_, raised)) = latest.as_mut() {
+                *raised = Instant::now() - LIFETIME - Duration::from_secs(1);
+            }
+        }
+
+        assert_eq!(
+            notices
+                .current()
+                .expect("the condition is still true")
+                .message,
+            "QR scanner disconnected"
+        );
     }
 }

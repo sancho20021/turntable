@@ -31,7 +31,6 @@ use percent_encoding::percent_decode_str;
 
 use crate::{
     audio_health::{AudioHealth, HealthLevel},
-    card_reader::{CardReaderView, Outcome, Staged},
     deck_controller::DeckState,
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
@@ -100,7 +99,6 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     tray_state: Arc<RwLock<TrayState>>,
     notices: Notices,
     health: Arc<AudioHealth>,
-    card_reader: Option<CardReaderView>,
     events: Sender<InputEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
@@ -136,7 +134,6 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                         tray,
                         notice,
                         &health,
-                        card_reader.as_ref(),
                     );
                 })
                 .expect("Failed to draw TUI frame");
@@ -236,20 +233,6 @@ fn parse_dropped_path(paste: &str) -> Option<String> {
     };
 
     (!path.is_empty()).then_some(path)
-}
-
-/// Enough of a card id to tell two apart, which is all anyone does with one.
-/// They are 64 hex characters, and the reason beside them is the part worth
-/// reading.
-fn short_card(payload: &str) -> String {
-    const SHOWN: usize = 12;
-
-    if payload.chars().count() <= SHOWN {
-        return payload.to_string();
-    }
-
-    let head: String = payload.chars().take(SHOWN).collect();
-    format!("{head}…")
 }
 
 /// Just the file name, so a long path does not eat the whole row.
@@ -419,24 +402,20 @@ fn render_tui<const DECKS: usize>(
     tray: Option<TrayState>,
     notice: Option<Notice>,
     health: &AudioHealth,
-    card_reader: Option<&CardReaderView>,
 ) {
     // 1. Split layout vertically into deck table, waveforms, the tray and
     //    health row, and the status bar
     //
     // The table has a natural size and the waveforms use every row they are
     // given, so the waveforms are the panel that absorbs the leftover height.
-    let mut panels = vec![
+    let panels = [
         Constraint::Length(DECK_TABLE_ROWS + DECKS as u16),
         Constraint::Min(2 + DECKS as u16 * DIAL_ROWS),
         Constraint::Length(3),
+        // Kept even with nothing to report, so a warning arriving mid-set does
+        // not shift every panel above it.
+        Constraint::Length(3),
     ];
-    if card_reader.is_some() {
-        panels.push(Constraint::Length(3));
-    }
-    // Kept even with nothing to report, so a warning arriving mid-set does not
-    // shift every panel above it.
-    panels.push(Constraint::Length(3));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -552,18 +531,7 @@ fn render_tui<const DECKS: usize>(
         .block(panel(" Audio Health "));
     frame.render_widget(health_widget, row[1]);
 
-    // 4. Whether cards can be scanned at all, when this run asked for them
-    let mut next = 3;
-    if let Some(reader) = card_reader {
-        let (scanner_text, scanner_style) = scanner_line(reader);
-        let scanner_widget = Paragraph::new(scanner_text)
-            .style(scanner_style)
-            .block(panel(" QR Scanner "));
-        frame.render_widget(scanner_widget, chunks[next]);
-        next += 1;
-    }
-
-    // 5. Anything that went wrong, for as long as it is worth reading
+    // 4. Anything that went wrong, for as long as it is worth reading
     let (title, message, style) = match notice {
         Some(Notice {
             message,
@@ -583,73 +551,14 @@ fn render_tui<const DECKS: usize>(
     };
 
     let notice_widget = Paragraph::new(message).style(style).block(panel(title));
-    frame.render_widget(notice_widget, chunks[next]);
-}
-
-/// A health light for the gun, and nothing else.
-fn scanner_line(reader: &CardReaderView) -> (String, Style) {
-    let ready = || ("●  ready".to_string(), Style::default().fg(DIM));
-    let problem = Style::default().fg(ALARM).add_modifier(Modifier::BOLD);
-
-    match reader.staged() {
-        // A gun that has read nothing and a gun whose last card reached the tray
-        // look the same on purpose: working, with nothing here to act on.
-        Staged::Empty => ready(),
-
-        Staged::Card(card) => match &card.outcome {
-            Outcome::SentToTray => ready(),
-
-            Outcome::Resolving => (
-                format!("●  looking up   {}", short_card(&card.payload)),
-                Style::default().fg(CAUTION),
-            ),
-
-            Outcome::Unknown => (
-                format!(
-                    "✗  unknown card  {}   not in the library",
-                    short_card(&card.payload)
-                ),
-                problem,
-            ),
-
-            Outcome::Failed(reason) => (
-                format!("✗  {}   {reason}", short_card(&card.payload)),
-                problem,
-            ),
-        },
-
-        Staged::Unavailable(fault) => (format!("✗  {fault}"), problem),
-    }
+    frame.render_widget(notice_widget, chunks[3]);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path, short_card, track_label};
+    use super::{format_duration, parse_dropped_path, track_label};
     use crate::record::{TrackMeta, TrackRef};
     use std::time::Duration;
-
-    /// A real card id, which has to leave room for the reason beside it.
-    #[test]
-    fn a_long_card_id_is_cut_short() {
-        let shortened =
-            short_card("003778873f9d0ca7c5c1a9519dafdd6eadec051f26aa0f7ab83e17eeba3032a4");
-
-        assert_eq!(shortened, "003778873f9d…");
-        assert!(shortened.chars().count() < 20, "{shortened} is still long");
-    }
-
-    /// Newer cards carry a bare track id, which is short enough to read whole.
-    #[test]
-    fn a_short_card_id_is_left_alone() {
-        assert_eq!(short_card("1701"), "1701");
-    }
-
-    /// Anything with a QR code on it can reach the gun, and a stray payload must
-    /// not be cut mid-character.
-    #[test]
-    fn a_multibyte_payload_is_cut_on_a_character() {
-        assert_eq!(short_card("ααααααααααααααα"), "αααααααααααα…");
-    }
 
     #[test]
     fn a_track_from_the_library_is_named_by_its_artist_and_title() {

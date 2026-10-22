@@ -40,8 +40,8 @@ pub struct ScannedCard {
 /// How far a scanned card got towards being playable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The lookup is running. Published before it starts, since it reads the
-    /// library off USB and can take seconds if the drive has spun down.
+    /// The lookup is running. Published before it starts, so the gun re-reading
+    /// the same card meanwhile is discarded.
     Resolving,
     /// Handed to the tray. What happens to it from there is the tray's to report.
     SentToTray,
@@ -95,27 +95,8 @@ pub enum Staged {
 
 /// Owns the gun and the thread draining it.
 pub struct CardReader {
-    staged: Arc<RwLock<Staged>>,
     scanner: QrScanner,
     staging: JoinHandle<()>,
-}
-
-/// Read access for the threads that display or consume scans, separate from the
-/// handle that owns the gun's lifetime.
-#[derive(Clone)]
-pub struct CardReaderView {
-    staged: Arc<RwLock<Staged>>,
-}
-
-impl CardReaderView {
-    pub fn staged(&self) -> Staged {
-        match self.staged.read() {
-            Ok(staged) => staged.clone(),
-            Err(_) => Staged::Unavailable(ScannerFault::Faulted(
-                "card reader lock poisoned, its thread may be dead".to_string(),
-            )),
-        }
-    }
 }
 
 /// Opens the gun and starts draining it.
@@ -131,25 +112,14 @@ pub fn start(
     let (events, scanner) = start_qr_scanner()?;
     let staged = Arc::new(RwLock::new(Staged::Empty));
 
-    let staging = {
-        let staged = Arc::clone(&staged);
-        std::thread::spawn(move || stage_scans(events, staged, shutdown, resolver, tracks, notices))
-    };
+    let staging = std::thread::spawn(move || {
+        stage_scans(events, staged, shutdown, resolver, tracks, notices)
+    });
 
-    Ok(CardReader {
-        staged,
-        scanner,
-        staging,
-    })
+    Ok(CardReader { scanner, staging })
 }
 
 impl CardReader {
-    pub fn view(&self) -> CardReaderView {
-        CardReaderView {
-            staged: Arc::clone(&self.staged),
-        }
-    }
-
     /// Closes the port and joins both threads. Takes up to a second, which is
     /// how long the gun's read timeout can hold its thread.
     pub fn stop(self) {
@@ -226,16 +196,19 @@ fn stage_scan(
         }),
     );
 
-    // Reads the library off the USB drive, so it takes seconds if the drive has
-    // spun down.
     let outcome = match resolver.resolve(&extract_cardid(&payload)) {
-        Ok(track) => send_to_tray(tracks, track),
+        Ok(track) => send_to_tray(tracks, notices, track),
         Err(ResolveError::Unknown) => {
             log::warn!("card not in the library: {payload}");
+            notices.warn(format!(
+                "Card {} is not in the library",
+                short_card(&payload)
+            ));
             Outcome::Unknown
         }
         Err(ResolveError::Failed(reason)) => {
             log::error!("cannot play card {payload}: {reason}");
+            notices.error(format!("Card {}: {reason}", short_card(&payload)));
             Outcome::Failed(reason)
         }
     };
@@ -263,13 +236,14 @@ fn already_handled(staged: &RwLock<Staged>, payload: &str) -> bool {
     }
 }
 
-fn send_to_tray(tracks: &Sender<InputEvent>, track: TrackRef) -> Outcome {
+fn send_to_tray(tracks: &Sender<InputEvent>, notices: &Notices, track: TrackRef) -> Outcome {
     log::info!("card resolved to {}", track.path);
 
     match tracks.try_send(InputEvent::App(AppEvent::PrepareRecord(track))) {
         Ok(()) => Outcome::SentToTray,
         Err(e) => {
             log::error!("cannot reach the record tray: {e}");
+            notices.error(format!("Cannot reach the record tray: {e}"));
             Outcome::Failed(format!("cannot reach the record tray: {e}"))
         }
     }
@@ -284,12 +258,12 @@ fn forget_the_card(staged: &RwLock<Staged>, notices: &Notices, why: &str) {
     publish(staged, Staged::Empty);
 }
 
-/// A dead gun is worth saying twice: the panel carries it for as long as it is
-/// true, and the notice catches the eye at the moment it happens.
+/// The gun does not come back within a run - the staging loop ends on a fault -
+/// so the notice stands for the rest of the session.
 fn raise(staged: &RwLock<Staged>, notices: &Notices, fault: ScannerFault) {
     log::error!("qr scanner unusable: {fault}");
 
-    notices.error(match &fault {
+    notices.standing(match &fault {
         ScannerFault::Disconnected(reason) => format!("QR scanner disconnected: {reason}"),
         ScannerFault::Faulted(reason) => format!("QR scanner stopped working: {reason}"),
     });
@@ -317,6 +291,20 @@ fn fault_of(stopped: ScannerStopped) -> ScannerFault {
         | ErrorKind::UnexpectedEof => ScannerFault::Disconnected(message),
         _ => ScannerFault::Faulted(message),
     }
+}
+
+/// Enough of a card id to tell two apart, which is all anyone does with one.
+/// They are 64 hex characters, and the reason beside them is the part worth
+/// reading.
+fn short_card(payload: &str) -> String {
+    const SHOWN: usize = 12;
+
+    if payload.chars().count() <= SHOWN {
+        return payload.to_string();
+    }
+
+    let head: String = payload.chars().take(SHOWN).collect();
+    format!("{head}…")
 }
 
 #[cfg(test)]
@@ -395,7 +383,7 @@ mod tests {
         }
 
         Run {
-            staged: CardReaderView { staged }.staged(),
+            staged: staged.read().expect("staged lock").clone(),
             prepared: prepared.try_iter().count(),
             lookups: library.lookups,
         }
@@ -567,5 +555,28 @@ mod tests {
             fault_of(scanner_stopped(ErrorKind::PermissionDenied)),
             ScannerFault::Faulted(_)
         ));
+    }
+
+    /// A real card id, which has to leave room for the reason beside it.
+    #[test]
+    fn a_long_card_id_is_cut_short() {
+        let shortened =
+            short_card("003778873f9d0ca7c5c1a9519dafdd6eadec051f26aa0f7ab83e17eeba3032a4");
+
+        assert_eq!(shortened, "003778873f9d…");
+        assert!(shortened.chars().count() < 20, "{shortened} is still long");
+    }
+
+    /// Newer cards carry a bare track id, which is short enough to read whole.
+    #[test]
+    fn a_short_card_id_is_left_alone() {
+        assert_eq!(short_card("1701"), "1701");
+    }
+
+    /// Anything with a QR code on it can reach the gun, and a stray payload must
+    /// not be cut mid-character.
+    #[test]
+    fn a_multibyte_payload_is_cut_on_a_character() {
+        assert_eq!(short_card("ααααααααααααααα"), "αααααααααααα…");
     }
 }

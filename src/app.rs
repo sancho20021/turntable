@@ -305,7 +305,6 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&tray_state),
         notices.clone(),
         health,
-        card_reader.as_ref().map(CardReader::view),
         events_snd.clone(),
         Arc::clone(&shutdown),
     );
