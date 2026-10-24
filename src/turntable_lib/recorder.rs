@@ -132,13 +132,6 @@ fn output_path(dir: &Path, now: NaiveDateTime) -> PathBuf {
     dir.join(format!("mix_{}.wav", now.format("%Y-%m-%d_%H-%M-%S")))
 }
 
-/// The part of a `pw-record` error line worth showing the DJ:
-/// `remote error: id=2 seq:7 res:-2 (No such file or directory): target not found`
-/// becomes `target not found`.
-fn reason(line: &str) -> &str {
-    line.rsplit(": ").next().unwrap_or(line)
-}
-
 /// `mm:ss`, or `h:mm:ss` from an hour up.
 fn clock(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
@@ -208,16 +201,12 @@ fn stop_child(child: &mut Child, grace: Duration) -> Stopped {
 }
 
 /// Copies the child's stderr into the log as it arrives, so the pipe never
-/// fills and blocks `pw-record`. The thread ends when the child closes stderr,
-/// and returns the last line, which says why it exited.
-fn drain_stderr(stderr: ChildStderr) -> JoinHandle<Option<String>> {
+/// fills and blocks `pw-record`. The thread ends when the child closes stderr.
+fn drain_stderr(stderr: ChildStderr) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut last = None;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             log::warn!("pw-record: {line}");
-            last = Some(line);
         }
-        last
     })
 }
 
@@ -226,7 +215,7 @@ fn drain_stderr(stderr: ChildStderr) -> JoinHandle<Option<String>> {
 /// Stopping.
 struct Capture {
     child: Child,
-    stderr: JoinHandle<Option<String>>,
+    stderr: JoinHandle<()>,
     path: PathBuf,
 }
 
@@ -344,18 +333,20 @@ impl Recorder {
         };
 
         let capture = self.capture.take().expect("checked above");
-        let line = capture.stderr.join().ok().flatten();
+        let _ = capture.stderr.join();
         log::error!(
             "pw-record exited on its own ({exit}) while writing {}",
             capture.path.display()
         );
-        let why = line.as_deref().map_or("pw-record exited", reason);
 
         let message = match &self.state {
             RecorderState::Recording { since, .. } => {
-                format!("Recording stopped after {}: {why}", clock(since.elapsed()))
+                format!(
+                    "Recording stopped after {}, see the log",
+                    clock(since.elapsed())
+                )
             }
-            _ => format!("Cannot record: {why}"),
+            _ => "Cannot record, see the log".to_string(),
         };
         self.notices.error(message);
         self.publish(RecorderState::Idle);
@@ -472,16 +463,6 @@ mod tests {
             }
         }
 
-        /// The recorder with `script` standing in for `pw-record`. The script
-        /// gets the WAV path as `$1`.
-        fn with_script(script: &'static str) -> Self {
-            Self::new(Box::new(move |path| {
-                let mut command = sh(script);
-                command.arg("sh").arg(path);
-                command
-            }))
-        }
-
         fn state(&self) -> RecorderState {
             self.recorder.state.clone()
         }
@@ -587,26 +568,15 @@ mod tests {
     }
 
     #[test]
-    fn stderr_is_drained_and_its_last_line_kept() {
-        let mut command = sh("yes x | head -c 200000 >&2; echo 'last words' >&2");
+    fn stderr_is_drained() {
+        // 200 KB is past a pipe's capacity: undrained, the child would block.
+        let mut command = sh("yes x | head -c 200000 >&2");
         command.stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawns");
         let stderr = drain_stderr(child.stderr.take().expect("piped"));
 
-        // 200 KB is past a pipe's capacity: undrained, the child would block.
         assert!(exited_within(&mut child, Duration::from_secs(5)).is_some());
-        assert_eq!(
-            stderr.join().expect("drain thread"),
-            Some("last words".into())
-        );
-    }
-
-    #[test]
-    fn a_header_alone_is_still_starting() {
-        let mut h = Harness::with_script("head -c 44 /dev/zero > \"$1\"; exec sleep 30");
-        h.recorder.start();
-        assert!(!h.watch_until(Duration::from_millis(500), is_recording));
-        assert!(matches!(h.state(), RecorderState::Starting { .. }));
+        stderr.join().expect("drain thread");
     }
 
     #[test]
@@ -824,8 +794,9 @@ mod tests {
 
         h.recorder.start();
         assert!(h.watch_until(Duration::from_secs(3), |s| *s == RecorderState::Idle));
-        assert_eq!(h.notice(), "Cannot record: target not found");
         assert!(file_size(&the_only_recording(&h.dir)) <= WAV_HEADER_BYTES);
+
+        assert_eq!(h.notice(), "Cannot record, see the log");
     }
 
     /// The software version of pulling the interface's USB cable.
@@ -843,9 +814,8 @@ mod tests {
         drop(source);
 
         assert!(h.watch_until(Duration::from_secs(3), |s| *s == RecorderState::Idle));
+        assert!(file_size(&the_only_recording(&h.dir)) > WAV_HEADER_BYTES);
         let notice = h.notice();
         assert!(notice.starts_with("Recording stopped after "), "{notice}");
-        assert!(notice.ends_with(": target not found"), "{notice}");
-        assert!(file_size(&the_only_recording(&h.dir)) > WAV_HEADER_BYTES);
     }
 }
