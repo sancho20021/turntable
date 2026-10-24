@@ -1,5 +1,8 @@
 # turntable
 
+Runs on Linux only. It plays through PipeWire when PipeWire is running and
+through ALSA otherwise; recording needs PipeWire.
+
 ## building
 
 Install the required system dependencies:

@@ -146,7 +146,6 @@ fn per_run_log_path() -> PathBuf {
 }
 
 /// Points `turntable.log` in the temp dir at this run's log.
-#[cfg(unix)]
 fn link_latest_log(log_path: &std::path::Path) {
     let link = std::env::temp_dir().join("turntable.log");
     let _ = std::fs::remove_file(&link);
@@ -181,7 +180,6 @@ fn main() {
 
     info!("Initialized logging to {log_path:?}");
 
-    #[cfg(unix)]
     if args.log_file.is_none() {
         link_latest_log(&log_path);
     }

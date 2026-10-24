@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("turntable runs on Linux only");
+
 pub mod audio_health;
 pub mod card_library;
 pub mod card_reader;
@@ -14,7 +17,6 @@ pub mod platter_audio_processor;
 pub mod platter_driver;
 pub mod ratatui;
 pub mod record;
-#[cfg(target_os = "linux")]
 pub mod recorder;
 pub mod samples_poller;
 #[cfg(feature = "sdl")]
