@@ -31,9 +31,10 @@ pub enum InputKind {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Turntable Scratch Engine CLI", long_about = None)]
 struct Cli {
-    /// Path to log file
-    #[arg(long, global = true, default_value_os_t = std::env::temp_dir().join("turntable.log"))]
-    log_file: PathBuf,
+    /// Path to log file. Defaults to a new file per run in the temp dir, with
+    /// turntable.log there pointing at the latest one
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -138,10 +139,30 @@ fn install_panic_logger() {
 /// says nothing about whether the track plays.
 const DEFAULT_LOG_FILTER: &str = "info,symphonia=error";
 
+/// A fresh path per run, so restarting after a crash keeps the crash's log.
+fn per_run_log_path() -> PathBuf {
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    std::env::temp_dir().join(format!("turntable-{stamp}.log"))
+}
+
+/// Points `turntable.log` in the temp dir at this run's log.
+#[cfg(unix)]
+fn link_latest_log(log_path: &std::path::Path) {
+    let link = std::env::temp_dir().join("turntable.log");
+    let _ = std::fs::remove_file(&link);
+
+    let target = log_path.file_name().unwrap_or(log_path.as_os_str());
+    if let Err(e) = std::os::unix::fs::symlink(target, &link) {
+        log::warn!("Cannot point {link:?} at this run's log: {e}");
+    }
+}
+
 fn main() {
     let args = Cli::parse();
 
-    if let Some(parent) = args.log_file.parent() {
+    let log_path = args.log_file.clone().unwrap_or_else(per_run_log_path);
+
+    if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
@@ -149,8 +170,8 @@ fn main() {
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&args.log_file)
-        .unwrap_or_else(|err| panic!("Failed to open log file at {:?}: {}", args.log_file, err));
+        .open(&log_path)
+        .unwrap_or_else(|err| panic!("Failed to open log file at {log_path:?}: {err}"));
 
     env_logger::Builder::from_env(Env::default().default_filter_or(DEFAULT_LOG_FILTER))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
@@ -158,7 +179,12 @@ fn main() {
 
     install_panic_logger();
 
-    info!("Initialized logging to {:?}", args.log_file);
+    info!("Initialized logging to {log_path:?}");
+
+    #[cfg(unix)]
+    if args.log_file.is_none() {
+        link_latest_log(&log_path);
+    }
 
     match &args.command {
         Commands::ListMidi => match turntable_lib::midi::list_ports() {
