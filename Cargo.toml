@@ -21,7 +21,7 @@ symphonium = { version = "0.12", features = ["mp3", "flac", "aac", "isomp4"] }
 # symphonia = { version = "0.6", features = ["wav", "isomp4", "mp3", "aac", "flac"] }
 atomic_float = "1.1"
 sdl2 = { version = "0.38", features = ["bundled"], optional = true }
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 crossbeam = "0.8"
 rtrb = "0.3"
 log = "0.4"
@@ -31,6 +31,7 @@ env_logger = "0.11"
 localdeck-qr-scanner = { path = "../localdeck/crates/qr-scanner" }
 localdeck-storage = { path = "../localdeck/crates/storage" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 toml = "0.7"
 
 midir = "0.11"

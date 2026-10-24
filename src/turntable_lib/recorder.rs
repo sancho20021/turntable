@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use chrono::NaiveDateTime;
 use crossbeam::channel::{Receiver, RecvTimeoutError};
 use rustix::{
@@ -43,16 +44,17 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 
 const TICK: Duration = Duration::from_millis(100);
 
+#[derive(Debug, Clone)]
 pub struct RecorderConfig {
     /// exact PipeWire node name of the capture source
-    pub target: String,
-    /// where the WAVs go, created if missing
+    pub source: String,
+    /// existing folder the WAVs go into, never created
     pub dir: PathBuf,
 }
 
 pub enum RecorderCommand {
-    Start,
-    Stop,
+    /// Start recording, or stop the recording in progress.
+    Toggle,
 }
 
 /// Published for the TUI.
@@ -85,15 +87,88 @@ pub fn start(
     notices: Notices,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    let target = config.target;
     let recorder = Recorder::new(
         config.dir,
-        Box::new(move |path| pw_record(&target, path)),
+        pw_record_for(config.source),
         state,
         notices,
         STOP_GRACE,
     );
     std::thread::spawn(move || recorder.run(commands, shutdown))
+}
+
+/// What a recording is taken from. A sink is recorded through its monitor,
+/// which carries what it is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Source,
+    Sink,
+}
+
+/// A PipeWire node `pw-record` can record from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordableNode {
+    pub name: String,
+    pub description: String,
+    pub kind: NodeKind,
+}
+
+/// Every node that can be recorded from, as `pw-dump` reports them.
+///
+/// The one list of what turntable records: `list-devices` prints it, and a
+/// recording starts only from a node in it.
+pub fn recordable_nodes() -> anyhow::Result<Vec<RecordableNode>> {
+    let dump = Command::new("pw-dump")
+        .output()
+        .context("Cannot run pw-dump")?;
+    if !dump.status.success() {
+        anyhow::bail!(
+            "pw-dump cannot reach PipeWire: {}",
+            String::from_utf8_lossy(&dump.stderr).trim()
+        );
+    }
+    parse_recordable(&String::from_utf8_lossy(&dump.stdout)).context("Cannot read pw-dump output")
+}
+
+/// The `Audio/Source` and `Audio/Sink` nodes in `pw-dump` output. `pw-record`
+/// gets `target not found` for `Audio/Source/Virtual`, so that class is left out.
+///
+/// While the graph changes, `pw-dump` prints more arrays after the first: each
+/// object replaces the one with its id, and `"info": null` removes it. Ids are
+/// reused, so the arrays are applied in order.
+fn parse_recordable(dump: &str) -> serde_json::Result<Vec<RecordableNode>> {
+    let mut objects: Vec<serde_json::Value> = Vec::new();
+    for batch in serde_json::Deserializer::from_str(dump).into_iter::<Vec<serde_json::Value>>() {
+        for object in batch? {
+            objects.retain(|known| known["id"] != object["id"]);
+            if !object["info"].is_null() {
+                objects.push(object);
+            }
+        }
+    }
+
+    Ok(objects
+        .iter()
+        .filter(|object| object["type"] == "PipeWire:Interface:Node")
+        .filter_map(|object| {
+            let props = &object["info"]["props"];
+            let kind = match props["media.class"].as_str()? {
+                "Audio/Source" => NodeKind::Source,
+                "Audio/Sink" => NodeKind::Sink,
+                _ => return None,
+            };
+            let name = props["node.name"].as_str()?.to_string();
+            let description = props["node.description"]
+                .as_str()
+                .unwrap_or(&name)
+                .to_string();
+            Some(RecordableNode {
+                name,
+                description,
+                kind,
+            })
+        })
+        .collect())
 }
 
 /// Loudest sample of 16-bit little-endian PCM, in dBFS.
@@ -109,23 +184,43 @@ pub fn peak_dbfs(pcm: &[u8]) -> Option<f32> {
     Some(20. * (peak as f32 / 32768.).log10())
 }
 
-fn record_args(target: &str, path: &Path) -> Vec<OsString> {
+fn record_args(node: &str, kind: NodeKind, path: &Path) -> Vec<OsString> {
+    let monitor = match kind {
+        NodeKind::Source => "",
+        NodeKind::Sink => " stream.capture.sink = true",
+    };
     vec![
-        format!("--target={target}").into(),
+        format!("--target={node}").into(),
         format!("--rate={SAMPLE_RATE}").into(),
         "--channels=2".into(),
         "--format=s16".into(),
         "-P".into(),
-        "{ node.name = turntable-recorder node.dont-reconnect = true node.dont-fallback = true }"
-            .into(),
+        format!(
+            "{{ node.name = turntable-recorder node.dont-reconnect = true \
+             node.dont-fallback = true{monitor} }}"
+        )
+        .into(),
         path.into(),
     ]
 }
 
-fn pw_record(target: &str, path: &Path) -> Command {
+fn pw_record(node: &str, kind: NodeKind, path: &Path) -> Command {
     let mut command = Command::new("pw-record");
-    command.args(record_args(target, path));
+    command.args(record_args(node, kind, path));
     command
+}
+
+/// The `pw-record` command for `source`, looked up in [`recordable_nodes`] on
+/// every start, so a sink is recorded through its monitor.
+fn pw_record_for(source: String) -> CommandFor {
+    Box::new(move |path| {
+        let nodes = recordable_nodes().map_err(|e| format!("Cannot record: {e:#}"))?;
+        let node = nodes
+            .iter()
+            .find(|node| node.name == source)
+            .ok_or_else(|| format!("Cannot record: no source or output named {source}"))?;
+        Ok(pw_record(&node.name, node.kind, path))
+    })
 }
 
 fn output_path(dir: &Path, now: NaiveDateTime) -> PathBuf {
@@ -139,6 +234,11 @@ fn clock(elapsed: Duration) -> String {
         0 => format!("{:02}:{:02}", secs / 60, secs % 60),
         hours => format!("{hours}:{:02}:{:02}", secs / 60 % 60, secs % 60),
     }
+}
+
+/// Deletes a WAV holding nothing but its header. Returns whether it did.
+fn discard_empty(path: &Path) -> bool {
+    file_size(path) <= WAV_HEADER_BYTES && std::fs::remove_file(path).is_ok()
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -219,9 +319,9 @@ struct Capture {
     path: PathBuf,
 }
 
-/// Builds the recording command for a path. `pw-record` in production, a
-/// stand-in in the tests.
-type CommandFor = Box<dyn Fn(&Path) -> Command + Send>;
+/// Builds the recording command for a path, or says why there is none.
+/// `pw-record` in production, a stand-in in the tests.
+type CommandFor = Box<dyn Fn(&Path) -> Result<Command, String> + Send>;
 
 struct Recorder {
     dir: PathBuf,
@@ -257,8 +357,8 @@ impl Recorder {
     fn run(mut self, commands: Receiver<RecorderCommand>, shutdown: Arc<AtomicBool>) {
         while !shutdown.load(Ordering::Relaxed) {
             match commands.recv_timeout(TICK) {
-                Ok(RecorderCommand::Start) => self.start(),
-                Ok(RecorderCommand::Stop) => self.stop(),
+                Ok(RecorderCommand::Toggle) if self.capture.is_some() => self.stop(),
+                Ok(RecorderCommand::Toggle) => self.start(),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -274,14 +374,25 @@ impl Recorder {
             return;
         }
 
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            self.notices
-                .error(format!("Cannot record into {}: {e}", self.dir.display()));
+        if !self.dir.is_dir() {
+            let message = format!(
+                "Cannot record: recordings folder {} does not exist",
+                self.dir.display()
+            );
+            log::error!("{message}");
+            self.notices.error(message);
             return;
         }
 
         let path = output_path(&self.dir, chrono::Local::now().naive_local());
-        let mut command = (self.command_for)(&path);
+        let mut command = match (self.command_for)(&path) {
+            Ok(command) => command,
+            Err(message) => {
+                log::error!("{message}");
+                self.notices.error(message);
+                return;
+            }
+        };
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -290,13 +401,15 @@ impl Recorder {
         let mut child = match spawn_with_deathsig(&mut command) {
             Ok(child) => child,
             Err(e) => {
-                self.notices.error(format!("Cannot start pw-record: {e}"));
+                let message = format!("Cannot start pw-record: {e}");
+                log::error!("{message}");
+                self.notices.error(message);
                 return;
             }
         };
 
         let stderr = drain_stderr(child.stderr.take().expect("stderr is piped"));
-        log::info!("Recording to {}", path.display());
+        log::info!("Starting pw-record into {}", path.display());
         self.publish(RecorderState::Starting { path: path.clone() });
         self.capture = Some(Capture {
             child,
@@ -320,6 +433,7 @@ impl Recorder {
                 if let RecorderState::Starting { path } = &self.state
                     && file_size(path) > WAV_HEADER_BYTES
                 {
+                    log::info!("Recording to {}", path.display());
                     let path = path.clone();
                     self.publish(RecorderState::Recording {
                         path,
@@ -334,19 +448,23 @@ impl Recorder {
 
         let capture = self.capture.take().expect("checked above");
         let _ = capture.stderr.join();
-        log::error!(
-            "pw-record exited on its own ({exit}) while writing {}",
-            capture.path.display()
-        );
 
         let message = match &self.state {
             RecorderState::Recording { since, .. } => {
+                log::error!(
+                    "pw-record exited on its own ({exit}) while writing {}",
+                    capture.path.display()
+                );
                 format!(
                     "Recording stopped after {}, see the log",
                     clock(since.elapsed())
                 )
             }
-            _ => "Cannot record, see the log".to_string(),
+            _ => {
+                discard_empty(&capture.path);
+                log::error!("pw-record quit before any audio ({exit}); nothing recorded");
+                "Cannot record, see the log".to_string()
+            }
         };
         self.notices.error(message);
         self.publish(RecorderState::Idle);
@@ -369,13 +487,19 @@ impl Recorder {
         let _ = capture.stderr.join();
 
         let name = capture.path.display();
-        match stopped {
-            Stopped::Clean => log::info!("Saved {name} ({length})"),
-            Stopped::Killed => {
-                log::error!("pw-record ignored SIGINT and was killed; {name} has no final header");
-                self.notices.warn(format!(
-                    "pw-record had to be killed, {name} may need repairing"
-                ));
+        if discard_empty(&capture.path) {
+            log::info!("Stopped before any audio; nothing recorded");
+        } else {
+            match stopped {
+                Stopped::Clean => log::info!("Saved {name} ({length})"),
+                Stopped::Killed => {
+                    log::error!(
+                        "pw-record ignored SIGINT and was killed; {name} has no final header"
+                    );
+                    self.notices.warn(format!(
+                        "pw-record had to be killed, {name} may need repairing"
+                    ));
+                }
             }
         }
         self.publish(RecorderState::Idle);
@@ -449,6 +573,7 @@ mod tests {
         fn new(command_for: CommandFor) -> Self {
             let notices = Notices::new();
             let dir = scratch_dir();
+            std::fs::create_dir_all(&dir).expect("scratch dir");
             let recorder = Recorder::new(
                 dir.clone(),
                 command_for,
@@ -496,8 +621,12 @@ mod tests {
     // --- pure ---
 
     #[test]
-    fn the_command_line_pins_the_target() {
-        let args = record_args("alsa_input.xone", Path::new("/rec/mix.wav"));
+    fn the_command_line_pins_the_node() {
+        let args = record_args(
+            "alsa_input.xone",
+            NodeKind::Source,
+            Path::new("/rec/mix.wav"),
+        );
         let expected: Vec<OsString> = [
             "--target=alsa_input.xone",
             "--rate=48000",
@@ -511,6 +640,74 @@ mod tests {
         .map(OsString::from)
         .collect();
         assert_eq!(args, expected);
+
+        let sink = record_args(
+            "alsa_output.xone",
+            NodeKind::Sink,
+            Path::new("/rec/mix.wav"),
+        );
+        assert_eq!(
+            sink[5],
+            OsString::from(
+                "{ node.name = turntable-recorder node.dont-reconnect = true \
+                 node.dont-fallback = true stream.capture.sink = true }"
+            )
+        );
+    }
+
+    /// What `pw-dump` prints when a sink goes away and a new source takes its
+    /// id while it runs.
+    #[test]
+    fn later_arrays_update_the_dump() {
+        let dump = r#"[
+            { "id": 40, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "alsa_input.mic", "node.description": "Mic", "media.class": "Audio/Source" } } },
+            { "id": 41, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "alsa_output.speakers", "node.description": "Speakers", "media.class": "Audio/Sink" } } }
+        ]
+        [ { "id": 41, "info": null } ]
+        [ { "id": 41, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "alsa_input.usb", "node.description": "USB", "media.class": "Audio/Source" } } } ]"#;
+        let names: Vec<_> = parse_recordable(dump)
+            .expect("valid JSON")
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        assert_eq!(names, ["alsa_input.mic", "alsa_input.usb"]);
+    }
+
+    #[test]
+    fn only_sources_and_sinks_are_recordable() {
+        let dump = r#"[
+            { "id": 1, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "alsa_input.mic", "node.description": "Mic", "media.class": "Audio/Source" } } },
+            { "id": 2, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "alsa_output.speakers", "node.description": "Speakers", "media.class": "Audio/Sink" } } },
+            { "id": 3, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "virtual-mic", "media.class": "Audio/Source/Virtual" } } },
+            { "id": 4, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "turntable-recorder", "media.class": "Stream/Input/Audio" } } },
+            { "id": 5, "type": "PipeWire:Interface:Node", "info": { "props":
+                { "node.name": "Midi-Bridge", "media.class": "Midi/Bridge" } } },
+            { "id": 6, "type": "PipeWire:Interface:Link", "info": { "props":
+                { "node.name": "not-a-node", "media.class": "Audio/Source" } } },
+            { "id": 7, "type": "PipeWire:Interface:Node", "info": null }
+        ]"#;
+        assert_eq!(
+            parse_recordable(dump).expect("valid JSON"),
+            vec![
+                RecordableNode {
+                    name: "alsa_input.mic".into(),
+                    description: "Mic".into(),
+                    kind: NodeKind::Source,
+                },
+                RecordableNode {
+                    name: "alsa_output.speakers".into(),
+                    description: "Speakers".into(),
+                    kind: NodeKind::Sink,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -581,7 +778,7 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_reported() {
-        let mut h = Harness::new(Box::new(|_| Command::new("turntable-no-such-program")));
+        let mut h = Harness::new(Box::new(|_| Ok(Command::new("turntable-no-such-program"))));
         h.recorder.start();
         assert_eq!(h.state(), RecorderState::Idle);
         assert!(
@@ -592,38 +789,113 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_stops_the_recording() {
-        let (commands, receive) = crossbeam::channel::bounded(1);
-        let state = Arc::new(RwLock::new(RecorderState::Idle));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let dir = scratch_dir();
+    fn a_missing_folder_is_refused() {
+        let mut h = Harness::new(Box::new(|_| Ok(sh("exec sleep 30"))));
+        std::fs::remove_dir_all(&h.dir).expect("scratch dir");
 
-        let recorder = Recorder::new(
-            dir.clone(),
-            Box::new(|path| {
-                let mut command = sh("head -c 1000 /dev/zero > \"$1\"; exec sleep 30");
-                command.arg("sh").arg(path);
-                command
-            }),
-            Arc::clone(&state),
-            Notices::new(),
-            Duration::from_millis(200),
+        h.recorder.start();
+        assert_eq!(h.state(), RecorderState::Idle);
+        assert!(
+            h.notice().starts_with("Cannot record: recordings folder "),
+            "{}",
+            h.notice()
         );
-        let thread = {
-            let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || recorder.run(receive, shutdown))
-        };
+        assert!(!h.dir.exists(), "the folder was created");
+    }
 
-        commands
-            .send(RecorderCommand::Start)
-            .expect("recorder alive");
-        let read = || state.read().expect("lock").clone();
-        assert!(eventually(Duration::from_secs(2), || is_recording(&read())));
+    #[test]
+    fn stopping_before_any_audio_leaves_no_file() {
+        let mut h = Harness::new(Box::new(|path| {
+            let mut command = sh("head -c 44 /dev/zero > \"$1\"; exec sleep 30");
+            command.arg("sh").arg(path);
+            Ok(command)
+        }));
+        h.recorder.start();
+        assert!(eventually(Duration::from_secs(2), || {
+            std::fs::read_dir(&h.dir).expect("dir").count() == 1
+        }));
 
-        shutdown.store(true, Ordering::Relaxed);
-        thread.join().expect("recorder thread");
-        assert_eq!(read(), RecorderState::Idle);
-        let _ = std::fs::remove_dir_all(&dir);
+        h.recorder.stop();
+        assert_eq!(std::fs::read_dir(&h.dir).expect("dir").count(), 0);
+    }
+
+    /// The recorder's own thread, with a stand-in that writes audio and waits.
+    struct Running {
+        commands: crossbeam::channel::Sender<RecorderCommand>,
+        state: Arc<RwLock<RecorderState>>,
+        shutdown: Arc<AtomicBool>,
+        thread: JoinHandle<()>,
+        dir: PathBuf,
+    }
+
+    impl Running {
+        fn new() -> Self {
+            let (commands, receive) = crossbeam::channel::bounded(4);
+            let state = Arc::new(RwLock::new(RecorderState::Idle));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let dir = scratch_dir();
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+
+            let recorder = Recorder::new(
+                dir.clone(),
+                Box::new(|path| {
+                    let mut command = sh("head -c 1000 /dev/zero > \"$1\"; exec sleep 30");
+                    command.arg("sh").arg(path);
+                    Ok(command)
+                }),
+                Arc::clone(&state),
+                Notices::new(),
+                Duration::from_millis(200),
+            );
+            let thread = {
+                let shutdown = Arc::clone(&shutdown);
+                std::thread::spawn(move || recorder.run(receive, shutdown))
+            };
+            Self {
+                commands,
+                state,
+                shutdown,
+                thread,
+                dir,
+            }
+        }
+
+        fn toggle(&self) {
+            self.commands
+                .send(RecorderCommand::Toggle)
+                .expect("recorder alive");
+        }
+
+        fn reaches(&self, done: impl Fn(&RecorderState) -> bool) -> bool {
+            eventually(Duration::from_secs(2), || {
+                done(&self.state.read().expect("lock"))
+            })
+        }
+
+        fn shut_down(self) -> RecorderState {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.thread.join().expect("recorder thread");
+            let _ = std::fs::remove_dir_all(&self.dir);
+            self.state.read().expect("lock").clone()
+        }
+    }
+
+    #[test]
+    fn a_second_toggle_stops_the_recording() {
+        let running = Running::new();
+        running.toggle();
+        assert!(running.reaches(is_recording));
+        running.toggle();
+        assert!(running.reaches(|s| *s == RecorderState::Idle));
+        running.shut_down();
+    }
+
+    #[test]
+    fn shutdown_stops_the_recording() {
+        let running = Running::new();
+        running.toggle();
+        assert!(running.reaches(is_recording));
+        assert_eq!(running.shut_down(), RecorderState::Idle);
     }
 
     // --- real PipeWire, virtual source ---
@@ -702,6 +974,11 @@ mod tests {
             format!("{}-out", self.name)
         }
 
+        /// The sink side, which the tone plays into.
+        fn sink(&self) -> String {
+            format!("{}-in", self.name)
+        }
+
         /// The recorder would otherwise race the node's creation and be
         /// told `target not found`.
         fn wait_for_ports(&self, prefix: &str) {
@@ -751,8 +1028,8 @@ mod tests {
         std::fs::write(path, wav).expect("tone written");
     }
 
-    fn real_recorder(target: String) -> Harness {
-        Harness::new(Box::new(move |path| pw_record(&target, path)))
+    fn real_recorder(source: String) -> Harness {
+        Harness::new(pw_record_for(source))
     }
 
     fn the_only_recording(dir: &Path) -> PathBuf {
@@ -787,16 +1064,74 @@ mod tests {
         assert!((peak + 6.02).abs() < 0.1, "peak {peak}");
     }
 
-    /// WirePlumber's fallback would record the default source, the laptop mic.
     #[test]
-    fn a_target_that_does_not_exist_records_nothing() {
+    fn an_unknown_name_is_refused_before_pw_record_starts() {
         let mut h = real_recorder("turntable-test-no-such-node".into());
 
         h.recorder.start();
-        assert!(h.watch_until(Duration::from_secs(3), |s| *s == RecorderState::Idle));
-        assert!(file_size(&the_only_recording(&h.dir)) <= WAV_HEADER_BYTES);
+        assert_eq!(h.state(), RecorderState::Idle);
+        assert_eq!(
+            h.notice(),
+            "Cannot record: no source or output named turntable-test-no-such-node"
+        );
+        assert_eq!(
+            std::fs::read_dir(&h.dir).expect("recordings dir").count(),
+            0
+        );
+    }
 
-        assert_eq!(h.notice(), "Cannot record, see the log");
+    /// A node can vanish between the lookup and the spawn. WirePlumber's
+    /// fallback would then record the default source or the default sink's
+    /// monitor: the laptop mic, or whatever is playing.
+    #[test]
+    fn pw_record_never_falls_back_to_another_node() {
+        for kind in [NodeKind::Source, NodeKind::Sink] {
+            let mut h = Harness::new(Box::new(move |path| {
+                Ok(pw_record("turntable-test-no-such-node", kind, path))
+            }));
+
+            h.recorder.start();
+            assert!(h.watch_until(Duration::from_secs(3), |s| *s == RecorderState::Idle));
+            assert_eq!(
+                std::fs::read_dir(&h.dir).expect("recordings dir").count(),
+                0,
+                "{kind:?}: nothing is left behind"
+            );
+            assert_eq!(h.notice(), "Cannot record, see the log");
+        }
+    }
+
+    #[test]
+    fn the_fixture_is_listed_as_a_source_and_a_sink() {
+        let source = VirtualSource::new(false);
+        let nodes = recordable_nodes().expect("pw-dump");
+        let kind_of = |name: String| {
+            nodes
+                .iter()
+                .find(|node| node.name == name)
+                .map(|node| node.kind)
+        };
+        assert_eq!(kind_of(source.target()), Some(NodeKind::Source));
+        assert_eq!(kind_of(source.sink()), Some(NodeKind::Sink));
+    }
+
+    #[test]
+    fn records_what_an_output_is_playing() {
+        let source = VirtualSource::new(true);
+        let mut h = real_recorder(source.sink());
+
+        h.recorder.start();
+        assert!(
+            h.watch_until(Duration::from_secs(3), is_recording),
+            "{}",
+            h.notice()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        h.recorder.stop();
+
+        let wav = std::fs::read(the_only_recording(&h.dir)).expect("recording");
+        let peak = peak_dbfs(&wav[WAV_HEADER_BYTES as usize..]).expect("not silent");
+        assert!((peak + 6.02).abs() < 0.1, "peak {peak}");
     }
 
     /// The software version of pulling the interface's USB cable.

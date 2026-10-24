@@ -23,6 +23,8 @@ pub enum AppEvent {
     /// A track was handed to the app (drag & drop, or a scanned card). It goes
     /// in the record tray, and a later `LoadRecord` picks the deck.
     PrepareRecord(TrackRef),
+    /// Start recording the set, or stop the recording in progress.
+    ToggleRecording,
     /// Shut the app down.
     Quit,
 }

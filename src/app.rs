@@ -20,6 +20,10 @@ use localdeck_storage::operations::Storage;
 
 use crate::InputKind;
 use crate::cards_config::{self, CardsConfig};
+#[cfg(feature = "sdl")]
+use std::{sync::atomic::AtomicUsize, time::Instant};
+#[cfg(feature = "sdl")]
+use turntable_lib::sdl_input::SdlInputMapper;
 use turntable_lib::{
     audio_health::{self, AudioHealth, HealthRecorder},
     card_library::Library,
@@ -33,15 +37,12 @@ use turntable_lib::{
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
+    recorder::{self, RecorderCommand, RecorderConfig, RecorderState},
     samples_poller::{DeckRouting, SamplesPoller},
     telemetry,
     tray::{self, TrayCommand, TrayState},
     utils::{log_try_send, unzip_array4},
 };
-#[cfg(feature = "sdl")]
-use std::{sync::atomic::AtomicUsize, time::Instant};
-#[cfg(feature = "sdl")]
-use turntable_lib::sdl_input::SdlInputMapper;
 
 /// Everything the app was asked to do, as parsed from the command line.
 pub struct Options<'a> {
@@ -63,6 +64,8 @@ pub struct Options<'a> {
     pub qr: QrMode,
     /// localdeck config naming the card library, else `$LOCALDECK_CONFIG`
     pub cards_config: Option<&'a Path>,
+    /// `Some` when a recording source and its folder are both configured
+    pub recording: Option<RecorderConfig>,
 }
 
 /// Frames per audio callback unless the command line says otherwise.
@@ -297,6 +300,45 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
+    // Its own shutdown flag, so teardown can stop it before the stream.
+    let recorder_shutdown = Arc::new(AtomicBool::new(false));
+    let recorder = options.recording.clone().map(|config| {
+        log::info!(
+            "Recording set up: source {}, folder {}",
+            config.source,
+            config.dir.display()
+        );
+
+        let problem = match recorder::recordable_nodes() {
+            Err(e) => Some(format!("Cannot check the recording source: {e:#}")),
+            Ok(nodes) if !nodes.iter().any(|node| node.name == config.source) => Some(format!(
+                "Recording source {} not found; turntable list-devices shows the sources",
+                config.source
+            )),
+            Ok(_) => None,
+        };
+        if let Some(problem) = problem {
+            log::warn!("{problem}");
+            notices.warn(problem);
+        }
+
+        if !config.dir.is_dir() {
+            let problem = format!("Recordings folder {} does not exist", config.dir.display());
+            log::warn!("{problem}");
+            notices.warn(problem);
+        }
+
+        let (commands, receive) = bounded(4);
+        let thread = recorder::start(
+            config,
+            receive,
+            Arc::new(RwLock::new(RecorderState::Idle)),
+            notices.clone(),
+            Arc::clone(&recorder_shutdown),
+        );
+        (commands, thread)
+    });
+
     // Spawn polling TUI thread, which doubles as the drag and drop source
     let tui_handle = spawn_tui_thread::<DECKS>(
         active_deck.clone(),
@@ -313,6 +355,8 @@ fn run_app<const DECKS: usize>(
         events_rcv,
         controllers,
         tray_snd.clone(),
+        recorder.as_ref().map(|(commands, _)| commands.clone()),
+        notices.clone(),
         Arc::clone(&shutdown),
     );
 
@@ -330,6 +374,16 @@ fn run_app<const DECKS: usize>(
 
     // 4. Teardown & Thread Joining
     log::info!("Stopping the app");
+
+    // Before the stream: the audio cutting out pops, and the recording must
+    // end before that.
+    recorder_shutdown.store(true, Ordering::Relaxed);
+    if let Some((_, thread)) = recorder
+        && thread.join().is_err()
+    {
+        log::error!("Recorder panicked");
+    }
+
     drop(stream);
     shutdown.store(true, Ordering::Relaxed);
 
@@ -513,6 +567,8 @@ fn spawn_dispatcher<const DECKS: usize>(
     events: Receiver<InputEvent>,
     mut controllers: [DeckController; DECKS],
     tray: Sender<TrayCommand>,
+    recorder: Option<Sender<RecorderCommand>>,
+    notices: Notices,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<[DeckController; DECKS]> {
     std::thread::spawn(move || {
@@ -534,6 +590,13 @@ fn spawn_dispatcher<const DECKS: usize>(
                 InputEvent::App(AppEvent::PrepareRecord(track)) => {
                     log_try_send(&tray, TrayCommand::PrepareRecord(track), "prepare record")
                 }
+
+                InputEvent::App(AppEvent::ToggleRecording) => match &recorder {
+                    Some(recorder) => {
+                        log_try_send(recorder, RecorderCommand::Toggle, "toggle recording")
+                    }
+                    None => notices.warn("Recording is off: no recording source set"),
+                },
 
                 InputEvent::Deck(deck_idx, event) => {
                     dispatch_to_deck(&mut controllers, deck_idx, event)

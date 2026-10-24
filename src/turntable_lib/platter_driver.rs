@@ -347,6 +347,10 @@ mod tests {
         for i in 0..12 {
             nudges.push(-1, end + Duration::from_secs_f64(i as f64 / 400.));
         }
-        assert!(nudges.bend(end) < held / 2., "reversal left {}", nudges.bend(end));
+        assert!(
+            nudges.bend(end) < held / 2.,
+            "reversal left {}",
+            nudges.bend(end)
+        );
     }
 }

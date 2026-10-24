@@ -105,8 +105,7 @@ impl InputProfile {
             max_drift_units: 50,
             convergence_lambda: 50.0,
             speed_smoothing_tau_secs: 0.01,
-            nudge_responsiveness: nudge * TOUCHPAD_BEND_AT_FLICK
-                / TOUCHPAD_FLICK_DETENTS_PER_SEC,
+            nudge_responsiveness: nudge * TOUCHPAD_BEND_AT_FLICK / TOUCHPAD_FLICK_DETENTS_PER_SEC,
             nudge_release_tau_secs: 0.1,
         }
     }
@@ -130,8 +129,7 @@ impl InputProfile {
             max_drift_units: 20,
             convergence_lambda: 50.0,
             speed_smoothing_tau_secs: 0.01,
-            nudge_responsiveness: nudge * JOG_BEND_AT_RECORD_SPEED
-                / ticks_per_sec_at_record_speed,
+            nudge_responsiveness: nudge * JOG_BEND_AT_RECORD_SPEED / ticks_per_sec_at_record_speed,
             nudge_release_tau_secs: 0.03,
         }
     }

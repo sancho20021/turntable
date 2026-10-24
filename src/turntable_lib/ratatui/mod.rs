@@ -5,7 +5,8 @@
 //! [`TermEvent::Paste`] and leaves as an [`AppEvent::PrepareRecord`]. Keys are
 //! ignored, because the keyboard belongs to the SDL window - except Ctrl-C,
 //! which raw mode never turns into SIGINT, so without it there would be no way
-//! out of a run with no SDL window.
+//! out of a run with no SDL window, and Ctrl-R, which starts and stops
+//! recording the set.
 
 use ratatui::{
     Frame,
@@ -201,6 +202,12 @@ fn to_input_event(event: TermEvent) -> Option<InputEvent> {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             Some(InputEvent::App(AppEvent::Quit))
+        }
+
+        TermEvent::Key(key)
+            if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(InputEvent::App(AppEvent::ToggleRecording))
         }
 
         // the keyboard belongs to the SDL window
@@ -556,9 +563,21 @@ fn render_tui<const DECKS: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path, track_label};
+    use super::{format_duration, parse_dropped_path, to_input_event, track_label};
+    use crate::input_event::{AppEvent, InputEvent};
     use crate::record::{TrackMeta, TrackRef};
+    use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    #[test]
+    fn ctrl_r_toggles_recording_and_r_alone_does_nothing() {
+        let key = |modifiers| TermEvent::Key(KeyEvent::new(KeyCode::Char('r'), modifiers));
+        assert!(matches!(
+            to_input_event(key(KeyModifiers::CONTROL)),
+            Some(InputEvent::App(AppEvent::ToggleRecording))
+        ));
+        assert!(to_input_event(key(KeyModifiers::NONE)).is_none());
+    }
 
     #[test]
     fn a_track_from_the_library_is_named_by_its_artist_and_title() {

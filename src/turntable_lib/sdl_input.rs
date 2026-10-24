@@ -60,6 +60,15 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
             // Scrolling left is forward, matching a record pushed away.
             Event::MouseWheel { x, .. } => DeckCommand::Nudge(-x as i16),
 
+            // R alone is ResetPitch, so the modifier is checked first.
+            Event::KeyDown {
+                keycode: Some(Keycode::R),
+                keymod,
+                ..
+            } if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => {
+                return Some(InputEvent::App(AppEvent::ToggleRecording));
+            }
+
             Event::KeyDown {
                 keycode: Some(key),
                 keymod,
@@ -125,5 +134,43 @@ fn keycode_to_deck_idx(key: Keycode) -> Option<DeckId> {
         Keycode::Num8 | Keycode::Kp8 => Some(7),
         Keycode::Num9 | Keycode::Kp9 => Some(8),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_r_toggles_recording_and_r_alone_resets_pitch() {
+        let mut mapper = SdlInputMapper::<2>::new(Arc::new(AtomicUsize::new(0)), Notices::new());
+        let mut press = |keymod| {
+            mapper.to_input_event(
+                Event::KeyDown {
+                    timestamp: 0,
+                    window_id: 0,
+                    keycode: Some(Keycode::R),
+                    scancode: None,
+                    keymod,
+                    repeat: false,
+                },
+                Instant::now(),
+            )
+        };
+
+        assert!(matches!(
+            press(Mod::LCTRLMOD),
+            Some(InputEvent::App(AppEvent::ToggleRecording))
+        ));
+        assert!(matches!(
+            press(Mod::NOMOD),
+            Some(InputEvent::Deck(
+                0,
+                DeckEvent {
+                    command: DeckCommand::ResetPitch,
+                    ..
+                }
+            ))
+        ));
     }
 }

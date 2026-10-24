@@ -8,6 +8,7 @@ use env_logger::Env;
 use log::info;
 
 use crate::app::{QrMode, start};
+use turntable_lib::recorder::{self, NodeKind, RecorderConfig};
 
 /// Which device drives the decks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -45,7 +46,7 @@ enum Commands {
     /// List MIDI input ports and exit
     ListMidi,
 
-    /// List audio output devices and exit
+    /// List audio output devices and recording sources and exit
     ListDevices,
 
     /// Run the turntable application
@@ -103,6 +104,15 @@ enum Commands {
         /// localdeck config naming the card library. Defaults to $LOCALDECK_CONFIG
         #[arg(long)]
         cards_config: Option<PathBuf>,
+
+        /// Exact PipeWire node name of the source to record, such as the mixer's
+        /// master return; list-devices shows them. Unset, recording is off
+        #[arg(long, env = "TURNTABLE_RECORDING_SOURCE", requires = "recordings_dir")]
+        recording_source: Option<String>,
+
+        /// Existing folder recordings are written to. It is never created
+        #[arg(long, env = "TURNTABLE_RECORDINGS_DIR", requires = "recording_source")]
+        recordings_dir: Option<PathBuf>,
     },
 }
 
@@ -199,19 +209,38 @@ fn main() {
             }
         },
 
-        Commands::ListDevices => match app::list_output_devices() {
-            Ok(devices) if devices.is_empty() => println!("No audio output devices found"),
-            Ok(devices) => {
-                println!("Audio output devices:");
-                for (i, name) in devices.iter().enumerate() {
-                    println!("  [{i}] {name}");
+        Commands::ListDevices => {
+            match app::list_output_devices() {
+                Ok(devices) if devices.is_empty() => println!("No audio output devices found"),
+                Ok(devices) => {
+                    println!("Audio output devices (-D):");
+                    for (i, name) in devices.iter().enumerate() {
+                        println!("  [{i}] {name}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Cannot list audio output devices: {e:#}");
+                    std::process::exit(1);
                 }
             }
-            Err(e) => {
-                eprintln!("Cannot list audio output devices: {e:#}");
-                std::process::exit(1);
+
+            println!();
+            match recorder::recordable_nodes() {
+                Ok(nodes) if nodes.is_empty() => println!("Nothing to record from"),
+                Ok(nodes) => {
+                    println!("Recording sources (--recording-source):");
+                    let width = nodes.iter().map(|node| node.name.len()).max().unwrap_or(0);
+                    for node in nodes {
+                        let output = match node.kind {
+                            NodeKind::Source => "",
+                            NodeKind::Sink => " (output)",
+                        };
+                        println!("  {:<width$}  {}{output}", node.name, node.description);
+                    }
+                }
+                Err(e) => println!("Recording sources unavailable: {e:#}"),
             }
-        },
+        }
 
         Commands::Run {
             input,
@@ -227,6 +256,8 @@ fn main() {
             qr,
             no_qr,
             cards_config,
+            recording_source,
+            recordings_dir,
         } => {
             if *buffer < app::MIN_SAFE_BUFFER_FRAMES && !*force_buffer {
                 eprintln!(
@@ -255,7 +286,33 @@ fn main() {
                     (_, true) => QrMode::Off,
                     _ => QrMode::Auto,
                 },
+                recording: recording_source
+                    .clone()
+                    .zip(recordings_dir.clone())
+                    .map(|(source, dir)| RecorderConfig { source, dir }),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(["turntable", "run"].iter().chain(args)).is_ok()
+    }
+
+    #[test]
+    fn recording_needs_both_a_source_and_a_folder() {
+        assert!(parses(&[]));
+        assert!(parses(&[
+            "--recording-source",
+            "x",
+            "--recordings-dir",
+            "/rec"
+        ]));
+        assert!(!parses(&["--recording-source", "x"]));
+        assert!(!parses(&["--recordings-dir", "/rec"]));
     }
 }

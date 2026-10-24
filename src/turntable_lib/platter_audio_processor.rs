@@ -778,7 +778,9 @@ mod tests {
             platter: readable,
             health: AudioHealth::new(FRAMES as u32, SAMPLE_RATE, 1).deck(0),
         });
-        records_in.push(Arc::new(tone(20., TONE_HZ, TONE_PEAK))).unwrap();
+        records_in
+            .push(Arc::new(tone(20., TONE_HZ, TONE_PEAK)))
+            .unwrap();
 
         let block_nanos = PlatterAudioProcessor::frames_to_dur_nanos(FRAMES).0;
         let mut frames = vec![StereoFrame::default(); FRAMES];
@@ -792,8 +794,7 @@ mod tests {
         // Park a quarter of a cycle in, where the tone is at its peak: the
         // offset left behind is the whole of TONE_PEAK.
         let period_nanos = (1e9 / TONE_HZ) as i64;
-        let parked_at =
-            INanos(clock as i64 / period_nanos * period_nanos + period_nanos / 4);
+        let parked_at = INanos(clock as i64 / period_nanos * period_nanos + period_nanos / 4);
         let drain_blocks =
             (1.0 / PlatterAudioProcessor::frames_to_dur(FRAMES).as_secs_f64()).ceil() as u64;
         for _ in 0..drain_blocks {
