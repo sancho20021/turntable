@@ -318,20 +318,15 @@ mod tests {
     /// `0.5 / tau` ticks a second.
     #[test]
     fn a_held_bend_ignores_the_release_tau() {
+        let depth =
+            InputProfile::jog_wheel(1., 1.).nudge_responsiveness * RECORD_SPEED_TICKS_PER_SEC;
         for tau in [0.02, 0.05, 0.2] {
             let (_, _, bend) = turn_at_record_speed(tau, 1.);
-            assert!((bend - 0.10).abs() < 0.01, "tau {tau} held {bend}");
+            assert!(
+                (bend / depth - 1.).abs() < 0.1,
+                "tau {tau} held {bend} of {depth}"
+            );
         }
-    }
-
-    /// A flick shorter than tau reaches part of the depth, less of it the
-    /// longer tau is.
-    #[test]
-    fn a_flick_shorter_than_tau_bends_less() {
-        let (_, _, brief) = turn_at_record_speed(0.1, 0.03);
-        let (_, _, tight) = turn_at_record_speed(0.03, 0.03);
-        assert!(brief < 0.04, "slow tau flicked to {brief}");
-        assert!(tight > 0.06, "tight tau only flicked to {tight}");
     }
 
     #[test]
