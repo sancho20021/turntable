@@ -329,14 +329,15 @@ fn run_app<const DECKS: usize>(
         }
 
         let (commands, receive) = bounded(4);
+        let state = Arc::new(RwLock::new(RecorderState::Idle));
         let thread = recorder::start(
             config,
             receive,
-            Arc::new(RwLock::new(RecorderState::Idle)),
+            Arc::clone(&state),
             notices.clone(),
             Arc::clone(&recorder_shutdown),
         );
-        (commands, thread)
+        (commands, thread, state)
     });
 
     // Spawn polling TUI thread, which doubles as the drag and drop source
@@ -346,6 +347,7 @@ fn run_app<const DECKS: usize>(
         array::from_fn(|i| controllers[i].get_platter()),
         Arc::clone(&tray_state),
         notices.clone(),
+        recorder.as_ref().map(|(_, _, state)| Arc::clone(state)),
         health,
         events_snd.clone(),
         Arc::clone(&shutdown),
@@ -355,7 +357,7 @@ fn run_app<const DECKS: usize>(
         events_rcv,
         controllers,
         tray_snd.clone(),
-        recorder.as_ref().map(|(commands, _)| commands.clone()),
+        recorder.as_ref().map(|(commands, _, _)| commands.clone()),
         notices.clone(),
         Arc::clone(&shutdown),
     );
@@ -378,7 +380,7 @@ fn run_app<const DECKS: usize>(
     // Before the stream: the audio cutting out pops, and the recording must
     // end before that.
     recorder_shutdown.store(true, Ordering::Relaxed);
-    if let Some((_, thread)) = recorder
+    if let Some((_, thread, _)) = recorder
         && thread.join().is_err()
     {
         log::error!("Recorder panicked");

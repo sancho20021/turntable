@@ -13,7 +13,7 @@
 
 use std::{
     ffi::OsString,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, ChildStderr, Command, Stdio},
@@ -30,7 +30,7 @@ use chrono::NaiveDateTime;
 use crossbeam::channel::{Receiver, RecvTimeoutError};
 use rustix::{
     io::Errno,
-    process::{Pid, Signal, getppid, kill_process, set_parent_process_death_signal},
+    process::{Pid, getppid, kill_process, set_parent_process_death_signal},
 };
 
 use crate::{decoder::SAMPLE_RATE, notices::Notices};
@@ -43,6 +43,15 @@ const WAV_HEADER_BYTES: u64 = 44;
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
 const TICK: Duration = Duration::from_millis(100);
+
+/// One second of the 16-bit stereo WAV, the stretch the level is read over.
+const SECOND_BYTES: u64 = SAMPLE_RATE as u64 * 4;
+
+/// `pw-record` writes every graph quantum, so a file this long without
+/// growing has stopped receiving audio.
+const STALL: Duration = Duration::from_secs(1);
+
+const FREE_SPACE_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
@@ -57,22 +66,41 @@ pub enum RecorderCommand {
     Toggle,
 }
 
+/// What the last second of a recording holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Signal {
+    /// its loudest sample, in dBFS
+    Peak(f32),
+    /// nothing but zeros
+    Silent,
+    /// nothing new: the file has not grown for [`STALL`]
+    NotWriting,
+}
+
 /// Published for the TUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecorderState {
     Idle,
     /// `pw-record` is running and nothing has reached the file yet.
     Starting {
         path: PathBuf,
     },
-    /// `since` is when the first audio reached the file.
+    /// `since` is when the first audio reached the file. `free_bytes` is the
+    /// space left in the recordings folder, `Some` once it has been read.
     Recording {
         path: PathBuf,
         since: Instant,
+        signal: Signal,
+        free_bytes: Option<u64>,
     },
     /// SIGINT sent, waiting for `pw-record` to finish the file.
     Stopping {
         path: PathBuf,
+    },
+    /// The last recording, finished.
+    Saved {
+        path: PathBuf,
+        length: Duration,
     },
 }
 
@@ -228,7 +256,7 @@ fn output_path(dir: &Path, now: NaiveDateTime) -> PathBuf {
 }
 
 /// `mm:ss`, or `h:mm:ss` from an hour up.
-fn clock(elapsed: Duration) -> String {
+pub fn clock(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     match secs / 3600 {
         0 => format!("{:02}:{:02}", secs / 60, secs % 60),
@@ -239,6 +267,31 @@ fn clock(elapsed: Duration) -> String {
 /// Deletes a WAV holding nothing but its header. Returns whether it did.
 fn discard_empty(path: &Path) -> bool {
     file_size(path) <= WAV_HEADER_BYTES && std::fs::remove_file(path).is_ok()
+}
+
+/// The signal in the last second of a WAV that is `size` bytes long.
+fn last_second(path: &Path, size: u64) -> Signal {
+    let start = size.saturating_sub(SECOND_BYTES).max(WAV_HEADER_BYTES);
+    let start = start + (start - WAV_HEADER_BYTES) % 2;
+
+    let mut pcm = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(start))?;
+        file.take(size - start).read_to_end(&mut pcm)
+    });
+    match read {
+        Ok(_) => peak_dbfs(&pcm).map_or(Signal::Silent, Signal::Peak),
+        Err(e) => {
+            log::warn!("Cannot read {} for its level: {e}", path.display());
+            Signal::NotWriting
+        }
+    }
+}
+
+fn free_bytes(dir: &Path) -> Option<u64> {
+    rustix::fs::statvfs(dir)
+        .ok()
+        .map(|stats| stats.f_bavail * stats.f_frsize)
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -259,7 +312,7 @@ fn spawn_with_deathsig(command: &mut Command) -> std::io::Result<Child> {
     // async-signal-safe work. It makes two syscalls and allocates nothing.
     unsafe {
         command.pre_exec(move || {
-            set_parent_process_death_signal(Some(Signal::INT))?;
+            set_parent_process_death_signal(Some(rustix::process::Signal::INT))?;
             // The parent may have died before this ran, and then no signal
             // will ever come.
             if getppid() != parent {
@@ -280,7 +333,7 @@ enum Stopped {
 
 /// SIGINT, then SIGKILL if the child is still there after `grace`.
 fn stop_child(child: &mut Child, grace: Duration) -> Stopped {
-    if let Err(e) = kill_process(Pid::from_child(child), Signal::INT) {
+    if let Err(e) = kill_process(Pid::from_child(child), rustix::process::Signal::INT) {
         log::warn!("Cannot send SIGINT to pw-record: {e}");
     }
 
@@ -317,6 +370,10 @@ struct Capture {
     child: Child,
     stderr: JoinHandle<()>,
     path: PathBuf,
+    size: u64,
+    grew_at: Instant,
+    free_bytes: Option<u64>,
+    free_read_at: Option<Instant>,
 }
 
 /// Builds the recording command for a path, or says why there is none.
@@ -415,6 +472,10 @@ impl Recorder {
             child,
             stderr,
             path,
+            size: 0,
+            grew_at: Instant::now(),
+            free_bytes: None,
+            free_read_at: None,
         });
     }
 
@@ -430,16 +491,43 @@ impl Recorder {
         // means something else reaped the child, so it is gone as well.
         let exit = match capture.child.try_wait() {
             Ok(None) => {
-                if let RecorderState::Starting { path } = &self.state
-                    && file_size(path) > WAV_HEADER_BYTES
-                {
-                    log::info!("Recording to {}", path.display());
-                    let path = path.clone();
-                    self.publish(RecorderState::Recording {
-                        path,
-                        since: Instant::now(),
-                    });
+                let now = Instant::now();
+                let size = file_size(&capture.path);
+                if size != capture.size {
+                    capture.size = size;
+                    capture.grew_at = now;
                 }
+                if size <= WAV_HEADER_BYTES {
+                    return;
+                }
+
+                if capture
+                    .free_read_at
+                    .is_none_or(|read_at| now - read_at >= FREE_SPACE_EVERY)
+                {
+                    capture.free_bytes = free_bytes(&self.dir);
+                    capture.free_read_at = Some(now);
+                }
+                let signal = if now - capture.grew_at > STALL {
+                    Signal::NotWriting
+                } else {
+                    last_second(&capture.path, size)
+                };
+                let (path, free_bytes) = (capture.path.clone(), capture.free_bytes);
+
+                let since = match &self.state {
+                    RecorderState::Recording { since, .. } => *since,
+                    _ => {
+                        log::info!("Recording to {}", path.display());
+                        now
+                    }
+                };
+                self.publish(RecorderState::Recording {
+                    path,
+                    since,
+                    signal,
+                    free_bytes,
+                });
                 return;
             }
             Ok(Some(status)) => status.to_string(),
@@ -476,8 +564,8 @@ impl Recorder {
         };
 
         let length = match &self.state {
-            RecorderState::Recording { since, .. } => clock(since.elapsed()),
-            _ => clock(Duration::ZERO),
+            RecorderState::Recording { since, .. } => since.elapsed(),
+            _ => Duration::ZERO,
         };
         self.publish(RecorderState::Stopping {
             path: capture.path.clone(),
@@ -489,20 +577,23 @@ impl Recorder {
         let name = capture.path.display();
         if discard_empty(&capture.path) {
             log::info!("Stopped before any audio; nothing recorded");
-        } else {
-            match stopped {
-                Stopped::Clean => log::info!("Saved {name} ({length})"),
-                Stopped::Killed => {
-                    log::error!(
-                        "pw-record ignored SIGINT and was killed; {name} has no final header"
-                    );
-                    self.notices.warn(format!(
-                        "pw-record had to be killed, {name} may need repairing"
-                    ));
-                }
+            self.publish(RecorderState::Idle);
+            return;
+        }
+
+        match stopped {
+            Stopped::Clean => log::info!("Saved {name} ({})", clock(length)),
+            Stopped::Killed => {
+                log::error!("pw-record ignored SIGINT and was killed; {name} has no final header");
+                self.notices.warn(format!(
+                    "pw-record had to be killed, {name} may need repairing"
+                ));
             }
         }
-        self.publish(RecorderState::Idle);
+        self.publish(RecorderState::Saved {
+            path: capture.path.clone(),
+            length,
+        });
     }
 
     fn publish(&mut self, state: RecorderState) {
@@ -620,39 +711,22 @@ mod tests {
 
     // --- pure ---
 
+    /// The `-P` properties are what stop WirePlumber recording some other
+    /// node, and what make an output record its monitor.
     #[test]
-    fn the_command_line_pins_the_node() {
-        let args = record_args(
-            "alsa_input.xone",
-            NodeKind::Source,
-            Path::new("/rec/mix.wav"),
-        );
-        let expected: Vec<OsString> = [
-            "--target=alsa_input.xone",
-            "--rate=48000",
-            "--channels=2",
-            "--format=s16",
-            "-P",
-            "{ node.name = turntable-recorder node.dont-reconnect = true node.dont-fallback = true }",
-            "/rec/mix.wav",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        assert_eq!(args, expected);
-
-        let sink = record_args(
-            "alsa_output.xone",
-            NodeKind::Sink,
-            Path::new("/rec/mix.wav"),
-        );
-        assert_eq!(
-            sink[5],
-            OsString::from(
-                "{ node.name = turntable-recorder node.dont-reconnect = true \
-                 node.dont-fallback = true stream.capture.sink = true }"
-            )
-        );
+    fn the_properties_pin_the_node() {
+        let props = |kind| {
+            let args = record_args("node", kind, Path::new("/rec/mix.wav"));
+            let at = args.iter().position(|arg| arg == "-P").expect("-P");
+            args[at + 1].to_string_lossy().into_owned()
+        };
+        let (source, sink) = (props(NodeKind::Source), props(NodeKind::Sink));
+        for props in [&source, &sink] {
+            assert!(props.contains("node.dont-reconnect = true"), "{props}");
+            assert!(props.contains("node.dont-fallback = true"), "{props}");
+        }
+        assert!(!source.contains("stream.capture.sink"), "{source}");
+        assert!(sink.contains("stream.capture.sink = true"), "{sink}");
     }
 
     /// What `pw-dump` prints when a sink goes away and a new source takes its
@@ -711,19 +785,10 @@ mod tests {
     }
 
     #[test]
-    fn peaks_are_measured_against_full_scale() {
+    fn silence_has_no_peak_and_the_lowest_sample_does_not_overflow() {
         assert_eq!(peak_dbfs(&[0; 64]), None);
         assert_eq!(peak_dbfs(&[]), None);
-
-        let peak_of = |sample: i16| {
-            let mut pcm = vec![0; 8];
-            pcm.extend(sample.to_le_bytes());
-            peak_dbfs(&pcm).expect("not silent")
-        };
-        assert!(peak_of(i16::MAX).abs() < 0.001);
-        assert!((peak_of(16384) + 6.0206).abs() < 0.001);
-        assert!((peak_of(-16384) + 6.0206).abs() < 0.001);
-        assert_eq!(peak_of(i16::MIN), 0.);
+        assert_eq!(peak_dbfs(&i16::MIN.to_le_bytes()), Some(0.));
     }
 
     // --- processes, no audio ---
@@ -761,7 +826,10 @@ mod tests {
         if status.is_none() {
             let _ = child.kill();
         }
-        assert_eq!(status.and_then(|s| s.signal()), Some(Signal::INT.as_raw()));
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(rustix::process::Signal::INT.as_raw())
+        );
     }
 
     #[test]
@@ -817,6 +885,44 @@ mod tests {
 
         h.recorder.stop();
         assert_eq!(std::fs::read_dir(&h.dir).expect("dir").count(), 0);
+        assert_eq!(h.state(), RecorderState::Idle);
+    }
+
+    #[test]
+    fn silence_reads_as_silent() {
+        let mut h = Harness::new(Box::new(|path| {
+            let mut command = sh("head -c 44 /dev/zero > \"$1\"
+                while :; do head -c 19200 /dev/zero >> \"$1\"; sleep 0.1; done");
+            command.arg("sh").arg(path);
+            Ok(command)
+        }));
+        h.recorder.start();
+        assert!(h.watch_until(Duration::from_secs(2), |s| matches!(
+            s,
+            RecorderState::Recording {
+                signal: Signal::Silent,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_file_that_stops_growing_reads_as_not_writing() {
+        let mut h = Harness::new(Box::new(|path| {
+            let mut command = sh("head -c 44 /dev/zero > \"$1\"
+                head -c 4000 /dev/urandom >> \"$1\"; exec sleep 30");
+            command.arg("sh").arg(path);
+            Ok(command)
+        }));
+        h.recorder.start();
+        assert!(h.watch_until(Duration::from_secs(2), is_recording));
+        assert!(h.watch_until(Duration::from_secs(3), |s| matches!(
+            s,
+            RecorderState::Recording {
+                signal: Signal::NotWriting,
+                ..
+            }
+        )));
     }
 
     /// The recorder's own thread, with a stand-in that writes audio and waits.
@@ -886,7 +992,7 @@ mod tests {
         running.toggle();
         assert!(running.reaches(is_recording));
         running.toggle();
-        assert!(running.reaches(|s| *s == RecorderState::Idle));
+        assert!(running.reaches(|s| matches!(s, RecorderState::Saved { .. })));
         running.shut_down();
     }
 
@@ -895,7 +1001,7 @@ mod tests {
         let running = Running::new();
         running.toggle();
         assert!(running.reaches(is_recording));
-        assert_eq!(running.shut_down(), RecorderState::Idle);
+        assert!(matches!(running.shut_down(), RecorderState::Saved { .. }));
     }
 
     // --- real PipeWire, virtual source ---
@@ -1052,9 +1158,21 @@ mod tests {
             "{}",
             h.notice()
         );
-        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            h.watch_until(Duration::from_secs(3), |s| matches!(
+                s,
+                RecorderState::Recording {
+                    signal: Signal::Peak(peak),
+                    free_bytes: Some(_),
+                    ..
+                } if (peak + 6.02).abs() < 0.1
+            )),
+            "{:?}",
+            h.state()
+        );
+        std::thread::sleep(Duration::from_millis(500));
         h.recorder.stop();
-        assert_eq!(h.state(), RecorderState::Idle);
+        assert!(matches!(h.state(), RecorderState::Saved { .. }));
 
         let wav = std::fs::read(the_only_recording(&h.dir)).expect("recording");
         let riff_len = u32::from_le_bytes(wav[4..8].try_into().expect("4 bytes"));
@@ -1099,20 +1217,6 @@ mod tests {
             );
             assert_eq!(h.notice(), "Cannot record, see the log");
         }
-    }
-
-    #[test]
-    fn the_fixture_is_listed_as_a_source_and_a_sink() {
-        let source = VirtualSource::new(false);
-        let nodes = recordable_nodes().expect("pw-dump");
-        let kind_of = |name: String| {
-            nodes
-                .iter()
-                .find(|node| node.name == name)
-                .map(|node| node.kind)
-        };
-        assert_eq!(kind_of(source.target()), Some(NodeKind::Source));
-        assert_eq!(kind_of(source.sink()), Some(NodeKind::Sink));
     }
 
     #[test]

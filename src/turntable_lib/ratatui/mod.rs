@@ -19,6 +19,7 @@ use ratatui::{
     },
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style, Stylize},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 use std::io::stdout;
@@ -36,6 +37,7 @@ use crate::{
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
     record::{INanos, TrackRef, UNanos},
+    recorder::{RecorderState, Signal, clock},
     tray::TrayState,
     virtual_platter::ReadablePlatter,
 };
@@ -99,6 +101,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     platters: [ReadablePlatter; DECKS],
     tray_state: Arc<RwLock<TrayState>>,
     notices: Notices,
+    recording: Option<Arc<RwLock<RecorderState>>>,
     health: Arc<AudioHealth>,
     events: Sender<InputEvent>,
     shutdown: Arc<AtomicBool>,
@@ -123,6 +126,9 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                 .as_ref()
                 .map(|deck| deck.load(Ordering::Relaxed));
             let notice = notices.current();
+            let recording = recording
+                .as_ref()
+                .and_then(|state| state.read().ok().map(|state| state.clone()));
             let tray = tray_state.read().ok().map(|tray| tray.clone());
 
             terminal
@@ -134,6 +140,7 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                         current_active,
                         tray,
                         notice,
+                        recording,
                         &health,
                     );
                 })
@@ -323,6 +330,58 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Wide enough for `● REC 1:05:09  -10.3 dBFS  41G left` inside its border.
+const RECORDING_COLS: u16 = 38;
+
+fn recording_line(state: &RecorderState) -> Line<'static> {
+    let dim = Style::default().fg(CHROME);
+    let alarm = Style::default().fg(ALARM).add_modifier(Modifier::BOLD);
+
+    match state {
+        RecorderState::Idle => Line::styled("Ctrl+R to record", dim),
+        RecorderState::Starting { .. } => {
+            Line::styled("waiting for audio…", Style::default().fg(CAUTION))
+        }
+        RecorderState::Recording {
+            since,
+            signal,
+            free_bytes,
+            ..
+        } => {
+            let level = match signal {
+                Signal::Peak(peak) => Span::raw(format!("{peak:.1} dBFS")),
+                Signal::Silent => Span::styled("NO SIGNAL", alarm),
+                Signal::NotWriting => Span::styled("NOT WRITING", alarm),
+            };
+            let mut spans = vec![
+                Span::styled("● ", Style::default().fg(ALARM)),
+                Span::raw(format!("REC {}  ", clock(since.elapsed()))),
+                level,
+            ];
+            if let Some(free) = free_bytes {
+                spans.push(Span::styled(format!("  {} left", size_label(*free)), dim));
+            }
+            Line::from(spans)
+        }
+        RecorderState::Stopping { .. } => Line::styled("stopping…", dim),
+        RecorderState::Saved { length, .. } => {
+            Line::styled(format!("saved {}", clock(*length)), dim)
+        }
+    }
+}
+
+/// `41G`, `4.2G` or `850M`, in powers of 1024 as `df -h` prints them.
+fn size_label(bytes: u64) -> String {
+    let gib = bytes as f64 / (1u64 << 30) as f64;
+    if gib >= 10. {
+        format!("{gib:.0}G")
+    } else if gib >= 1. {
+        format!("{gib:.1}G")
+    } else {
+        format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
+    }
+}
+
 /// One line saying whether audio is being lost, and how it should be coloured.
 fn health_line(health: &AudioHealth) -> (String, Style) {
     let digest = health.digest();
@@ -408,6 +467,7 @@ fn render_tui<const DECKS: usize>(
     active_deck_idx: Option<usize>,
     tray: Option<TrayState>,
     notice: Option<Notice>,
+    recording: Option<RecorderState>,
     health: &AudioHealth,
 ) {
     // 1. Split layout vertically into deck table, waveforms, the tray and
@@ -523,7 +583,14 @@ fn render_tui<const DECKS: usize>(
     //    delivering the audio it computed
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+        .constraints(match recording {
+            Some(_) => vec![
+                Constraint::Fill(1),
+                Constraint::Length(RECORDING_COLS),
+                Constraint::Fill(1),
+            ],
+            None => vec![Constraint::Fill(1), Constraint::Fill(1)],
+        })
         .split(chunks[2]);
 
     let (tray_text, tray_style) = tray_line(tray, active_deck_idx);
@@ -536,7 +603,13 @@ fn render_tui<const DECKS: usize>(
     let health_widget = Paragraph::new(health_text)
         .style(health_style)
         .block(panel(" Audio Health "));
-    frame.render_widget(health_widget, row[1]);
+    frame.render_widget(health_widget, row[row.len() - 1]);
+
+    if let Some(recording) = recording {
+        let recording_widget =
+            Paragraph::new(recording_line(&recording)).block(panel(" Recording "));
+        frame.render_widget(recording_widget, row[1]);
+    }
 
     // 4. Anything that went wrong, for as long as it is worth reading
     let (title, message, style) = match notice {
