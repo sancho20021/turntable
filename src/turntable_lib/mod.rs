@@ -13,6 +13,7 @@ pub mod input_profile;
 pub mod midi;
 pub mod notices;
 pub mod physical_speed;
+pub mod pipewire_nodes;
 pub mod platter_audio_processor;
 pub mod platter_driver;
 pub mod ratatui;

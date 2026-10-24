@@ -25,15 +25,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
 use chrono::NaiveDateTime;
-use crossbeam::channel::{Receiver, RecvTimeoutError};
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 use rustix::{
     io::Errno,
     process::{Pid, getppid, kill_process, set_parent_process_death_signal},
 };
 
-use crate::{decoder::SAMPLE_RATE, notices::Notices};
+use crate::{
+    decoder::SAMPLE_RATE,
+    notices::Notices,
+    pipewire_nodes::{NodeKind, recordable_nodes},
+};
 
 /// What libsndfile writes ahead of the first sample of a 16-bit stereo WAV.
 const WAV_HEADER_BYTES: u64 = 44;
@@ -104,99 +107,81 @@ pub enum RecorderState {
     },
 }
 
-/// Spawns the recorder thread.
+/// The running recorder: the channel commands go down, the state the TUI
+/// draws, and the thread.
+pub struct RecorderHandle {
+    pub commands: Sender<RecorderCommand>,
+    pub state: Arc<RwLock<RecorderState>>,
+    shutdown: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl RecorderHandle {
+    /// Stops a recording in progress, then waits for the thread to end.
+    pub fn stop(self) -> std::thread::Result<()> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.thread.join()
+    }
+}
+
+/// Warns about a source that is not there or a folder that does not exist,
+/// then spawns the recorder thread.
 ///
 /// It is also the thread that spawns `pw-record`, and PDEATHSIG ties the child
-/// to it, so it must live until shutdown. See [`spawn_with_deathsig`].
-pub fn start(
-    config: RecorderConfig,
-    commands: Receiver<RecorderCommand>,
-    state: Arc<RwLock<RecorderState>>,
-    notices: Notices,
-    shutdown: Arc<AtomicBool>,
-) -> JoinHandle<()> {
+/// to it, so it must live until [`RecorderHandle::stop`]. See
+/// [`spawn_with_deathsig`].
+pub fn start(config: RecorderConfig, notices: Notices) -> RecorderHandle {
+    log::info!(
+        "Recording set up: source {}, folder {}",
+        config.source,
+        config.dir.display()
+    );
+    warn_about(&config, &notices);
+
+    let (commands, receive) = crossbeam::channel::bounded(4);
+    let state = Arc::new(RwLock::new(RecorderState::Idle));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let recorder = Recorder::new(
         config.dir,
         pw_record_for(config.source),
-        state,
+        Arc::clone(&state),
         notices,
         STOP_GRACE,
     );
-    std::thread::spawn(move || recorder.run(commands, shutdown))
-}
+    let thread = {
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || recorder.run(receive, shutdown))
+    };
 
-/// What a recording is taken from. A sink is recorded through its monitor,
-/// which carries what it is playing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    Source,
-    Sink,
-}
-
-/// A PipeWire node `pw-record` can record from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordableNode {
-    pub name: String,
-    pub description: String,
-    pub kind: NodeKind,
-}
-
-/// Every node that can be recorded from, as `pw-dump` reports them.
-///
-/// The one list of what turntable records: `list-devices` prints it, and a
-/// recording starts only from a node in it.
-pub fn recordable_nodes() -> anyhow::Result<Vec<RecordableNode>> {
-    let dump = Command::new("pw-dump")
-        .output()
-        .context("Cannot run pw-dump")?;
-    if !dump.status.success() {
-        anyhow::bail!(
-            "pw-dump cannot reach PipeWire: {}",
-            String::from_utf8_lossy(&dump.stderr).trim()
-        );
+    RecorderHandle {
+        commands,
+        state,
+        shutdown,
+        thread,
     }
-    parse_recordable(&String::from_utf8_lossy(&dump.stdout)).context("Cannot read pw-dump output")
 }
 
-/// The `Audio/Source` and `Audio/Sink` nodes in `pw-dump` output. `pw-record`
-/// gets `target not found` for `Audio/Source/Virtual`, so that class is left out.
-///
-/// While the graph changes, `pw-dump` prints more arrays after the first: each
-/// object replaces the one with its id, and `"info": null` removes it. Ids are
-/// reused, so the arrays are applied in order.
-fn parse_recordable(dump: &str) -> serde_json::Result<Vec<RecordableNode>> {
-    let mut objects: Vec<serde_json::Value> = Vec::new();
-    for batch in serde_json::Deserializer::from_str(dump).into_iter::<Vec<serde_json::Value>>() {
-        for object in batch? {
-            objects.retain(|known| known["id"] != object["id"]);
-            if !object["info"].is_null() {
-                objects.push(object);
-            }
-        }
+/// Only warns: the interface may be plugged in, or the drive mounted, after
+/// launch.
+fn warn_about(config: &RecorderConfig, notices: &Notices) {
+    let problem = match recordable_nodes() {
+        Err(e) => Some(format!("Cannot check the recording source: {e:#}")),
+        Ok(nodes) if !nodes.iter().any(|node| node.name == config.source) => Some(format!(
+            "Recording source {} not found; turntable list-devices shows the sources",
+            config.source
+        )),
+        Ok(_) => None,
+    };
+    if let Some(problem) = problem {
+        log::warn!("{problem}");
+        notices.warn(problem);
     }
 
-    Ok(objects
-        .iter()
-        .filter(|object| object["type"] == "PipeWire:Interface:Node")
-        .filter_map(|object| {
-            let props = &object["info"]["props"];
-            let kind = match props["media.class"].as_str()? {
-                "Audio/Source" => NodeKind::Source,
-                "Audio/Sink" => NodeKind::Sink,
-                _ => return None,
-            };
-            let name = props["node.name"].as_str()?.to_string();
-            let description = props["node.description"]
-                .as_str()
-                .unwrap_or(&name)
-                .to_string();
-            Some(RecordableNode {
-                name,
-                description,
-                kind,
-            })
-        })
-        .collect())
+    if !config.dir.is_dir() {
+        let problem = format!("Recordings folder {} does not exist", config.dir.display());
+        log::warn!("{problem}");
+        notices.warn(problem);
+    }
 }
 
 /// Loudest sample of 16-bit little-endian PCM, in dBFS.
@@ -727,61 +712,6 @@ mod tests {
         }
         assert!(!source.contains("stream.capture.sink"), "{source}");
         assert!(sink.contains("stream.capture.sink = true"), "{sink}");
-    }
-
-    /// What `pw-dump` prints when a sink goes away and a new source takes its
-    /// id while it runs.
-    #[test]
-    fn later_arrays_update_the_dump() {
-        let dump = r#"[
-            { "id": 40, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "alsa_input.mic", "node.description": "Mic", "media.class": "Audio/Source" } } },
-            { "id": 41, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "alsa_output.speakers", "node.description": "Speakers", "media.class": "Audio/Sink" } } }
-        ]
-        [ { "id": 41, "info": null } ]
-        [ { "id": 41, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "alsa_input.usb", "node.description": "USB", "media.class": "Audio/Source" } } } ]"#;
-        let names: Vec<_> = parse_recordable(dump)
-            .expect("valid JSON")
-            .into_iter()
-            .map(|node| node.name)
-            .collect();
-        assert_eq!(names, ["alsa_input.mic", "alsa_input.usb"]);
-    }
-
-    #[test]
-    fn only_sources_and_sinks_are_recordable() {
-        let dump = r#"[
-            { "id": 1, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "alsa_input.mic", "node.description": "Mic", "media.class": "Audio/Source" } } },
-            { "id": 2, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "alsa_output.speakers", "node.description": "Speakers", "media.class": "Audio/Sink" } } },
-            { "id": 3, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "virtual-mic", "media.class": "Audio/Source/Virtual" } } },
-            { "id": 4, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "turntable-recorder", "media.class": "Stream/Input/Audio" } } },
-            { "id": 5, "type": "PipeWire:Interface:Node", "info": { "props":
-                { "node.name": "Midi-Bridge", "media.class": "Midi/Bridge" } } },
-            { "id": 6, "type": "PipeWire:Interface:Link", "info": { "props":
-                { "node.name": "not-a-node", "media.class": "Audio/Source" } } },
-            { "id": 7, "type": "PipeWire:Interface:Node", "info": null }
-        ]"#;
-        assert_eq!(
-            parse_recordable(dump).expect("valid JSON"),
-            vec![
-                RecordableNode {
-                    name: "alsa_input.mic".into(),
-                    description: "Mic".into(),
-                    kind: NodeKind::Source,
-                },
-                RecordableNode {
-                    name: "alsa_output.speakers".into(),
-                    description: "Speakers".into(),
-                    kind: NodeKind::Sink,
-                },
-            ]
-        );
     }
 
     #[test]

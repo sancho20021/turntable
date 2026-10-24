@@ -37,7 +37,7 @@ use turntable_lib::{
     platter_audio_processor::{AudioProcessorHandles, PlatterAudioProcessor},
     platter_driver::PlatterDriver,
     ratatui::spawn_tui_thread,
-    recorder::{self, RecorderCommand, RecorderConfig, RecorderState},
+    recorder::{self, RecorderCommand, RecorderConfig},
     samples_poller::{DeckRouting, SamplesPoller},
     telemetry,
     tray::{self, TrayCommand, TrayState},
@@ -300,45 +300,10 @@ fn run_app<const DECKS: usize>(
         Arc::clone(&shutdown),
     );
 
-    // Its own shutdown flag, so teardown can stop it before the stream.
-    let recorder_shutdown = Arc::new(AtomicBool::new(false));
-    let recorder = options.recording.clone().map(|config| {
-        log::info!(
-            "Recording set up: source {}, folder {}",
-            config.source,
-            config.dir.display()
-        );
-
-        let problem = match recorder::recordable_nodes() {
-            Err(e) => Some(format!("Cannot check the recording source: {e:#}")),
-            Ok(nodes) if !nodes.iter().any(|node| node.name == config.source) => Some(format!(
-                "Recording source {} not found; turntable list-devices shows the sources",
-                config.source
-            )),
-            Ok(_) => None,
-        };
-        if let Some(problem) = problem {
-            log::warn!("{problem}");
-            notices.warn(problem);
-        }
-
-        if !config.dir.is_dir() {
-            let problem = format!("Recordings folder {} does not exist", config.dir.display());
-            log::warn!("{problem}");
-            notices.warn(problem);
-        }
-
-        let (commands, receive) = bounded(4);
-        let state = Arc::new(RwLock::new(RecorderState::Idle));
-        let thread = recorder::start(
-            config,
-            receive,
-            Arc::clone(&state),
-            notices.clone(),
-            Arc::clone(&recorder_shutdown),
-        );
-        (commands, thread, state)
-    });
+    let recorder = options
+        .recording
+        .clone()
+        .map(|config| recorder::start(config, notices.clone()));
 
     // Spawn polling TUI thread, which doubles as the drag and drop source
     let tui_handle = spawn_tui_thread::<DECKS>(
@@ -347,7 +312,9 @@ fn run_app<const DECKS: usize>(
         array::from_fn(|i| controllers[i].get_platter()),
         Arc::clone(&tray_state),
         notices.clone(),
-        recorder.as_ref().map(|(_, _, state)| Arc::clone(state)),
+        recorder
+            .as_ref()
+            .map(|recorder| Arc::clone(&recorder.state)),
         health,
         events_snd.clone(),
         Arc::clone(&shutdown),
@@ -357,7 +324,7 @@ fn run_app<const DECKS: usize>(
         events_rcv,
         controllers,
         tray_snd.clone(),
-        recorder.as_ref().map(|(commands, _, _)| commands.clone()),
+        recorder.as_ref().map(|recorder| recorder.commands.clone()),
         notices.clone(),
         Arc::clone(&shutdown),
     );
@@ -379,9 +346,8 @@ fn run_app<const DECKS: usize>(
 
     // Before the stream: the audio cutting out pops, and the recording must
     // end before that.
-    recorder_shutdown.store(true, Ordering::Relaxed);
-    if let Some((_, thread, _)) = recorder
-        && thread.join().is_err()
+    if let Some(recorder) = recorder
+        && recorder.stop().is_err()
     {
         log::error!("Recorder panicked");
     }

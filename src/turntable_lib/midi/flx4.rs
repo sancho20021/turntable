@@ -5,6 +5,8 @@
 //! The channel says which deck:
 //!
 //!   ch 1 (0x0)  deck 1        ch 2 (0x1)  deck 2        ch 7 (0x6)  mixer
+//!   ch 5 (0x4)  BEAT FX, its channel switch on CH1 or CH1+2
+//!   ch 6 (0x5)  BEAT FX, its channel switch on CH2
 //!
 //! So a deck is named by every message, and nothing here needs the notion of an
 //! "active deck" that the keyboard source carries.
@@ -15,9 +17,6 @@
 //! *different note or CC number* on the same channel - e.g. the deck-2 jog wheel
 //! sends CC 0x22 normally but CC 0x29 while shifted. So [`Decoder`] keeps the
 //! shift state and tags every event with it.
-//!
-//! (Some controllers in this family also mirror shifted buttons onto channel
-//! + 4; `scope_of` accepts those channels too, harmless if unused.)
 //!
 //! Anything not in the table is logged raw by [`super::start`], which is how the
 //! shifted jog numbers above were found - keep extending it that way.
@@ -76,17 +75,17 @@ pub enum Button {
 }
 
 impl Button {
-    fn from_note(deck: Option<Deck>, note: u8) -> Self {
-        match (deck, note) {
-            // Per-deck transport buttons (channels 1/2, or 5/6 with shift).
-            (Some(_), 0x0B) => Button::PlayPause,
-            (Some(_), 0x0C) => Button::Cue,
-            (Some(_), 0x51) => Button::SeekBack,
-            (Some(_), 0x53) => Button::SeekForward,
-            (Some(_), 0x3F) => Button::Shift,
+    fn from_note(section: Section, note: u8) -> Self {
+        match (section, note) {
+            (Section::Deck(_), 0x0B) => Button::PlayPause,
+            (Section::Deck(_), 0x0C) => Button::Cue,
+            (Section::Deck(_), 0x51) => Button::SeekBack,
+            (Section::Deck(_), 0x53) => Button::SeekForward,
+            (Section::Deck(_), 0x3F) => Button::Shift,
             // LOAD buttons live on the shared mixer channel, one note each.
-            (None, 0x46) => Button::Load(Deck::One),
-            (None, 0x47) => Button::Load(Deck::Two),
+            (Section::Mixer, 0x46) => Button::Load(Deck::One),
+            (Section::Mixer, 0x47) => Button::Load(Deck::Two),
+            (Section::BeatFx, 0x47) => Button::FxOn,
             _ => Button::Unmapped(note),
         }
     }
@@ -107,25 +106,41 @@ impl fmt::Display for Button {
     }
 }
 
-/// What the channel nibble told us: which deck (if any) and whether SHIFT was
-/// held when the control was touched.
+/// The part of the controller a channel belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Deck(Deck),
+    Mixer,
+    BeatFx,
+}
+
+impl Section {
+    fn deck(self) -> Option<Deck> {
+        match self {
+            Section::Deck(deck) => Some(deck),
+            Section::Mixer | Section::BeatFx => None,
+        }
+    }
+}
+
+/// What the channel nibble told us: which section, and whether SHIFT was held
+/// when the control was touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Scope {
-    deck: Option<Deck>,
+    section: Section,
     shifted: bool,
 }
 
 fn scope_of(channel: u8) -> Option<Scope> {
-    let (deck, shifted) = match channel {
-        0x0 => (Some(Deck::One), false),
-        0x1 => (Some(Deck::Two), false),
-        0x4 => (Some(Deck::One), true),
-        0x5 => (Some(Deck::Two), true),
-        0x6 => (None, false),
-        0xA => (None, true),
+    let (section, shifted) = match channel {
+        0x0 => (Section::Deck(Deck::One), false),
+        0x1 => (Section::Deck(Deck::Two), false),
+        0x4 | 0x5 => (Section::BeatFx, false),
+        0x6 => (Section::Mixer, false),
+        0xA => (Section::Mixer, true),
         _ => return None,
     };
-    Some(Scope { deck, shifted })
+    Some(Scope { section, shifted })
 }
 
 /// Which way a jog wheel movement was reported.
@@ -221,19 +236,8 @@ impl Decoder {
     }
 
     fn note(&mut self, channel: u8, note: u8, pressed: bool) -> Option<Event> {
-        // BEAT FX reports on channel 5 while its channel switch is on CH1 or
-        // CH1+2 and on channel 6 for CH2, the channels `scope_of` reads as
-        // shifted decks.
-        if (channel == 0x4 || channel == 0x5) && note == 0x47 {
-            return Some(Event::Button {
-                deck: None,
-                button: Button::FxOn,
-                shifted: false,
-                pressed,
-            });
-        }
-
-        let Scope { deck, shifted } = scope_of(channel)?;
+        let Scope { section, shifted } = scope_of(channel)?;
+        let deck = section.deck();
         let shifted = shifted || deck.is_some_and(|d| self.shift_held(d));
 
         // Jog wheel touch sensor is a note, not a CC. 0x67 is the same sensor
@@ -248,7 +252,7 @@ impl Decoder {
             });
         }
 
-        let button = Button::from_note(deck, note);
+        let button = Button::from_note(section, note);
 
         // The SHIFT key press itself: remember it, and don't label it
         // "SHIFT + SHIFT".
@@ -270,7 +274,8 @@ impl Decoder {
     }
 
     fn cc(&mut self, channel: u8, controller: u8, value: u8) -> Option<Event> {
-        let Scope { deck, shifted } = scope_of(channel)?;
+        let Scope { section, shifted } = scope_of(channel)?;
+        let deck = section.deck();
         let shifted = shifted || deck.is_some_and(|d| self.shift_held(d));
 
         match controller {

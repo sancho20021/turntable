@@ -8,7 +8,10 @@ use env_logger::Env;
 use log::info;
 
 use crate::app::{QrMode, start};
-use turntable_lib::recorder::{self, NodeKind, RecorderConfig};
+use turntable_lib::{
+    pipewire_nodes::{self, NodeKind},
+    recorder::RecorderConfig,
+};
 
 /// Which device drives the decks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -225,7 +228,7 @@ fn main() {
             }
 
             println!();
-            match recorder::recordable_nodes() {
+            match pipewire_nodes::recordable_nodes() {
                 Ok(nodes) if nodes.is_empty() => println!("Nothing to record from"),
                 Ok(nodes) => {
                     println!("Recording sources (--recording-source):");
