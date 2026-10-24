@@ -3323,6 +3323,7 @@ dependencies = [
  "percent-encoding",
  "ratatui",
  "rtrb",
+ "rustix",
  "sdl2",
  "serde",
  "shlex 1.3.0",

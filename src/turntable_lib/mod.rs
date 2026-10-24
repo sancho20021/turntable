@@ -14,6 +14,8 @@ pub mod platter_audio_processor;
 pub mod platter_driver;
 pub mod ratatui;
 pub mod record;
+#[cfg(target_os = "linux")]
+pub mod recorder;
 pub mod samples_poller;
 #[cfg(feature = "sdl")]
 pub mod sdl_input;
