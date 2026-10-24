@@ -26,7 +26,7 @@ use std::{fmt, time::Instant};
 
 use crate::{
     deck_controller::DeckId,
-    input_event::{DeckCommand, DeckEvent, InputEvent},
+    input_event::{AppEvent, DeckCommand, DeckEvent, InputEvent},
     midi::message::MidiMessage,
 };
 
@@ -70,6 +70,8 @@ pub enum Button {
     /// LOAD lives on the shared mixer channel and names its target deck in the
     /// note number, so it carries the deck itself.
     Load(Deck),
+    /// BEAT FX ON/OFF. turntable has no effects; it starts and stops recording.
+    FxOn,
     Unmapped(u8),
 }
 
@@ -99,6 +101,7 @@ impl fmt::Display for Button {
             Button::SeekForward => f.write_str("CUE/LOOP CALL >"),
             Button::Shift => f.write_str("SHIFT"),
             Button::Load(deck) => write!(f, "LOAD -> deck {}", deck.index() + 1),
+            Button::FxOn => f.write_str("BEAT FX ON/OFF"),
             Button::Unmapped(note) => write!(f, "unmapped note 0x{note:02X}"),
         }
     }
@@ -218,6 +221,18 @@ impl Decoder {
     }
 
     fn note(&mut self, channel: u8, note: u8, pressed: bool) -> Option<Event> {
+        // BEAT FX reports on channel 5 while its channel switch is on CH1 or
+        // CH1+2 and on channel 6 for CH2, the channels `scope_of` reads as
+        // shifted decks.
+        if (channel == 0x4 || channel == 0x5) && note == 0x47 {
+            return Some(Event::Button {
+                deck: None,
+                button: Button::FxOn,
+                shifted: false,
+                pressed,
+            });
+        }
+
         let Scope { deck, shifted } = scope_of(channel)?;
         let shifted = shifted || deck.is_some_and(|d| self.shift_held(d));
 
@@ -371,6 +386,7 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
             // The LOAD buttons name their target deck, so they are the only
             // controls that reach across from the mixer channel to a deck.
             Button::Load(target) => (target.index(), DeckCommand::LoadRecord),
+            Button::FxOn => return Some(InputEvent::App(AppEvent::ToggleRecording)),
             // SHIFT is a modifier the decoder already tracked.
             Button::Shift => return None,
             // Not bound to anything - logged here because the decoder no longer
@@ -412,6 +428,19 @@ mod tests {
     }
 
     /// Press a button on a deck channel and map it through to a deck command.
+    #[test]
+    fn fx_on_toggles_recording_whichever_channel_the_fx_switch_is_on() {
+        for channel in [0x4, 0x5] {
+            assert!(
+                matches!(
+                    press(channel, 0x47),
+                    InputEvent::App(AppEvent::ToggleRecording)
+                ),
+                "channel {channel}"
+            );
+        }
+    }
+
     fn press(channel: u8, note: u8) -> InputEvent {
         let event = Decoder::new()
             .decode(&MidiMessage::NoteOn {
