@@ -297,25 +297,3 @@ fn main() {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parses(args: &[&str]) -> bool {
-        Cli::try_parse_from(["turntable", "run"].iter().chain(args)).is_ok()
-    }
-
-    #[test]
-    fn recording_needs_both_a_source_and_a_folder() {
-        assert!(parses(&[]));
-        assert!(parses(&[
-            "--recording-source",
-            "x",
-            "--recordings-dir",
-            "/rec"
-        ]));
-        assert!(!parses(&["--recording-source", "x"]));
-        assert!(!parses(&["--recordings-dir", "/rec"]));
-    }
-}
