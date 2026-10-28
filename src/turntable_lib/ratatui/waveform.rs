@@ -32,7 +32,7 @@ const DOTS_PER_ROW: u16 = 2;
 pub fn waveform<'a>(record: Option<&'a RecordInfo>, pos: INanos, area: Rect) -> impl Widget + 'a {
     let cols = area.width * DOTS_PER_COL;
     let rows = area.height * DOTS_PER_ROW;
-    let playhead = record.and_then(|record| playhead_column(pos, record.duration, area.width));
+    let playhead = record.and_then(|record| column_of(pos, record.duration, area.width));
 
     Canvas::default()
         .marker(Marker::Quadrant)
@@ -76,8 +76,9 @@ fn column_peak(envelope: &[f32], x: u16, width: u16) -> f32 {
     envelope[lo..hi].iter().copied().fold(0., f32::max)
 }
 
-/// Which column the playhead sits in, or `None` while it is off the record.
-fn playhead_column(pos: INanos, duration: UNanos, width: u16) -> Option<u16> {
+/// Which column a position on the record falls in, or `None` while it is off
+/// the record.
+pub(super) fn column_of(pos: INanos, duration: UNanos, width: u16) -> Option<u16> {
     if duration.0 == 0 || width == 0 || pos.0 < 0 {
         return None;
     }
@@ -96,7 +97,7 @@ fn colour(cell: u16, playhead: Option<u16>) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_peak, playhead_column};
+    use super::{column_of, column_peak};
     use crate::record::{INanos, UNanos};
 
     /// Five minutes, as the platter counts it.
@@ -122,13 +123,13 @@ mod tests {
 
     #[test]
     fn the_playhead_runs_from_the_first_column_to_the_last() {
-        assert_eq!(playhead_column(INanos(0), FIVE_MINUTES, 100), Some(0));
+        assert_eq!(column_of(INanos(0), FIVE_MINUTES, 100), Some(0));
         assert_eq!(
-            playhead_column(INanos(150_000_000_000), FIVE_MINUTES, 100),
+            column_of(INanos(150_000_000_000), FIVE_MINUTES, 100),
             Some(50)
         );
         assert_eq!(
-            playhead_column(INanos(299_999_999_999), FIVE_MINUTES, 100),
+            column_of(INanos(299_999_999_999), FIVE_MINUTES, 100),
             Some(99)
         );
     }
@@ -137,11 +138,8 @@ mod tests {
     /// the start after a scratch back through zero.
     #[test]
     fn a_playhead_off_the_record_lands_in_no_column() {
-        assert_eq!(
-            playhead_column(INanos(300_000_000_000), FIVE_MINUTES, 100),
-            None
-        );
-        assert_eq!(playhead_column(INanos(-1), FIVE_MINUTES, 100), None);
-        assert_eq!(playhead_column(INanos(0), UNanos(0), 100), None);
+        assert_eq!(column_of(INanos(300_000_000_000), FIVE_MINUTES, 100), None);
+        assert_eq!(column_of(INanos(-1), FIVE_MINUTES, 100), None);
+        assert_eq!(column_of(INanos(0), UNanos(0), 100), None);
     }
 }

@@ -67,6 +67,8 @@ pub struct DeckState {
     pub platter: AtomicCell<PlatterState>,
     /// Current record playing
     pub cur_record: RwLock<Option<RecordInfo>>,
+    /// Where CUE jumps to.
+    pub cue: AtomicCell<Option<INanos>>,
 }
 
 impl DeckState {
@@ -120,9 +122,10 @@ pub fn new_deck(
 ) {
     let initial_state = Arc::new(DeckState {
         pitch: AtomicF64::new(1.0),
-        playing: AtomicBool::new(true),
+        playing: AtomicBool::new(false),
         platter: AtomicCell::new(PlatterState::Playing),
         cur_record: RwLock::new(None),
+        cue: AtomicCell::new(None),
     });
     let (pl_snd, pl_rcv) = bounded(1000);
     let (writable_platter, readable_platter) = new_platter();
@@ -256,6 +259,25 @@ impl DeckController {
         self.state.pitch.store(new_speed, Ordering::Relaxed);
     }
 
+    /// Sets the cue point when deck is stopped.
+    /// Jumps to cue point when deck is playing.
+    fn cue(&self) {
+        if !self.state.playing.load(Ordering::Relaxed) {
+            let pos = self.platter.get_playhead().record_pos;
+            self.state.cue.store(Some(pos));
+            log::info!("deck {} cue set at {}ms", self.deck_id + 1, pos.as_millis());
+            return;
+        }
+
+        if let Some(cue) = self.state.cue.load() {
+            log_try_send(
+                &self.platter_events,
+                PlatterEvent::MovePlayhead(Jump::To(cue)),
+                "jump to cue",
+            );
+        }
+    }
+
     fn start_or_stop(&self) {
         let playing = self.state.playing.load(Ordering::Relaxed);
         self.state.playing.store(!playing, Ordering::Relaxed);
@@ -286,11 +308,7 @@ impl DeckController {
                 },
                 "load record from tray",
             ),
-            DeckCommand::PlayheadReset => log_try_send(
-                &self.platter_events,
-                PlatterEvent::MovePlayhead(Jump::ToZero),
-                "reset playhead",
-            ),
+            DeckCommand::Cue => self.cue(),
             DeckCommand::PlayheadFF => log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::Forward),
@@ -313,5 +331,106 @@ impl DeckController {
 
     pub fn get_platter(&self) -> ReadablePlatter {
         self.platter.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_health::AudioHealth;
+    use crossbeam::channel::{Receiver, bounded};
+
+    /// A deck wired to its own platter driver, so a command can be followed all
+    /// the way to the playhead. The tray receiver is returned because a closed
+    /// channel turns every command into a logged error.
+    fn deck() -> (DeckController, PlatterDriver, Receiver<TrayCommand>) {
+        let (tray, tray_rcv) = bounded(10);
+        let (controller, driver, _audio, _slot) = new_deck(
+            0,
+            InputProfile::touchpad(1., 1.),
+            0.05,
+            tray,
+            Arc::new(AtomicBool::new(false)),
+            64,
+            AudioHealth::new(64, 48_000, 1).deck(0),
+        );
+        (controller, driver, tray_rcv)
+    }
+
+    fn press(controller: &mut DeckController, command: DeckCommand) {
+        controller.handle_deck_event(DeckEvent {
+            command,
+            timestamp: Instant::now(),
+        });
+    }
+
+    /// Wall-clock slack: a playing platter keeps moving between the jump and
+    /// the assertion.
+    const TOLERANCE: INanos = INanos(50_000_000);
+
+    fn assert_near(pos: INanos, expected: INanos) {
+        assert!(
+            (pos.0 - expected.0).abs() < TOLERANCE.0,
+            "playhead at {}ms, expected {}ms",
+            pos.as_millis(),
+            expected.as_millis()
+        );
+    }
+
+    #[test]
+    fn a_stopped_deck_marks_the_spot() {
+        let (mut controller, mut driver, _tray) = deck();
+        controller.state.playing.store(false, Ordering::Relaxed);
+
+        press(&mut controller, DeckCommand::PlayheadFF);
+        driver.update_platter();
+        let spot = controller.platter.get_playhead().record_pos;
+        press(&mut controller, DeckCommand::Cue);
+
+        assert!(spot.0 > 0, "the playhead never left the start");
+        assert_near(controller.state.cue.load().expect("the cue was set"), spot);
+    }
+
+    #[test]
+    fn a_playing_deck_goes_back_to_the_spot() {
+        let (mut controller, mut driver, _tray) = deck();
+        controller.state.playing.store(true, Ordering::Relaxed);
+        let spot = INanos(90_000_000_000);
+        controller.state.cue.store(Some(spot));
+
+        press(&mut controller, DeckCommand::Cue);
+        driver.update_platter();
+
+        assert_near(controller.platter.get_playhead().record_pos, spot);
+    }
+
+    /// The record follows the hand and nothing else.
+    #[test]
+    fn a_cue_under_a_held_platter_leaves_the_record_where_it_is() {
+        let (mut controller, mut driver, _tray) = deck();
+        controller.state.playing.store(true, Ordering::Relaxed);
+        controller.state.cue.store(Some(INanos(90_000_000_000)));
+
+        press(&mut controller, DeckCommand::ScratchStart(0));
+        press(&mut controller, DeckCommand::Cue);
+        driver.update_platter();
+
+        assert_near(controller.platter.get_playhead().record_pos, INanos(0));
+    }
+
+    /// Nothing to go back to, so the record keeps playing.
+    #[test]
+    fn a_playing_deck_with_no_cue_stays_where_it_is() {
+        let (mut controller, mut driver, _tray) = deck();
+        controller.state.playing.store(true, Ordering::Relaxed);
+
+        press(&mut controller, DeckCommand::PlayheadFF);
+        driver.update_platter();
+        let spot = controller.platter.get_playhead().record_pos;
+
+        press(&mut controller, DeckCommand::Cue);
+        driver.update_platter();
+
+        assert_near(controller.platter.get_playhead().record_pos, spot);
     }
 }

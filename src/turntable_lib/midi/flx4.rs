@@ -385,7 +385,7 @@ pub fn to_input_event(event: Event, pitch_range: f64, timestamp: Instant) -> Opt
             ..
         } => match button {
             Button::PlayPause => (deck?.index(), DeckCommand::StartStop),
-            Button::Cue => (deck?.index(), DeckCommand::PlayheadReset),
+            Button::Cue => (deck?.index(), DeckCommand::Cue),
             Button::SeekBack => (deck?.index(), DeckCommand::PlayheadRewind),
             Button::SeekForward => (deck?.index(), DeckCommand::PlayheadFF),
             // The LOAD buttons name their target deck, so they are the only
@@ -440,6 +440,25 @@ mod tests {
                 matches!(
                     press(channel, 0x47),
                     InputEvent::App(AppEvent::ToggleRecording)
+                ),
+                "channel {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cue_button_cues_its_own_deck() {
+        for (channel, deck) in [(0x0, 0), (0x1, 1)] {
+            assert!(
+                matches!(
+                    press(channel, 0x0C),
+                    InputEvent::Deck(
+                        d,
+                        DeckEvent {
+                            command: DeckCommand::Cue,
+                            ..
+                        }
+                    ) if d == deck
                 ),
                 "channel {channel}"
             );

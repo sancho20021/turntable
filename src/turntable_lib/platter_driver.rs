@@ -38,6 +38,8 @@ const UPDATES_PER_CALLBACK: f64 = 2.;
 pub enum Jump {
     /// set playhead to the start
     ToZero,
+    /// set playhead to a position on the record
+    To(INanos),
     /// skip FF_TIME forward
     Forward,
     /// go FF_TIME backward
@@ -242,9 +244,18 @@ impl PlatterDriver {
 
         match event {
             PlatterEvent::MovePlayhead(jump) => {
+                // A held platter takes its position from the anchor it was
+                // grabbed at, so a jump written here is thrown away on the next
+                // update - after the audio thread, which polls the playhead on
+                // its own schedule, may have rendered a block from it.
+                if let PlatterState::Scratching { .. } = self.state.platter.load() {
+                    return;
+                }
+
                 let cur_playhead = self.platter.get_playhead().record_pos;
                 let new_pos = INanos(match jump {
                     Jump::ToZero => 0,
+                    Jump::To(pos) => pos.0,
                     Jump::Forward => cur_playhead.0 + FF_TIME.0 as i64,
                     Jump::Backward => cur_playhead.0 - FF_TIME.0 as i64,
                 });

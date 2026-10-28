@@ -65,7 +65,9 @@ pub enum DeckCommand {
     SetPitch(f64),
     /// Put the record waiting in the tray on this deck.
     LoadRecord,
-    PlayheadReset,
+    /// While the deck plays, jump to the cue point, if one is set. While it is
+    /// stopped, put the cue point where the playhead stands.
+    Cue,
     PlayheadFF,
     PlayheadRewind,
 }

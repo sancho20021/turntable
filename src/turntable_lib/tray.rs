@@ -32,7 +32,7 @@ use crossbeam::channel::{Receiver, Sender, select};
 use rtrb::{Consumer, Producer};
 
 use crate::{
-    deck_controller::{DeckId, DeckState, RecordInfo},
+    deck_controller::{DeckId, DeckState, PlatterState, RecordInfo},
     decoder::load_file,
     notices::Notices,
     platter_audio_processor::PlatterAudioProcessor,
@@ -82,6 +82,25 @@ pub struct DeckSlot {
     pub state: Arc<DeckState>,
     /// to drop the needle at the start of a fresh record
     pub platter_events: Sender<PlatterEvent>,
+}
+
+/// Why a record cannot go on this deck yet. A record drops onto a deck that is
+/// stopped with its platter free, which is what lets the playhead be reset to
+/// the start of the new track: a moving or held platter owns the position and
+/// puts the needle back wherever the old record was.
+fn busy_reason(state: &DeckState, deck_id: DeckId) -> Option<String> {
+    if state.playing.load(Ordering::Relaxed) {
+        return Some(format!("Deck {} is playing, stop it to load", deck_id + 1));
+    }
+
+    if let PlatterState::Scratching { .. } = state.platter.load() {
+        return Some(format!(
+            "Deck {} platter is held, let go of it to load",
+            deck_id + 1
+        ));
+    }
+
+    None
 }
 
 /// One decoded record, handed from the loader back to the tray.
@@ -234,6 +253,13 @@ impl<const DECKS: usize> Tray<DECKS> {
                     log::error!("cannot load on deck {deck_id}, only {DECKS} decks are available");
                     return;
                 };
+
+                if let Some(why) = busy_reason(&slot.state, deck_id) {
+                    log::warn!("load on deck {deck_id} rejected: {why}");
+                    self.notices.warn(why);
+                    return;
+                }
+
                 // Cloned, not taken: the tray goes on holding the record, so the
                 // same card can reach a second deck without being scanned again.
                 // Sharing the samples is what makes that free.
@@ -245,10 +271,11 @@ impl<const DECKS: usize> Tray<DECKS> {
 
                 match slot.records_in.push(record) {
                     Ok(()) => {
-                        // The record is already on its way to the audio thread, so a
-                        // lost reset cannot be retried here: it would start playing
-                        // from wherever the previous record's playhead was. The deck's
-                        // playhead is on screen, so the log is where this belongs.
+                        // The record is already on its way to the audio thread, so
+                        // a lost reset cannot be retried here: the new record picks
+                        // up wherever the previous one's playhead was left. The
+                        // deck's playhead is on screen, so the log is where this
+                        // belongs.
                         match slot
                             .platter_events
                             .try_send(PlatterEvent::MovePlayhead(Jump::ToZero))
@@ -264,6 +291,8 @@ impl<const DECKS: usize> Tray<DECKS> {
                                 deck_id + 1
                             ),
                         }
+
+                        slot.state.cue.store(None);
 
                         match slot.state.cur_record.write() {
                             Ok(mut cur_record) => *cur_record = Some(info),
@@ -385,6 +414,9 @@ pub fn start<const DECKS: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{INanos, UNanos};
+    use atomic_float::AtomicF64;
+    use crossbeam::atomic::AtomicCell;
     use crossbeam::channel::bounded;
 
     fn track(path: &str) -> TrackRef {
@@ -423,6 +455,94 @@ mod tests {
             track: track(path),
             result: Err("not a real decode".to_string()),
         }
+    }
+
+    /// A tray holding a record, and the deck it can go on. The deck starts the
+    /// way a deck starts: stopped, with its platter free.
+    fn tray_and_deck() -> (Tray<1>, Arc<DeckState>) {
+        let (loader, _decoding) = bounded(1);
+        let (records_in, _audio_side) = rtrb::RingBuffer::new(1);
+        let (_audio_side, records_out) = rtrb::RingBuffer::new(1);
+        let (platter_events, _driver_side) = bounded(10);
+
+        let state = Arc::new(DeckState {
+            pitch: AtomicF64::new(1.),
+            playing: AtomicBool::new(false),
+            platter: AtomicCell::new(PlatterState::Playing),
+            cur_record: RwLock::new(None),
+            cue: AtomicCell::new(None),
+        });
+
+        let info = RecordInfo {
+            track: track("ready.flac"),
+            duration: UNanos(1_000_000_000),
+            envelope: Arc::new([0.; envelope::BUCKETS]),
+        };
+
+        let tray = Tray::<1> {
+            prepared: Some((
+                Arc::new(Record::new(Vec::new(), Interpolator::linear())),
+                info.clone(),
+            )),
+            pending: None,
+            state: TrayState::Ready { info },
+            published: Arc::new(RwLock::new(TrayState::Empty)),
+            loader,
+            decks: [DeckSlot {
+                records_in,
+                records_out,
+                state: Arc::clone(&state),
+                platter_events,
+            }],
+            notices: Notices::new(),
+        };
+
+        (tray, state)
+    }
+
+    fn loaded(state: &DeckState) -> bool {
+        state.cur_record.read().expect("deck state").is_some()
+    }
+
+    #[test]
+    fn a_stopped_deck_with_a_free_platter_takes_the_record() {
+        let (mut tray, state) = tray_and_deck();
+
+        tray.load_record(0);
+
+        assert!(loaded(&state));
+    }
+
+    /// The playhead is reset as the record lands, and a running deck would
+    /// carry the needle off before the DJ ever heard the start.
+    #[test]
+    fn a_playing_deck_refuses_the_record() {
+        let (mut tray, state) = tray_and_deck();
+        state.playing.store(true, Ordering::Relaxed);
+
+        tray.load_record(0);
+
+        assert!(!loaded(&state));
+        assert!(
+            matches!(tray.state, TrayState::Ready { .. }),
+            "the record left the tray"
+        );
+    }
+
+    #[test]
+    fn a_held_platter_refuses_the_record() {
+        let (mut tray, state) = tray_and_deck();
+        state.platter.store(PlatterState::Scratching {
+            anchor_pos: INanos(0),
+            anchor_input: 0,
+            latest_input: 0,
+            input_speed: None,
+            timestamp: UNanos(0),
+        });
+
+        tray.load_record(0);
+
+        assert!(!loaded(&state));
     }
 
     /// Scans arrive without anyone pressing anything, so a second one during a

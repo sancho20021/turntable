@@ -32,7 +32,7 @@ use crossbeam::channel::Sender;
 use percent_encoding::percent_decode_str;
 
 use crate::{
-    deck_controller::DeckState,
+    deck_controller::{DeckState, RecordInfo},
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
     record::{INanos, TrackRef, UNanos},
@@ -45,10 +45,11 @@ pub mod platter_dial;
 mod waveform;
 
 use platter_dial::{DIAL_COLS, DIAL_ROWS, dial_area, platter_dial};
-use waveform::waveform;
+use waveform::{column_of, waveform};
 
 /// Green phosphor on a dark machine. One hue carries everything the engine is
-/// doing, at four brightnesses, and red appears only when audio is being lost.
+/// doing, at four brightnesses; amber marks a cue point, and red appears only
+/// when audio is being lost.
 mod palette {
     use ratatui::style::Color;
 
@@ -62,6 +63,8 @@ mod palette {
     pub const NEEDLE: Color = Color::Rgb(230, 255, 233);
     /// The part of a track still ahead of the needle.
     pub const SUBMERGED: Color = Color::Rgb(30, 42, 34);
+    /// Behind the cue point, the whole height of a waveform.
+    pub const CUE: Color = Color::Rgb(230, 176, 45);
     /// Waiting on something, or losing a little audio.
     pub const CAUTION: Color = Color::Rgb(200, 208, 196);
     /// Audio is being lost, or a track will not load.
@@ -410,6 +413,27 @@ fn render_waveforms<const DECKS: usize>(
         frame.render_widget(platter_dial(pos, disk_color, NEEDLE), dial_area(columns[1]));
 
         frame.render_widget(waveform(record, pos, columns[3]), columns[3]);
+
+        if let Some(cue) = deck_states[idx].cue.load() {
+            render_cue(frame, columns[3], record, cue);
+        }
+    }
+}
+
+/// The cue point, as a stripe behind the full height of the waveform. Only the
+/// background is touched, so the waveform and the needle stay readable where
+/// they cross it.
+fn render_cue(frame: &mut Frame, area: Rect, record: Option<&RecordInfo>, cue: INanos) {
+    let Some(record) = record else { return };
+    let Some(column) = column_of(cue, record.duration, area.width) else {
+        return;
+    };
+
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        if let Some(cell) = buffer.cell_mut((area.x + column, y)) {
+            cell.set_bg(CUE);
+        }
     }
 }
 
@@ -577,10 +601,47 @@ fn render_tui<const DECKS: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dropped_path, to_input_event, track_label};
+    use super::{CUE, parse_dropped_path, render_cue, to_input_event, track_label};
+    use crate::deck_controller::RecordInfo;
     use crate::input_event::{AppEvent, InputEvent};
-    use crate::record::{TrackMeta, TrackRef};
+    use crate::record::{INanos, TrackMeta, TrackRef, UNanos, envelope};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use std::sync::Arc;
+
+    /// Half way through a five minute track, on a strip ten columns wide.
+    #[test]
+    fn the_cue_stripe_tints_one_column_and_writes_no_glyph() {
+        let record = RecordInfo {
+            track: TrackRef {
+                path: "/music/cued.flac".to_string(),
+                meta: None,
+            },
+            duration: UNanos(300_000_000_000),
+            envelope: Arc::new([0.; envelope::BUCKETS]),
+        };
+
+        let area = Rect::new(0, 0, 10, 2);
+        let mut terminal = Terminal::new(TestBackend::new(10, 2)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_cue(frame, area, Some(&record), INanos(150_000_000_000));
+            })
+            .expect("a frame");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                let expected = if x == 5 { CUE } else { Color::Reset };
+                assert_eq!(cell.bg, expected, "cell {x},{y}");
+                assert_eq!(cell.symbol(), " ", "cell {x},{y}");
+            }
+        }
+    }
 
     #[test]
     fn ctrl_r_toggles_recording_and_r_alone_does_nothing() {

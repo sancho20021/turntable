@@ -70,10 +70,8 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
             }
 
             Event::KeyDown {
-                keycode: Some(key),
-                keymod,
-                ..
-            } => self.key_down(key, keymod)?,
+                keycode: Some(key), ..
+            } => self.key_down(key)?,
 
             _ => return None,
         };
@@ -86,9 +84,7 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
 
     /// Keys that are not bound to a deck command switch the active deck instead,
     /// which is why this needs `&mut self` and can return nothing.
-    fn key_down(&mut self, key: Keycode, keymod: Mod) -> Option<DeckCommand> {
-        let is_shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
-
+    fn key_down(&mut self, key: Keycode) -> Option<DeckCommand> {
         match key {
             Keycode::R => Some(DeckCommand::ResetPitch),
             Keycode::Up => Some(DeckCommand::PitchUp),
@@ -96,13 +92,8 @@ impl<const DECKS: usize> SdlInputMapper<DECKS> {
             Keycode::Space => Some(DeckCommand::StartStop),
             Keycode::Return | Keycode::KpEnter => Some(DeckCommand::LoadRecord),
             Keycode::Right => Some(DeckCommand::PlayheadFF),
-            Keycode::Left => {
-                if is_shift {
-                    Some(DeckCommand::PlayheadReset)
-                } else {
-                    Some(DeckCommand::PlayheadRewind)
-                }
-            }
+            Keycode::Left => Some(DeckCommand::PlayheadRewind),
+            Keycode::C => Some(DeckCommand::Cue),
             k => {
                 if let Some(deck_idx) = keycode_to_deck_idx(k) {
                     if deck_idx < DECKS {
