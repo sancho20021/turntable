@@ -72,11 +72,15 @@ pub struct DeckState {
 }
 
 impl DeckState {
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+
     /// target platter speed.
     ///
     /// 0 if not playing, pitch if playing
     pub fn target_speed(&self) -> f64 {
-        if self.playing.load(Ordering::Relaxed) {
+        if self.is_playing() {
             self.pitch.load(Ordering::Relaxed)
         } else {
             0.
@@ -262,7 +266,7 @@ impl DeckController {
     /// Sets the cue point when deck is stopped.
     /// Jumps to cue point when deck is playing.
     fn cue(&self) {
-        if !self.state.playing.load(Ordering::Relaxed) {
+        if !self.state.is_playing() {
             let pos = self.platter.get_playhead().record_pos;
             self.state.cue.store(Some(pos));
             log::info!("deck {} cue set at {}ms", self.deck_id + 1, pos.as_millis());
@@ -270,6 +274,11 @@ impl DeckController {
         }
 
         if let Some(cue) = self.state.cue.load() {
+            log::info!(
+                "deck {} jumping to its cue at {}ms",
+                self.deck_id + 1,
+                cue.as_millis()
+            );
             log_try_send(
                 &self.platter_events,
                 PlatterEvent::MovePlayhead(Jump::To(cue)),
@@ -279,7 +288,7 @@ impl DeckController {
     }
 
     fn start_or_stop(&self) {
-        let playing = self.state.playing.load(Ordering::Relaxed);
+        let playing = self.state.is_playing();
         self.state.playing.store(!playing, Ordering::Relaxed);
     }
 

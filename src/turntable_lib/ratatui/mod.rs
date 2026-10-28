@@ -490,8 +490,7 @@ fn render_tui<const DECKS: usize>(
         };
 
         // 2. Playback state
-        let is_playing = state.playing.load(Ordering::Relaxed);
-        let (play_str, play_style) = if is_playing {
+        let (play_str, play_style) = if state.is_playing() {
             ("▶ PLAYING", Style::default().fg(LIT))
         } else {
             ("⏸ STOPPED", Style::default().fg(CHROME))

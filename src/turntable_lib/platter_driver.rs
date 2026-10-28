@@ -249,6 +249,10 @@ impl PlatterDriver {
                 // update - after the audio thread, which polls the playhead on
                 // its own schedule, may have rendered a block from it.
                 if let PlatterState::Scratching { .. } = self.state.platter.load() {
+                    log::info!(
+                        "deck {} jump ignored, the platter is held",
+                        self.deck_id + 1
+                    );
                     return;
                 }
 

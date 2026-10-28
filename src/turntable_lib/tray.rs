@@ -89,7 +89,7 @@ pub struct DeckSlot {
 /// the start of the new track: a moving or held platter owns the position and
 /// puts the needle back wherever the old record was.
 fn busy_reason(state: &DeckState, deck_id: DeckId) -> Option<String> {
-    if state.playing.load(Ordering::Relaxed) {
+    if state.is_playing() {
         return Some(format!("Deck {} is playing, stop it to load", deck_id + 1));
     }
 
