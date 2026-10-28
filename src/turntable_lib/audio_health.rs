@@ -4,7 +4,8 @@
 //! mutex and issues an unbuffered `write()` per record, which blocks for
 //! milliseconds whenever the filesystem commits its journal. So the callback
 //! only bumps relaxed atomics here and pushes the occasional detail event onto a
-//! lock-free queue; [`spawn_monitor`] does the logging on its own thread.
+//! lock-free queue; [`spawn_monitor`] does the logging, and raises the notices
+//! the TUI shows, on its own thread.
 
 use std::{
     sync::{
@@ -15,8 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::atomic::AtomicCell;
 use rtrb::{Consumer, Producer, RingBuffer};
+
+use crate::notices::Notices;
 
 /// Capacity of the detail-event queue. Events are rate limited at the source, so
 /// this only has to absorb a burst.
@@ -72,34 +74,6 @@ impl HealthLevel {
             n if n < MANY_LOST_CALLBACKS => Self::Glitching,
             _ => Self::Failing,
         }
-    }
-}
-
-/// The verdict a display shows, computed once a second by the monitor.
-#[derive(Debug, Clone, Copy)]
-pub struct HealthDigest {
-    pub level: HealthLevel,
-    /// Callbacks lost in the last second.
-    pub lost: u64,
-    /// When the monitor started, so "clean for" has a floor.
-    pub started: Instant,
-    /// End of the last second in which anything was lost.
-    pub last_loss: Option<Instant>,
-}
-
-impl HealthDigest {
-    fn new(started: Instant) -> Self {
-        Self {
-            level: HealthLevel::Clean,
-            lost: 0,
-            started,
-            last_loss: None,
-        }
-    }
-
-    /// How long the engine has been losing nothing.
-    pub fn clean_for(&self) -> Duration {
-        self.last_loss.unwrap_or(self.started).elapsed()
     }
 }
 
@@ -252,9 +226,6 @@ pub struct AudioHealth {
     /// leaving a hole in the skip accounting rather than a dropout.
     pub clock_discontinuities: AtomicU64,
 
-    /// The verdict for a display, written by the monitor once a second.
-    digest: AtomicCell<HealthDigest>,
-
     /// Per-deck sound-quality health, indexed by deck id.
     decks: Vec<Arc<DeckHealth>>,
 }
@@ -287,14 +258,8 @@ impl AudioHealth {
             longest_callback_nanos_session: AtomicU64::new(0),
             detail_events_dropped: AtomicU64::new(0),
             clock_discontinuities: AtomicU64::new(0),
-            digest: AtomicCell::new(HealthDigest::new(Instant::now())),
             decks: (0..decks).map(|_| Arc::new(DeckHealth::new())).collect(),
         })
-    }
-
-    /// The verdict for a display. See [`HealthDigest`].
-    pub fn digest(&self) -> HealthDigest {
-        self.digest.load()
     }
 
     /// Handle for one deck's processor to write its own metrics through.
@@ -600,6 +565,7 @@ fn percent(part: u64, whole: u64) -> f64 {
 pub fn spawn_monitor(
     health: Arc<AudioHealth>,
     mut events: Consumer<AudioEvent>,
+    notices: Notices,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -612,7 +578,6 @@ pub fn spawn_monitor(
         let session_start = Instant::now();
         let mut previous = Snapshot::take(&health);
         let mut window_start = Instant::now();
-        let mut last_loss = None;
 
         while !shutdown.load(Relaxed) {
             std::thread::sleep(POLL_INTERVAL);
@@ -621,7 +586,7 @@ pub fn spawn_monitor(
             if window_start.elapsed() >= REPORT_INTERVAL {
                 let current = Snapshot::take(&health);
                 let lost = report_window(&health, &previous, &current);
-                publish_digest(&health, &mut last_loss, lost, session_start);
+                raise_notice(&notices, lost);
                 previous = current;
                 window_start = Instant::now();
             }
@@ -668,23 +633,20 @@ fn drain_events(health: &AudioHealth, events: &mut Consumer<AudioEvent>) {
     }
 }
 
-/// Turns one second of counters into the verdict a display shows.
-fn publish_digest(
-    health: &AudioHealth,
-    last_loss: &mut Option<Instant>,
-    lost: u64,
-    session_start: Instant,
-) {
-    if lost > 0 {
-        *last_loss = Some(Instant::now());
+/// Puts a second of loss on screen. Nothing is said while the audio is clean,
+/// and a run of bad seconds keeps raising the notice, so it stays up until the
+/// loss stops.
+fn raise_notice(notices: &Notices, lost: u64) {
+    match HealthLevel::of(lost) {
+        HealthLevel::Clean => {}
+        HealthLevel::Glitching => notices.warn(format!(
+            "Audio glitching: {lost} dropout{} in the last second",
+            if lost == 1 { "" } else { "s" },
+        )),
+        HealthLevel::Failing => notices.error(format!(
+            "Losing audio: {lost} dropouts in the last second - raise --buffer"
+        )),
     }
-
-    health.digest.store(HealthDigest {
-        level: HealthLevel::of(lost),
-        lost,
-        started: session_start,
-        last_loss: *last_loss,
-    });
 }
 
 fn report_window(health: &AudioHealth, previous: &Snapshot, current: &Snapshot) -> u64 {
@@ -823,7 +785,8 @@ fn report_session(health: &AudioHealth, elapsed: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioHealth, HealthLevel, new_recorder};
+    use super::{AudioHealth, HealthLevel, new_recorder, raise_notice};
+    use crate::notices::{Level, Notices};
     use std::sync::atomic::Ordering::Relaxed;
 
     /// Drives callbacks of `frames` at their natural spacing, starting from
@@ -902,6 +865,24 @@ mod tests {
     fn one_or_two_dropouts_is_a_glitch() {
         assert_eq!(HealthLevel::of(1), HealthLevel::Glitching);
         assert_eq!(HealthLevel::of(2), HealthLevel::Glitching);
+    }
+
+    #[test]
+    fn a_clean_second_is_not_worth_saying() {
+        let notices = Notices::new();
+        raise_notice(&notices, 0);
+        assert!(notices.current().is_none());
+    }
+
+    #[test]
+    fn lost_audio_reaches_the_screen() {
+        let notices = Notices::new();
+
+        raise_notice(&notices, 1);
+        assert_eq!(notices.current().expect("a glitch").level, Level::Warning);
+
+        raise_notice(&notices, 9);
+        assert_eq!(notices.current().expect("a failure").level, Level::Error);
     }
 
     #[test]

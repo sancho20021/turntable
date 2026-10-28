@@ -32,7 +32,6 @@ use crossbeam::channel::Sender;
 use percent_encoding::percent_decode_str;
 
 use crate::{
-    audio_health::{AudioHealth, HealthLevel},
     deck_controller::DeckState,
     input_event::{AppEvent, InputEvent},
     notices::{Level, Notice, Notices},
@@ -57,8 +56,6 @@ mod palette {
     pub const CHROME: Color = Color::Rgb(74, 84, 76);
     /// Panel names, table headers, a deck sitting there loaded.
     pub const LABEL: Color = Color::Rgb(124, 136, 126);
-    /// Powered, with nothing to report.
-    pub const DIM: Color = Color::Rgb(44, 122, 60);
     /// Running: a playing deck, a track ready, the part already heard.
     pub const LIT: Color = Color::Rgb(51, 230, 71);
     /// The playhead, the one thing on screen that moves.
@@ -102,7 +99,6 @@ pub fn spawn_tui_thread<const DECKS: usize>(
     tray_state: Arc<RwLock<TrayState>>,
     notices: Notices,
     recording: Option<Arc<RwLock<RecorderState>>>,
-    health: Arc<AudioHealth>,
     events: Sender<InputEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
@@ -141,7 +137,6 @@ pub fn spawn_tui_thread<const DECKS: usize>(
                         tray,
                         notice,
                         recording,
-                        &health,
                     );
                 })
                 .expect("Failed to draw TUI frame");
@@ -320,16 +315,6 @@ fn tray_line(tray: Option<TrayState>, active_deck_idx: Option<usize>) -> (String
     }
 }
 
-/// Renders a duration the way you would say it out loud.
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
-        (0, 0, s) => format!("{s}s"),
-        (0, m, s) => format!("{m}m {s:02}s"),
-        (h, m, _) => format!("{h}h {m:02}m"),
-    }
-}
-
 /// Wide enough for `● REC 1:05:09  -10.3 dBFS  41G left` inside its border.
 const RECORDING_COLS: u16 = 38;
 
@@ -379,38 +364,6 @@ fn size_label(bytes: u64) -> String {
         format!("{gib:.1}G")
     } else {
         format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
-    }
-}
-
-/// One line saying whether audio is being lost, and how it should be coloured.
-fn health_line(health: &AudioHealth) -> (String, Style) {
-    let digest = health.digest();
-
-    match digest.level {
-        HealthLevel::Clean => (
-            format!(
-                "●  clean       nothing lost in {}",
-                format_duration(digest.clean_for())
-            ),
-            Style::default().fg(DIM),
-        ),
-
-        HealthLevel::Glitching => (
-            format!(
-                "▲  glitch      {} dropout{} in the last second",
-                digest.lost,
-                if digest.lost == 1 { "" } else { "s" },
-            ),
-            Style::default().fg(CAUTION),
-        ),
-
-        HealthLevel::Failing => (
-            format!(
-                "✗  LOSING AUDIO   {} dropouts in the last second - raise --buffer",
-                digest.lost,
-            ),
-            Style::default().fg(ALARM).add_modifier(Modifier::BOLD),
-        ),
     }
 }
 
@@ -468,10 +421,9 @@ fn render_tui<const DECKS: usize>(
     tray: Option<TrayState>,
     notice: Option<Notice>,
     recording: Option<RecorderState>,
-    health: &AudioHealth,
 ) {
-    // 1. Split layout vertically into deck table, waveforms, the tray and
-    //    health row, and the status bar
+    // 1. Split layout vertically into deck table, waveforms, the tray row, and
+    //    the status bar
     //
     // The table has a natural size and the waveforms use every row they are
     // given, so the waveforms are the panel that absorbs the leftover height.
@@ -579,17 +531,12 @@ fn render_tui<const DECKS: usize>(
     // 2. Where each deck is in its track, and what is coming
     render_waveforms(frame, chunks[1], deck_states, platters);
 
-    // 3. What is waiting to be loaded, and whether the engine is actually
-    //    delivering the audio it computed
+    // 3. What is waiting to be loaded, and what is being recorded
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(match recording {
-            Some(_) => vec![
-                Constraint::Fill(1),
-                Constraint::Length(RECORDING_COLS),
-                Constraint::Fill(1),
-            ],
-            None => vec![Constraint::Fill(1), Constraint::Fill(1)],
+            Some(_) => vec![Constraint::Fill(1), Constraint::Length(RECORDING_COLS)],
+            None => vec![Constraint::Fill(1)],
         })
         .split(chunks[2]);
 
@@ -598,12 +545,6 @@ fn render_tui<const DECKS: usize>(
         .style(tray_style)
         .block(panel(" Record Tray "));
     frame.render_widget(tray_widget, row[0]);
-
-    let (health_text, health_style) = health_line(health);
-    let health_widget = Paragraph::new(health_text)
-        .style(health_style)
-        .block(panel(" Audio Health "));
-    frame.render_widget(health_widget, row[row.len() - 1]);
 
     if let Some(recording) = recording {
         let recording_widget =
@@ -636,11 +577,10 @@ fn render_tui<const DECKS: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, parse_dropped_path, to_input_event, track_label};
+    use super::{parse_dropped_path, to_input_event, track_label};
     use crate::input_event::{AppEvent, InputEvent};
     use crate::record::{TrackMeta, TrackRef};
     use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
-    use std::time::Duration;
 
     #[test]
     fn ctrl_r_toggles_recording_and_r_alone_does_nothing() {
@@ -674,14 +614,6 @@ mod tests {
         };
 
         assert_eq!(track_label(&track), "04 - untitled_master_v3.flac");
-    }
-
-    #[test]
-    fn durations_read_the_way_you_say_them() {
-        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
-        assert_eq!(format_duration(Duration::from_secs(62)), "1m 02s");
-        assert_eq!(format_duration(Duration::from_secs(3725)), "1h 02m");
     }
 
     #[test]

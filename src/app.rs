@@ -289,8 +289,12 @@ fn run_app<const DECKS: usize>(
         }
     };
 
-    let health_monitor =
-        audio_health::spawn_monitor(Arc::clone(&health), health_events, Arc::clone(&shutdown));
+    let health_monitor = audio_health::spawn_monitor(
+        Arc::clone(&health),
+        health_events,
+        notices.clone(),
+        Arc::clone(&shutdown),
+    );
 
     let tray = tray::start(
         tray_rcv,
@@ -315,7 +319,6 @@ fn run_app<const DECKS: usize>(
         recorder
             .as_ref()
             .map(|recorder| Arc::clone(&recorder.state)),
-        health,
         events_snd.clone(),
         Arc::clone(&shutdown),
     );
