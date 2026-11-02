@@ -65,7 +65,7 @@ fn describe(error: StorageError) -> String {
     match error {
         StorageError::TrackNotFound(_) => "no file recorded for this track".to_string(),
         StorageError::InvalidTrackFile { extra, .. } => {
-            format!("the track's file is missing or its drive is unplugged ({extra})")
+            format!("no playable file for this track: {extra}")
         }
         other => other.to_string(),
     }
