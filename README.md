@@ -48,6 +48,53 @@ mount | grep /mnt/   # each line should include utf8
 `umount` failing with "target is busy": `sudo fuser -vm /mnt/recorder` shows
 what holds the drive.
 
+## start on boot (Raspberry Pi)
+
+Turntable is a TUI, so it runs on the Pi's screen from the autologin shell, not
+from a systemd service (a service has no terminal to draw on).
+
+1. Log the user in automatically on the console (the user is the one running
+   `sudo`):
+
+   ```bash
+   sudo raspi-config nonint do_boot_behaviour B2
+   ```
+
+   Check with `cat /etc/systemd/system/getty@tty1.service.d/autologin.conf`:
+   it should show `--autologin <user>`. Password still applies to SSH and
+   `sudo`.
+
+2. Start turntable from `~/.profile` on `tty1` only, so SSH logins do not start
+   a second copy. Use `~/.profile`, not `~/.bash_profile`: once the latter
+   exists, bash stops reading `~/.profile` and its PATH setup.
+
+   ```bash
+   cat >> ~/.profile <<'EOF'
+
+   # start turntable on the Pi's screen after autologin (not over SSH)
+   if [ "$(tty)" = "/dev/tty1" ]; then
+       deadline=$((SECONDS + 10))
+       until turntable run; do
+           if [ $SECONDS -ge $deadline ]; then
+               echo "turntable still failing after 10s, giving up"
+               break
+           fi
+           echo "turntable failed, retrying in 1s"
+           sleep 1
+       done
+   fi
+   EOF
+   ```
+
+   If `turntable` is not on PATH at login, use the full path from
+   `which turntable`.
+
+Why the retry: for the first few seconds after boot PipeWire's default output
+is still a 2-channel device, and the 4-channel interface appears a moment
+later. The first run fails with `... offers 2 usable output channels;
+routing ... needs 4`; a run a second or two later works. A clean quit
+ends the loop and leaves a normal shell.
+
 ## useful commands
 
 Create a virtual Pipewire device for testing:
